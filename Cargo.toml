@@ -1,0 +1,26 @@
+[package]
+name = "lidarpub"
+description = "Maivin LiDAR Publisher"
+repository = "https://bitbucket.org/au-zone/lidarpub"
+license = "CLOSED"
+version = "0.0.0"
+edition = "2021"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+debug = false
+
+[profile.profiling]
+inherits = "release"
+strip = false
+debug = true
+
+[dependencies]
+clap = { version = "4.5.23", features = ["derive"] }
+env_logger = "0.11"
+etherparse = "0.16.0"
+log = "0.4.22"
+pcap-parser = "0.16.0"
+rerun = { version = "0.21.0" }
