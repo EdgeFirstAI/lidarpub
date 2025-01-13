@@ -1,4 +1,5 @@
 use std::fmt;
+use std::fs::File;
 
 #[derive(Debug)]
 pub enum Error {
@@ -212,5 +213,18 @@ impl<'a> HeaderSlice<'a> {
     pub fn alert_status(&self) -> AlertStatus {
         // println!("flags: {:b}", self.slice[12]);
         AlertStatus::from_flags(self.slice[12])
+    }
+
+    /// Returns the slice containing the payload.
+    #[inline]
+    pub fn payload(&self) -> &'a [u8] {
+        unsafe {
+            // SAFETY: Safe as the slice length was verified
+            // to be at least UdpHeader::LEN by "from_slice".
+            core::slice::from_raw_parts(
+                self.slice.as_ptr().add(Header::LEN),
+                self.slice.len() - Header::LEN,
+            )
+        }
     }
 }
