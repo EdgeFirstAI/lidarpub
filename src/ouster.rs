@@ -1,5 +1,4 @@
 use std::fmt;
-use std::fs::File;
 
 #[derive(Debug)]
 pub enum Error {

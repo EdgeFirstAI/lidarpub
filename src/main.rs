@@ -1,11 +1,8 @@
 use clap::Parser;
-use log::error;
 use lidarpub::ouster::HeaderSlice;
+use log::error;
 use pcap_parser::{traits::PcapReaderIterator, *};
-use rerun::{
-    external::re_sdk_comms::DEFAULT_SERVER_PORT,
-    RecordingStream,
-};
+use rerun::{external::re_sdk_comms::DEFAULT_SERVER_PORT, RecordingStream};
 use std::{
     fs::File,
     io::BufReader,
@@ -57,6 +54,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(pcap) = args.pcap {
         pcap_loop(&rr, &pcap)?;
+    } else {
+        udp_loop(&rr)?;
     }
 
     Ok(())
@@ -66,7 +65,9 @@ fn pcap_loop(
     rr: &Option<RecordingStream>,
     path: &String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(rr) = rr { rr.set_time_seconds("stable_time", 0f64) }
+    if let Some(rr) = rr {
+        rr.set_time_seconds("stable_time", 0f64)
+    }
 
     let file = File::open(path)?;
     let buffered = BufReader::new(file);
@@ -110,5 +111,9 @@ fn pcap_loop(
 
     println!("\tnum_blocks: {}", num_blocks);
 
+    Ok(())
+}
+
+fn udp_loop(rr: &Option<RecordingStream>) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
