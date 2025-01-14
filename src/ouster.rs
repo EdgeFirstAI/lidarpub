@@ -74,10 +74,10 @@ pub enum AlertStatus {
 
 impl AlertStatus {
     pub fn from_flags(flags: u8) -> AlertStatus {
-        if flags & 2 != 0 {
-            AlertStatus::Overflow(flags >> 6)
-        } else if flags & 1 != 0 {
-            AlertStatus::Active(flags >> 6)
+        if flags & (1 << 6) != 0 {
+            AlertStatus::Overflow(flags & 0b00111111)
+        } else if flags & (1 << 7) != 0 {
+            AlertStatus::Active(flags & 0b00111111)
         } else {
             AlertStatus::Normal
         }
@@ -210,7 +210,7 @@ impl<'a> HeaderSlice<'a> {
     }
 
     pub fn alert_status(&self) -> AlertStatus {
-        // println!("flags: {:b}", self.slice[12]);
+        println!("flags: {:b}", self.slice[12]);
         AlertStatus::from_flags(self.slice[12])
     }
 
