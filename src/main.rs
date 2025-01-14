@@ -115,5 +115,15 @@ fn pcap_loop(
 }
 
 fn udp_loop(rr: &Option<RecordingStream>) -> Result<(), Box<dyn std::error::Error>> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:7502")?;
+    let mut buf = [0u8; 16 * 1024];
+
+    loop {
+        let (len, _src) = socket.recv_from(&mut buf)?;
+        let header = HeaderSlice::from_slice(&buf[..len])?;
+        let header = header.to_header();
+        println!("header: {:?}", header);
+    }
+
     Ok(())
 }
