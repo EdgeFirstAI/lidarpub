@@ -1,5 +1,7 @@
 use clap::Parser;
-use lidarpub::ouster::{Config, Frame, FrameReader};
+use lidarpub::ouster::{
+    BeamIntrinsics, Config, Frame, FrameReader, LidarDataFormat, Parameters, SensorInfo,
+};
 use log::error;
 use pcap_parser::{traits::PcapReaderIterator, *};
 use rerun::{external::re_sdk_comms::DEFAULT_SERVER_PORT, RecordingStream};
@@ -7,7 +9,7 @@ use std::{
     error::Error,
     fs::File,
     io::BufReader,
-    net::{Ipv4Addr, SocketAddr},
+    net::{Ipv4Addr, SocketAddr, TcpStream},
     path::Path,
 };
 
@@ -70,8 +72,8 @@ fn pcap_loop(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let json_path = Path::new(path).with_extension("json");
     let json = File::open(json_path)?;
-    let config: Config = serde_json::from_reader(json)?;
-    let mut frame_reader = FrameReader::new(config)?;
+    let params: Parameters = serde_json::from_reader(json)?;
+    let mut frame_reader = FrameReader::new(params)?;
 
     let pcap_path = Path::new(path).with_extension("pcap");
     let pcap = File::open(pcap_path)?;
@@ -126,18 +128,58 @@ fn live_loop(
     rr: &Option<RecordingStream>,
     target: &String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // let socket = std::net::UdpSocket::bind("0.0.0.0:7502")?;
-    // let mut buf = [0u8; 16 * 1024];
-    // let mut frame = Frame::<64, 2048>::new();
+    let local = {
+        let stream = TcpStream::connect(format!("{}:80", target))?;
+        stream.local_addr()?.ip()
+    };
 
-    // loop {
-    //     let (len, _src) = socket.recv_from(&mut buf)?;
-    //     if let Some(frame) = frame.update(&buf[..len])? {
-    //         frame_handler(rr, frame)?;
-    //     }
-    // }
+    let api = format!("http://{}//api/v1/sensor", target);
 
-    Ok(())
+    let config = Config {
+        udp_dest: local.to_string(),
+        ..Default::default()
+    };
+
+    ureq::post(&format!("{}/config", api)).send_json(&config)?;
+    let config = ureq::get(&format!("{}/config", api))
+        .call()?
+        .into_json::<Config>()?;
+    println!("config: {:?}", config);
+
+    let sensor_info = ureq::get(&format!("{}/metadata/sensor_info", api))
+        .call()?
+        .into_json::<SensorInfo>()?;
+    let lidar_data_format = ureq::get(&format!("{}/metadata/lidar_data_format", api))
+        .call()?
+        .into_json::<LidarDataFormat>()?;
+    let beam_intrinsics = ureq::get(&format!("{}/metadata/beam_intrinsics", api))
+        .call()?
+        .into_json::<BeamIntrinsics>()?;
+
+    let params = Parameters {
+        sensor_info,
+        lidar_data_format,
+        beam_intrinsics,
+    };
+
+    // On Linux [::] will bind to IPv4 and IPv6 but not on Windows so we bind
+    // according to the local address IP version.
+    let bind_addr = match local.is_ipv4() {
+        true => format!("0.0.0.0:{}", config.udp_port_lidar),
+        false => format!("[::]:{}", config.udp_port_lidar),
+    };
+    let socket = std::net::UdpSocket::bind(bind_addr)?;
+    let mut buf = [0u8; 16 * 1024];
+    let mut frame_reader = FrameReader::new(params)?;
+
+    loop {
+        let (len, _src) = socket.recv_from(&mut buf)?;
+
+        if let Some(frame) = frame_reader.update(&buf[..len])? {
+            // println!("frame_id: {:?}", frame.frame_id);
+            frame_handler(rr, frame)?;
+        }
+    }
 }
 
 fn frame_handler(rr: &Option<RecordingStream>, frame: Frame) -> Result<(), Box<dyn Error>> {

@@ -3,6 +3,25 @@ use serde::{Deserialize, Serialize};
 use std::{f32::consts::PI, fmt};
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct Config {
+    pub udp_dest: String,
+    pub udp_port_lidar: u16,
+    pub udp_profile_lidar: String,
+    pub azimuth_window: [u32; 2],
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            udp_dest: "".to_owned(),
+            udp_port_lidar: 7502,
+            udp_profile_lidar: "RNG15_RFL8_NIR8".to_owned(),
+            azimuth_window: [0, 360000],
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SensorInfo {
     pub status: String,
     pub build_rev: String,
@@ -30,7 +49,7 @@ pub struct BeamIntrinsics {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct Config {
+pub struct Parameters {
     pub sensor_info: SensorInfo,
     pub lidar_data_format: LidarDataFormat,
     pub beam_intrinsics: BeamIntrinsics,
@@ -388,19 +407,19 @@ pub struct FrameReader {
 }
 
 impl FrameReader {
-    pub fn new(config: Config) -> Result<FrameReader, Error> {
-        if config.lidar_data_format.udp_profile_lidar != "RNG15_RFL8_NIR8" {
+    pub fn new(params: Parameters) -> Result<FrameReader, Error> {
+        if params.lidar_data_format.udp_profile_lidar != "RNG15_RFL8_NIR8" {
             return Err(Error::UnsupportedDataFormat(
-                config.lidar_data_format.udp_profile_lidar,
+                params.lidar_data_format.udp_profile_lidar,
             ));
         }
 
-        let cols = config.lidar_data_format.columns_per_frame;
-        let rows = config.lidar_data_format.pixels_per_column;
-        let columns_per_packet = config.lidar_data_format.columns_per_packet;
-        let beam_azimuth_angles = config.beam_intrinsics.beam_azimuth_angles;
-        let beam_altitude_angles = config.beam_intrinsics.beam_altitude_angles;
-        let beam_to_lidar = config.beam_intrinsics.beam_to_lidar_transform;
+        let cols = params.lidar_data_format.columns_per_frame;
+        let rows = params.lidar_data_format.pixels_per_column;
+        let columns_per_packet = params.lidar_data_format.columns_per_packet;
+        let beam_azimuth_angles = params.beam_intrinsics.beam_azimuth_angles;
+        let beam_altitude_angles = params.beam_intrinsics.beam_altitude_angles;
+        let beam_to_lidar = params.beam_intrinsics.beam_to_lidar_transform;
 
         Ok(FrameReader {
             rows,
