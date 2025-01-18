@@ -1,12 +1,14 @@
 use clap::Parser;
-use lidarpub::ouster::HeaderSlice;
+use lidarpub::ouster::{Config, Frame, FrameReader};
 use log::error;
 use pcap_parser::{traits::PcapReaderIterator, *};
 use rerun::{external::re_sdk_comms::DEFAULT_SERVER_PORT, RecordingStream};
 use std::{
+    error::Error,
     fs::File,
     io::BufReader,
     net::{Ipv4Addr, SocketAddr},
+    path::Path,
 };
 
 #[derive(Parser, Debug, Clone)]
@@ -28,9 +30,10 @@ struct Args {
     #[arg(short, long)]
     port: Option<u16>,
 
-    /// Read from a pcap file instead of a live interface.
+    /// Connect to target device or pcap file.  If target is a valid pcap file,
+    /// it will be used otherwise it will be tried as a hostname or IP address.
     #[arg()]
-    pcap: Option<String>,
+    target: String,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -52,10 +55,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    if let Some(pcap) = args.pcap {
-        pcap_loop(&rr, &pcap)?;
+    if Path::new(&args.target).exists() {
+        pcap_loop(&rr, &args.target)?;
     } else {
-        udp_loop(&rr)?;
+        live_loop(&rr, &args.target)?;
     }
 
     Ok(())
@@ -65,64 +68,87 @@ fn pcap_loop(
     rr: &Option<RecordingStream>,
     path: &String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(rr) = rr {
-        rr.set_time_seconds("stable_time", 0f64)
-    }
+    let json_path = Path::new(path).with_extension("json");
+    let json = File::open(json_path)?;
+    let config: Config = serde_json::from_reader(json)?;
+    let mut frame_reader = FrameReader::new(config)?;
 
-    let file = File::open(path)?;
-    let buffered = BufReader::new(file);
-    let mut reader = LegacyPcapReader::new(65536, buffered)?;
-    let mut num_blocks = 0;
+    let pcap_path = Path::new(path).with_extension("pcap");
+    let pcap = File::open(pcap_path)?;
+    let buffered = BufReader::new(pcap);
+    let mut pcap_reader = LegacyPcapReader::new(65536, buffered)?;
 
     loop {
-        match reader.next() {
+        match pcap_reader.next() {
             Ok((offset, block)) => {
-                num_blocks += 1;
                 match block {
-                    PcapBlockOwned::LegacyHeader(hdr) => println!("header: {:?}", hdr),
+                    PcapBlockOwned::LegacyHeader(_) => (),
                     PcapBlockOwned::Legacy(block) => {
                         match etherparse::SlicedPacket::from_ethernet(block.data) {
                             Err(err) => error!("Err {:?}", err),
                             Ok(pkt) => {
                                 if let Some(etherparse::TransportSlice::Udp(udp)) = pkt.transport {
                                     if udp.destination_port() != 7502 {
-                                        reader.consume(offset);
+                                        pcap_reader.consume(offset);
                                         continue;
                                     }
 
-                                    let header = HeaderSlice::from_slice(udp.payload())?;
-                                    let header = header.to_header();
-                                    println!("header: {:?}", header);
+                                    if let Some(frame) = frame_reader.update(udp.payload())? {
+                                        if let Some(rr) = rr {
+                                            rr.set_time_seconds(
+                                                "stable_time",
+                                                frame.frame_id as f64 / 10.0,
+                                            );
+                                        }
+
+                                        frame_handler(rr, frame)?;
+                                    }
                                 }
                             }
                         }
                     }
                     PcapBlockOwned::NG(_) => unreachable!(),
                 }
-                reader.consume(offset);
+                pcap_reader.consume(offset);
             }
             Err(PcapError::Eof) => break,
             Err(PcapError::Incomplete(_)) => {
-                reader.refill().unwrap();
+                pcap_reader.refill().unwrap();
             }
             Err(e) => panic!("error while reading: {:?}", e),
         }
     }
 
-    println!("\tnum_blocks: {}", num_blocks);
+    Ok(())
+}
+
+fn live_loop(
+    rr: &Option<RecordingStream>,
+    target: &String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // let socket = std::net::UdpSocket::bind("0.0.0.0:7502")?;
+    // let mut buf = [0u8; 16 * 1024];
+    // let mut frame = Frame::<64, 2048>::new();
+
+    // loop {
+    //     let (len, _src) = socket.recv_from(&mut buf)?;
+    //     if let Some(frame) = frame.update(&buf[..len])? {
+    //         frame_handler(rr, frame)?;
+    //     }
+    // }
 
     Ok(())
 }
 
-fn udp_loop(rr: &Option<RecordingStream>) -> Result<(), Box<dyn std::error::Error>> {
-    let socket = std::net::UdpSocket::bind("0.0.0.0:7502")?;
-    let mut buf = [0u8; 16 * 1024];
-
-    loop {
-        let (len, _src) = socket.recv_from(&mut buf)?;
-        let header = HeaderSlice::from_slice(&buf[..len])?;
-        let header = header.to_header();
-        println!("header: {:?}", header);
+fn frame_handler(rr: &Option<RecordingStream>, frame: Frame) -> Result<(), Box<dyn Error>> {
+    if let Some(rr) = rr {
+        let points = rerun::Points3D::new(frame.points).with_colors(
+            frame
+                .reflect
+                .iter()
+                .map(|x| rerun::Color::from_rgb(x << 1, x << 1, x << 1)),
+        );
+        rr.log("points", &points)?;
     }
 
     Ok(())

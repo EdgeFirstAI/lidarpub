@@ -20,7 +20,10 @@ debug = true
 [dependencies]
 clap = { version = "4.5.23", features = ["derive"] }
 env_logger = "0.11"
-etherparse = "0.16.0"
-log = "0.4.22"
+etherparse = "0.17.0"
+log = "0.4.25"
+ndarray = "0.16.1"
 pcap-parser = "0.16.0"
 rerun = { version = "0.21.0" }
+serde = { version = "1.0.217", features = ["derive"] }
+serde_json = "1.0"

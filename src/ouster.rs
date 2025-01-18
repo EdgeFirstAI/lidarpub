@@ -1,10 +1,51 @@
-use std::fmt;
+use ndarray::Array2;
+use serde::{Deserialize, Serialize};
+use std::{f32::consts::PI, fmt};
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SensorInfo {
+    pub status: String,
+    pub build_rev: String,
+    pub prod_sn: String,
+    pub prod_pn: String,
+    pub prod_line: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LidarDataFormat {
+    pub udp_profile_lidar: String,
+    pub udp_profile_imu: String,
+    pub columns_per_packet: usize,
+    pub columns_per_frame: usize,
+    pub pixels_per_column: usize,
+    pub column_window: [usize; 2],
+    pub pixel_shift_by_row: Vec<i16>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BeamIntrinsics {
+    pub beam_azimuth_angles: Vec<f32>,
+    pub beam_altitude_angles: Vec<f32>,
+    pub beam_to_lidar_transform: Vec<f32>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Config {
+    pub sensor_info: SensorInfo,
+    pub lidar_data_format: LidarDataFormat,
+    pub beam_intrinsics: BeamIntrinsics,
+}
 
 #[derive(Debug)]
 pub enum Error {
     IoError(std::io::Error),
+    ShapeError(ndarray::ShapeError),
+    UnsupportedDataFormat(String),
     UnexpectedEndOfSlice(usize),
     UnknownPacketType(u16),
+    TooManyColumns(usize),
+    InsufficientColumns(usize),
+    UnsupportedRows(usize),
 }
 
 impl std::error::Error for Error {}
@@ -15,12 +56,25 @@ impl From<std::io::Error> for Error {
     }
 }
 
+impl From<ndarray::ShapeError> for Error {
+    fn from(err: ndarray::ShapeError) -> Error {
+        Error::ShapeError(err)
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> std::fmt::Result {
         match self {
             Error::IoError(err) => write!(f, "io error: {}", err),
+            Error::ShapeError(err) => write!(f, "shape error: {}", err),
+            Error::UnsupportedDataFormat(format) => {
+                write!(f, "unsupported lidar data format: {}", format)
+            }
             Error::UnexpectedEndOfSlice(len) => write!(f, "unexpected end of slice: {} bytes", len),
             Error::UnknownPacketType(typ) => write!(f, "unknown packet type: {}", typ),
+            Error::TooManyColumns(cols) => write!(f, "too many columns: {}", cols),
+            Error::InsufficientColumns(cols) => write!(f, "insufficient columns: {}", cols),
+            Error::UnsupportedRows(rows) => write!(f, "unsupported number of rows: {}", rows),
         }
     }
 }
@@ -161,19 +215,19 @@ impl<'a> HeaderSlice<'a> {
     }
 
     pub fn init_id(&self) -> u32 {
-        u32::from_le_bytes([0, self.slice[4], self.slice[5], self.slice[6]])
+        u32::from_le_bytes([self.slice[4], self.slice[5], self.slice[6], 0])
     }
 
     pub fn serial_number(&self) -> u64 {
         u64::from_le_bytes([
-            0,
-            0,
-            0,
             self.slice[7],
             self.slice[8],
             self.slice[9],
             self.slice[10],
             self.slice[11],
+            0,
+            0,
+            0,
         ])
     }
 
@@ -210,20 +264,214 @@ impl<'a> HeaderSlice<'a> {
     }
 
     pub fn alert_status(&self) -> AlertStatus {
-        println!("flags: {:b}", self.slice[12]);
         AlertStatus::from_flags(self.slice[12])
     }
 
-    /// Returns the slice containing the payload.
-    #[inline]
-    pub fn payload(&self) -> &'a [u8] {
-        unsafe {
-            // SAFETY: Safe as the slice length was verified
-            // to be at least UdpHeader::LEN by "from_slice".
-            core::slice::from_raw_parts(
-                self.slice.as_ptr().add(Header::LEN),
-                self.slice.len() - Header::LEN,
-            )
+    /// Returns the column at the given index.
+    pub fn column(&self, rows: usize, col: usize) -> Result<ColumnHeaderSlice<'a>, Error> {
+        let offset = Header::LEN + (ColumnHeader::LEN + DataBlock::LEN * rows) * col;
+        ColumnHeaderSlice::from_slice(&self.slice[offset..])
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ColumnHeader {
+    /// Timestamp of the measurement in nanoseconds.
+    pub timestamp: u64,
+    /// Sequentially incrementing measurement counting up from 0 to 511,
+    /// or 0 to 1023, or 0 to 2047 depending on lidar_mode.
+    pub measurement_id: u16,
+    /// Indicates validity of the measurements. Status is true for valid
+    /// measurements. Status is false for dropped or disabled columns.
+    pub status: bool,
+}
+
+impl ColumnHeader {
+    /// Length of the column header in bytes/octets.
+    pub const LEN: usize = 12;
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct ColumnHeaderSlice<'a> {
+    slice: &'a [u8],
+}
+
+impl<'a> ColumnHeaderSlice<'a> {
+    pub fn from_slice(slice: &'a [u8]) -> Result<ColumnHeaderSlice<'a>, Error> {
+        if slice.len() < ColumnHeader::LEN {
+            return Err(Error::UnexpectedEndOfSlice(slice.len()));
         }
+
+        Ok(ColumnHeaderSlice { slice })
+    }
+
+    pub fn to_column(&self) -> ColumnHeader {
+        ColumnHeader {
+            timestamp: self.timestamp(),
+            measurement_id: self.measurement_id(),
+            status: self.status(),
+        }
+    }
+
+    pub fn timestamp(&self) -> u64 {
+        u64::from_le_bytes([
+            self.slice[0],
+            self.slice[1],
+            self.slice[2],
+            self.slice[3],
+            self.slice[4],
+            self.slice[5],
+            self.slice[6],
+            self.slice[7],
+        ])
+    }
+
+    pub fn measurement_id(&self) -> u16 {
+        u16::from_le_bytes([self.slice[8], self.slice[9]])
+    }
+
+    pub fn status(&self) -> bool {
+        self.slice[10] & 1 != 0
+    }
+
+    pub fn row(&self, row: usize) -> Result<DataBlock, Error> {
+        let offset = ColumnHeader::LEN + row * DataBlock::LEN;
+
+        if self.slice.len() < offset + DataBlock::LEN {
+            let delta = offset + DataBlock::LEN - self.slice.len();
+            return Err(Error::UnexpectedEndOfSlice(delta));
+        }
+
+        Ok(DataBlock {
+            range: u16::from_le_bytes([self.slice[offset], self.slice[offset + 1] & 0x7F]) as u32
+                * 8,
+            reflect: self.slice[offset + 2],
+            nir: self.slice[offset + 3],
+        })
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct DataBlock {
+    /// Range in millimeters, discretized to the nearest 1 millimeters.
+    pub range: u32,
+    /// Sensor Signal Photons measurements are scaled based on measured range
+    /// and sensor sensitivity at that range, providing an indication of target
+    /// reflectivity.
+    pub reflect: u8,
+    /// NIR photons related to natural environmental illumination are reported.
+    pub nir: u8,
+}
+
+impl DataBlock {
+    /// Length of the data block in bytes/octets.
+    pub const LEN: usize = 4;
+}
+
+#[derive(Clone, Debug)]
+pub struct Frame {
+    pub frame_id: u16,
+    pub points: Vec<(f32, f32, f32)>,
+    pub reflect: Vec<u8>,
+}
+
+pub struct FrameReader {
+    pub rows: usize,
+    pub cols: usize,
+    columns_per_packet: usize,
+    beam_azimuth_angles: Vec<f32>,
+    beam_altitude_angles: Vec<f32>,
+    beam_to_lidar: Array2<f32>,
+    frame_id: u16,
+    range: Array2<u32>,
+    reflect: Array2<u8>,
+}
+
+impl FrameReader {
+    pub fn new(config: Config) -> Result<FrameReader, Error> {
+        if config.lidar_data_format.udp_profile_lidar != "RNG15_RFL8_NIR8" {
+            return Err(Error::UnsupportedDataFormat(
+                config.lidar_data_format.udp_profile_lidar,
+            ));
+        }
+
+        let cols = config.lidar_data_format.columns_per_frame;
+        let rows = config.lidar_data_format.pixels_per_column;
+        let columns_per_packet = config.lidar_data_format.columns_per_packet;
+        let beam_azimuth_angles = config.beam_intrinsics.beam_azimuth_angles;
+        let beam_altitude_angles = config.beam_intrinsics.beam_altitude_angles;
+        let beam_to_lidar = config.beam_intrinsics.beam_to_lidar_transform;
+
+        Ok(FrameReader {
+            rows,
+            cols,
+            columns_per_packet,
+            beam_azimuth_angles,
+            beam_altitude_angles,
+            beam_to_lidar: Array2::from_shape_vec((4, 4), beam_to_lidar)?,
+            frame_id: 0,
+            range: Array2::zeros((cols, rows)),
+            reflect: Array2::zeros((cols, rows)),
+        })
+    }
+
+    pub fn update(&mut self, slice: &[u8]) -> Result<Option<Frame>, Error> {
+        let mut frame = None;
+        let header = HeaderSlice::from_slice(slice)?;
+
+        if self.frame_id != header.frame_id() {
+            frame = Some(Frame {
+                frame_id: self.frame_id,
+                points: self.points(),
+                reflect: self.reflect.iter().cloned().collect(),
+            });
+
+            self.frame_id = header.frame_id();
+            self.range.fill(0);
+            self.reflect.fill(0);
+        }
+
+        for i in 0..self.columns_per_packet {
+            let column = header.column(self.rows, i)?;
+            if column.status() {
+                let col = column.measurement_id() as usize;
+                if col >= self.cols {
+                    return Err(Error::TooManyColumns(col));
+                }
+
+                for row in 0..self.rows {
+                    let data = column.row(row)?;
+                    self.range[[col, row]] = data.range;
+                    self.reflect[[col, row]] = data.reflect;
+                }
+            }
+        }
+
+        Ok(frame)
+    }
+
+    fn points(&self) -> Vec<(f32, f32, f32)> {
+        let n = (self.beam_to_lidar[[0, 3]].powi(2) + self.beam_to_lidar[[2, 3]].powi(2)).sqrt();
+        let mut points = Vec::with_capacity(self.cols * self.rows);
+
+        for col in 0..self.cols {
+            let enc = 2.0 * PI * (1.0 - col as f32 / self.cols as f32);
+            let x_delta = self.beam_to_lidar[[0, 3]] * enc.cos();
+            let y_delta = self.beam_to_lidar[[0, 3]] * enc.sin();
+
+            for row in 0..self.rows {
+                let r = self.range[[col, row]] as f32 * 10.0 - n;
+                let azi = -2.0 * PI * (self.beam_azimuth_angles[row] / 360.0);
+                let alt = 2.0 * PI * (self.beam_altitude_angles[row] / 360.0);
+
+                let x = r * (enc + azi).cos() * alt.cos() + x_delta;
+                let y = r * (enc + azi).sin() * alt.cos() + y_delta;
+                let z = r * alt.sin() + self.beam_to_lidar[[2, 3]];
+
+                points.push((x, y, z));
+            }
+        }
+
+        points
     }
 }
