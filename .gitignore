@@ -1,7 +1,10 @@
 /target
 /venv
+/.debug
 
 audit.json
 clippy.json
 outdated.json
 sonar-issues.json
+
+perf.data*
