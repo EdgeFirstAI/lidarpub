@@ -1,139 +1,116 @@
-use clap::Parser;
+use cdr::{CdrLe, Infinite};
+use clap::{builder::PossibleValuesParser, Parser};
+use edgefirst_schemas::{
+    builtin_interfaces::{self, Time},
+    geometry_msgs::{Quaternion, Transform, TransformStamped, Vector3},
+    sensor_msgs::{PointCloud2, PointField},
+    std_msgs::Header,
+};
+use itertools::izip;
 use lidarpub::ouster::{
-    BeamIntrinsics, Config, Frame, FrameReader, LidarDataFormat, Parameters, SensorInfo,
+    BeamIntrinsics, Config, FrameReader, LidarDataFormat, Parameters, SensorInfo,
 };
-use log::error;
-use pcap_parser::{traits::PcapReaderIterator, *};
-use rerun::{external::re_sdk_comms::DEFAULT_SERVER_PORT, RecordingStream};
+use log::{debug, error, trace};
 use std::{
-    error::Error,
-    fs::File,
-    io::BufReader,
-    net::{Ipv4Addr, SocketAddr, TcpStream},
-    path::Path,
+    net::TcpStream,
+    str::FromStr as _,
+    sync::Arc,
+    thread::{self, sleep},
+    time::{Duration, Instant},
 };
+use zenoh::prelude::{r#async::*, sync::SyncResolve};
+
+#[derive(Debug)]
+#[allow(dead_code)]
+pub enum PointFieldType {
+    INT8 = 1,
+    UINT8 = 2,
+    INT16 = 3,
+    UINT16 = 4,
+    INT32 = 5,
+    UINT32 = 6,
+    FLOAT32 = 7,
+    FLOAT64 = 8,
+}
 
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// connect to remote rerun viewer at this address
-    #[arg(short, long)]
-    connect: Option<Ipv4Addr>,
-
-    /// record rerun data to file instead of live viewer
-    #[arg(short, long)]
-    record: Option<String>,
-
-    /// launch local rerun viewer
-    #[arg(short, long)]
-    viewer: bool,
-
-    /// use this port for the rerun viewer (remote or web server)
-    #[arg(short, long)]
-    port: Option<u16>,
-
     /// Connect to target device or pcap file.  If target is a valid pcap file,
     /// it will be used otherwise it will be tried as a hostname or IP address.
-    #[arg()]
+    #[arg(env)]
     target: String,
+
+    /// Beam horizontal field of view start and stop angles in degrees.  
+    /// The 0 degree point is the rear connector of the LiDAR.
+    #[arg(long, num_args = 2, value_names = ["START", "STOP"], default_value = "0 360")]
+    view: Vec<u32>,
+
+    /// LiDAR columns per frame.
+    #[arg(long, default_value = "1024x10", 
+          value_parser = PossibleValuesParser::new(["512x10", "1024x10", "2048x10", "512x20", "1024x20",]))]
+    mode: u32,
+
+    /// Frame transformation vector from the base_link
+    #[arg(
+        long,
+        env,
+        default_value = "0 0 0",
+        value_delimiter = ' ',
+        num_args = 3
+    )]
+    tf_vec: Vec<f64>,
+
+    /// Frame transformation quaternion from the base_link
+    #[arg(
+        long,
+        env,
+        default_value = "0 0 0 1",
+        value_delimiter = ' ',
+        num_args = 4
+    )]
+    tf_quat: Vec<f64>,
+
+    /// The name of the base frame
+    #[arg(long, env, default_value = "base_link")]
+    base_frame_id: String,
+
+    /// The name of the lidar frame
+    #[arg(long, env, default_value = "lidar")]
+    frame_id: String,
+
+    /// lidar point cloud topic
+    #[arg(long, default_value = "rt/lidar/points")]
+    lidar_topic: String,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::init();
+#[async_std::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    env_logger::init();
 
-    let rr = if let Some(addr) = args.connect {
-        let port = args.port.unwrap_or(DEFAULT_SERVER_PORT);
-        let remote = SocketAddr::new(addr.into(), port);
-        Some(
-            rerun::RecordingStreamBuilder::new("radarview")
-                .connect_tcp_opts(remote, rerun::default_flush_timeout())?,
-        )
-    } else if let Some(record) = args.record {
-        Some(rerun::RecordingStreamBuilder::new("radarview").save(record)?)
-    } else if args.viewer {
-        Some(rerun::RecordingStreamBuilder::new("radarview").spawn()?)
-    } else {
-        None
-    };
+    let mut zenoh_config = zenoh::config::Config::default();
+    zenoh_config
+        .set_mode(Some(zenoh::config::WhatAmI::Client))
+        .unwrap();
+    let endpoint = zenoh::config::Locator::from_str("tcp/127.0.0.1:7447").unwrap();
+    zenoh_config.connect.endpoints = vec![endpoint.into()];
+    let _ = zenoh_config.scouting.multicast.set_enabled(Some(false));
+    let session = zenoh::open(zenoh_config)
+        .res_async()
+        .await
+        .unwrap()
+        .into_arc();
+    debug!("opened zenoh session");
 
-    if Path::new(&args.target).exists() {
-        pcap_loop(&rr, &args.target)?;
-    } else {
-        live_loop(&rr, &args.target)?;
-    }
+    spawn_tf_static(session.clone(), &args).await.unwrap();
 
-    Ok(())
-}
-
-fn pcap_loop(
-    rr: &Option<RecordingStream>,
-    path: &String,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let json_path = Path::new(path).with_extension("json");
-    let json = File::open(json_path)?;
-    let params: Parameters = serde_json::from_reader(json)?;
-    let mut frame_reader = FrameReader::new(params)?;
-
-    let pcap_path = Path::new(path).with_extension("pcap");
-    let pcap = File::open(pcap_path)?;
-    let buffered = BufReader::new(pcap);
-    let mut pcap_reader = LegacyPcapReader::new(65536, buffered)?;
-
-    loop {
-        match pcap_reader.next() {
-            Ok((offset, block)) => {
-                match block {
-                    PcapBlockOwned::LegacyHeader(_) => (),
-                    PcapBlockOwned::Legacy(block) => {
-                        match etherparse::SlicedPacket::from_ethernet(block.data) {
-                            Err(err) => error!("Err {:?}", err),
-                            Ok(pkt) => {
-                                if let Some(etherparse::TransportSlice::Udp(udp)) = pkt.transport {
-                                    if udp.destination_port() != 7502 {
-                                        pcap_reader.consume(offset);
-                                        continue;
-                                    }
-
-                                    if let Some(frame) = frame_reader.update(udp.payload())? {
-                                        if let Some(rr) = rr {
-                                            rr.set_time_seconds(
-                                                "stable_time",
-                                                frame.frame_id as f64 / 10.0,
-                                            );
-                                        }
-
-                                        frame_handler(rr, frame)?;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    PcapBlockOwned::NG(_) => unreachable!(),
-                }
-                pcap_reader.consume(offset);
-            }
-            Err(PcapError::Eof) => break,
-            Err(PcapError::Incomplete(_)) => {
-                pcap_reader.refill().unwrap();
-            }
-            Err(e) => panic!("error while reading: {:?}", e),
-        }
-    }
-
-    Ok(())
-}
-
-fn live_loop(
-    rr: &Option<RecordingStream>,
-    target: &String,
-) -> Result<(), Box<dyn std::error::Error>> {
     let local = {
-        let stream = TcpStream::connect(format!("{}:80", target))?;
+        let stream = TcpStream::connect(format!("{}:80", &args.target))?;
         stream.local_addr()?.ip()
     };
 
-    let api = format!("http://{}//api/v1/sensor", target);
+    let api = format!("http://{}//api/v1/sensor", &args.target);
 
     let config = Config {
         udp_dest: local.to_string(),
@@ -174,24 +151,159 @@ fn live_loop(
 
     loop {
         let (len, _src) = socket.recv_from(&mut buf)?;
-
         if let Some(frame) = frame_reader.update(&buf[..len])? {
-            // println!("frame_id: {:?}", frame.frame_id);
-            frame_handler(rr, frame)?;
+            let fields = vec![
+                PointField {
+                    name: String::from("x"),
+                    offset: 0,
+                    datatype: PointFieldType::FLOAT32 as u8,
+                    count: 1,
+                },
+                PointField {
+                    name: String::from("y"),
+                    offset: 4,
+                    datatype: PointFieldType::FLOAT32 as u8,
+                    count: 1,
+                },
+                PointField {
+                    name: String::from("z"),
+                    offset: 8,
+                    datatype: PointFieldType::FLOAT32 as u8,
+                    count: 1,
+                },
+                PointField {
+                    name: String::from("reflect"),
+                    offset: 12,
+                    datatype: PointFieldType::UINT8 as u8,
+                    count: 1,
+                },
+                PointField {
+                    name: String::from("nir"),
+                    offset: 13,
+                    datatype: PointFieldType::UINT8 as u8,
+                    count: 1,
+                },
+            ];
+
+            let n_points = frame.points.len();
+            let data: Vec<_> = izip!(frame.points, frame.reflect, frame.nir)
+                .map(|(p, reflect, nir)| {
+                    let x = p.0.to_le_bytes();
+                    let y = p.1.to_le_bytes();
+                    let z = p.2.to_le_bytes();
+
+                    vec![
+                        x[0], x[1], x[2], x[3], y[0], y[1], y[2], y[3], z[0], z[1], z[2], z[3],
+                        reflect, nir,
+                    ]
+                })
+                .flatten()
+                .collect();
+
+            let msg = PointCloud2 {
+                header: Header {
+                    stamp: timestamp()?,
+                    frame_id: args.frame_id.clone(),
+                },
+                height: 1,
+                width: n_points as u32,
+                fields,
+                is_bigendian: false,
+                point_step: 14,
+                row_step: 0,
+                data,
+                is_dense: true,
+            };
+            let encoded = cdr::serialize::<_, _, CdrLe>(&msg, Infinite)?;
+
+            match session
+                .put(&args.lidar_topic, encoded)
+                .encoding(Encoding::WithSuffix(
+                    KnownEncoding::AppOctetStream,
+                    "sensor_msgs/msg/PointCloud2".into(),
+                ))
+                .res_async()
+                .await
+            {
+                Ok(_) => trace!("{} message sent", args.lidar_topic),
+                Err(e) => error!("{} message error: {:?}", args.lidar_topic, e),
+            }
         }
     }
 }
 
-fn frame_handler(rr: &Option<RecordingStream>, frame: Frame) -> Result<(), Box<dyn Error>> {
-    if let Some(rr) = rr {
-        let points = rerun::Points3D::new(frame.points).with_colors(
-            frame
-                .reflect
-                .iter()
-                .map(|x| rerun::Color::from_rgb(x << 1, x << 1, x << 1)),
-        );
-        rr.log("points", &points)?;
-    }
+async fn spawn_tf_static(
+    session: Arc<zenoh::Session>,
+    args: &Args,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let publisher = match session
+        .declare_publisher("rt/tf_static".to_string())
+        .priority(Priority::Background)
+        .congestion_control(CongestionControl::Drop)
+        .res_async()
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            error!("Failed to create publisher rt/tf_static: {:?}", e);
+            return Err(e);
+        }
+    };
+
+    let msg = TransformStamped {
+        header: Header {
+            frame_id: args.base_frame_id.clone(),
+            stamp: timestamp().unwrap_or(Time { sec: 0, nanosec: 0 }),
+        },
+        child_frame_id: args.frame_id.clone(),
+        transform: Transform {
+            translation: Vector3 {
+                x: args.tf_vec[0],
+                y: args.tf_vec[1],
+                z: args.tf_vec[2],
+            },
+            rotation: Quaternion {
+                x: args.tf_quat[0],
+                y: args.tf_quat[1],
+                z: args.tf_quat[2],
+                w: args.tf_quat[3],
+            },
+        },
+    };
+
+    let msg =
+        Value::from(cdr::serialize::<_, _, CdrLe>(&msg, Infinite)?).encoding(Encoding::WithSuffix(
+            KnownEncoding::AppOctetStream,
+            "geometry_msgs/msg/TransformStamped".into(),
+        ));
+
+    thread::spawn(move || {
+        let interval = Duration::from_secs(1);
+        let mut target_time = Instant::now() + interval;
+
+        loop {
+            publisher.put(msg.clone()).res_sync().unwrap();
+            trace!("lidarpub publishing rt/tf_static");
+            sleep(target_time.duration_since(Instant::now()));
+            target_time += interval
+        }
+    });
 
     Ok(())
+}
+
+fn timestamp() -> Result<builtin_interfaces::Time, std::io::Error> {
+    let mut tp = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let err = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, &mut tp) };
+    if err != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    Ok(builtin_interfaces::Time {
+        sec: tp.tv_sec as i32,
+        nanosec: tp.tv_nsec as u32,
+    })
 }

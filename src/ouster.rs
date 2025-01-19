@@ -392,6 +392,7 @@ pub struct Frame {
     pub frame_id: u16,
     pub points: Vec<(f32, f32, f32)>,
     pub reflect: Vec<u8>,
+    pub nir: Vec<u8>,
 }
 
 pub struct FrameReader {
@@ -404,6 +405,7 @@ pub struct FrameReader {
     frame_id: u16,
     range: Array2<u32>,
     reflect: Array2<u8>,
+    nir: Array2<u8>,
 }
 
 impl FrameReader {
@@ -431,6 +433,7 @@ impl FrameReader {
             frame_id: 0,
             range: Array2::zeros((cols, rows)),
             reflect: Array2::zeros((cols, rows)),
+            nir: Array2::zeros((cols, rows)),
         })
     }
 
@@ -443,11 +446,13 @@ impl FrameReader {
                 frame_id: self.frame_id,
                 points: self.points(),
                 reflect: self.reflect.iter().cloned().collect(),
+                nir: self.nir.iter().cloned().collect(),
             });
 
             self.frame_id = header.frame_id();
             self.range.fill(0);
             self.reflect.fill(0);
+            self.nir.fill(0);
         }
 
         for i in 0..self.columns_per_packet {
@@ -462,6 +467,7 @@ impl FrameReader {
                     let data = column.row(row)?;
                     self.range[[col, row]] = data.range;
                     self.reflect[[col, row]] = data.reflect;
+                    self.nir[[col, row]] = data.nir;
                 }
             }
         }

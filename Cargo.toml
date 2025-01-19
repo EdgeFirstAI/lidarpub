@@ -5,6 +5,7 @@ repository = "https://bitbucket.org/au-zone/lidarpub"
 license = "CLOSED"
 version = "0.0.0"
 edition = "2021"
+default-run = "lidarpub"
 
 [profile.release]
 opt-level = 3
@@ -17,14 +18,30 @@ inherits = "release"
 strip = false
 debug = true
 
+[[bin]]
+name = "lidar-rerun"
+path = "src/rerun.rs"
+required-features = ["rerun"]
+
+[features]
+default = []
+rerun = ["dep:rerun", "dep:etherparse", "dep:pcap-parser"]
+
 [dependencies]
-clap = { version = "4.5.23", features = ["derive"] }
+async-std = { version = "1.12.0", features = ["attributes"] }
+cdr = "0.2.4"
+clap = { version = "4.5.26", features = ["derive", "env"] }
+edgefirst-schemas = "1.2.4"
 env_logger = "0.11"
-etherparse = "0.17.0"
+etherparse = { version = "0.17.0", optional = true }
+itertools = "0.14.0"
+libc = "0.2.167"
 log = "0.4.25"
 ndarray = "0.16.1"
-pcap-parser = "0.16.0"
-rerun = { version = "0.21.0" }
+pcap-parser = { version = "0.16.0", optional = true }
+rerun = { version = "0.21.0", optional = true }
 serde = { version = "1.0.217", features = ["derive"] }
-serde_json = "1.0"
+serde_json = "1.0.136"
+unix-ts = "1.0"
 ureq = { version = "2.12.1", features = ["json"] }
+zenoh = "0.10.0-rc"
