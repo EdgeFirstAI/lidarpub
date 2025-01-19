@@ -43,13 +43,13 @@ struct Args {
 
     /// Beam horizontal field of view start and stop angles in degrees.  
     /// The 0 degree point is the rear connector of the LiDAR.
-    #[arg(long, num_args = 2, value_names = ["START", "STOP"], default_value = "0 360")]
+    #[arg(long, num_args = 2, value_names = ["START", "STOP"], value_delimiter=' ', default_value = "0 360")]
     view: Vec<u32>,
 
     /// LiDAR columns per frame.
     #[arg(long, default_value = "1024x10", 
           value_parser = PossibleValuesParser::new(["512x10", "1024x10", "2048x10", "512x20", "1024x20",]))]
-    mode: u32,
+    mode: String,
 
     /// Frame transformation vector from the base_link
     #[arg(
@@ -210,7 +210,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 fields,
                 is_bigendian: false,
                 point_step: 14,
-                row_step: 0,
+                row_step: 14 * n_points as u32,
                 data,
                 is_dense: true,
             };
