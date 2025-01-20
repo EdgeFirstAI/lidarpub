@@ -543,9 +543,9 @@ impl FrameReader {
                     let z = r * self.altitude_angles[row] + self.beam_to_lidar[[2, 3]];
 
                     points.push(Point {
-                        x: x / 1000.0,
-                        y: y / 1000.0,
-                        z: z / 1000.0,
+                        x: x * 0.001,
+                        y: y * 0.001,
+                        z: z * 0.001,
                         reflect: self.reflect[[col, row]],
                         nir: self.nir[[col, row]],
                     });

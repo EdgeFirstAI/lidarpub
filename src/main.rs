@@ -6,7 +6,6 @@ use edgefirst_schemas::{
     sensor_msgs::{PointCloud2, PointField},
     std_msgs::Header,
 };
-use itertools::izip;
 use lidarpub::ouster::{
     BeamIntrinsics, Config, FrameReader, LidarDataFormat, Parameters, SensorInfo,
 };
