@@ -238,15 +238,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ];
 
             let n_points = frame.points.len();
-            let data: Vec<_> = izip!(frame.points, frame.reflect, frame.nir)
-                .flat_map(|(p, reflect, nir)| {
-                    let x = p.0.to_ne_bytes();
-                    let y = p.1.to_ne_bytes();
-                    let z = p.2.to_ne_bytes();
+            let data: Vec<_> = frame
+                .points
+                .iter()
+                .flat_map(|pt| {
+                    let x = pt.x.to_ne_bytes();
+                    let y = pt.y.to_ne_bytes();
+                    let z = pt.z.to_ne_bytes();
 
                     [
                         x[0], x[1], x[2], x[3], y[0], y[1], y[2], y[3], z[0], z[1], z[2], z[3],
-                        reflect, nir,
+                        pt.reflect, pt.nir,
                     ]
                 })
                 .collect();
@@ -265,7 +267,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 data,
                 is_dense: true,
             };
-            
+
             let encoded = cdr::serialize::<_, _, CdrLe>(&msg, Infinite)?;
             let encoded = Value::from(encoded).encoding(Encoding::WithSuffix(
                 KnownEncoding::AppOctetStream,

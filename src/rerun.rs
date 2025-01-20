@@ -184,12 +184,12 @@ fn live_loop(
 
 fn frame_handler(rr: &Option<RecordingStream>, frame: Frame) -> Result<(), Box<dyn Error>> {
     if let Some(rr) = rr {
-        let points = rerun::Points3D::new(frame.points).with_colors(
-            frame
-                .reflect
-                .iter()
-                .map(|x| rerun::Color::from_rgb(x << 1, x << 1, x << 1)),
-        );
+        rr.log("n_points", &rerun::Scalar::new(frame.points.len() as f64))?;
+        let points: Vec<_> = frame.points.iter().map(|pt| (pt.x, pt.y, pt.z)).collect();
+        let points =
+            rerun::Points3D::new(points).with_colors(frame.points.iter().map(|pt| {
+                rerun::Color::from_rgb(pt.reflect << 1, pt.reflect << 1, pt.reflect << 1)
+            }));
         rr.log("points", &points)?;
     }
 

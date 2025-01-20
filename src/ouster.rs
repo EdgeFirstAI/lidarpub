@@ -389,20 +389,31 @@ impl DataBlock {
 }
 
 #[derive(Clone, Debug)]
+pub struct Point {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub reflect: u8,
+    pub nir: u8,
+}
+
+#[derive(Clone, Debug)]
 pub struct Frame {
     pub frame_id: u16,
-    pub points: Vec<(f32, f32, f32)>,
-    pub reflect: Vec<u8>,
-    pub nir: Vec<u8>,
+    pub points: Vec<Point>,
 }
 
 pub struct FrameReader {
     pub rows: usize,
     pub cols: usize,
     columns_per_packet: usize,
-    beam_azimuth_angles: Vec<f32>,
-    beam_altitude_angles: Vec<f32>,
     beam_to_lidar: Array2<f32>,
+    altitude_angles: Vec<f32>,
+    range_delta: f32,
+    x_range: Array2<f32>,
+    y_range: Array2<f32>,
+    x_delta: Vec<f32>,
+    y_delta: Vec<f32>,
     frame_id: u16,
     range: Array2<u16>,
     reflect: Array2<u8>,
@@ -420,17 +431,60 @@ impl FrameReader {
         let cols = params.lidar_data_format.columns_per_frame;
         let rows = params.lidar_data_format.pixels_per_column;
         let columns_per_packet = params.lidar_data_format.columns_per_packet;
-        let beam_azimuth_angles = params.beam_intrinsics.beam_azimuth_angles;
-        let beam_altitude_angles = params.beam_intrinsics.beam_altitude_angles;
-        let beam_to_lidar = params.beam_intrinsics.beam_to_lidar_transform;
+        let beam_to_lidar =
+            Array2::from_shape_vec((4, 4), params.beam_intrinsics.beam_to_lidar_transform)?;
+        let range_delta = (beam_to_lidar[[0, 3]].powi(2) + beam_to_lidar[[2, 3]].powi(2)).sqrt();
+
+        let enc = (0..cols)
+            .map(|col| 2.0 * PI * (1.0 - col as f32 / cols as f32))
+            .collect::<Vec<_>>();
+
+        let azimuth_angles: Vec<_> = params
+            .beam_intrinsics
+            .beam_azimuth_angles
+            .iter()
+            .map(|x| -2.0 * PI * (x / 360.0))
+            .collect();
+
+        let altitude_angles: Vec<_> = params
+            .beam_intrinsics
+            .beam_altitude_angles
+            .iter()
+            .map(|x| 2.0 * PI * (x / 360.0))
+            .collect();
+
+        let mut x_range = Array2::zeros((cols, rows));
+        let mut y_range = Array2::zeros((cols, rows));
+
+        for col in 0..cols {
+            for row in 0..rows {
+                x_range[[col, row]] =
+                    (enc[col] + azimuth_angles[row]).cos() * altitude_angles[row].cos();
+                y_range[[col, row]] =
+                    (enc[col] + azimuth_angles[row]).sin() * altitude_angles[row].cos();
+            }
+        }
+
+        let x_delta = enc
+            .iter()
+            .map(|x| beam_to_lidar[[0, 3]] * x.cos())
+            .collect();
+        let y_delta = enc
+            .iter()
+            .map(|x| beam_to_lidar[[0, 3]] * x.sin())
+            .collect();
 
         Ok(FrameReader {
             rows,
             cols,
             columns_per_packet,
-            beam_azimuth_angles,
-            beam_altitude_angles,
-            beam_to_lidar: Array2::from_shape_vec((4, 4), beam_to_lidar)?,
+            beam_to_lidar,
+            altitude_angles: altitude_angles.iter().map(|x| x.sin()).collect(),
+            range_delta,
+            x_range,
+            y_range,
+            x_delta,
+            y_delta,
             frame_id: 0,
             range: Array2::zeros((cols, rows)),
             reflect: Array2::zeros((cols, rows)),
@@ -446,8 +500,6 @@ impl FrameReader {
             frame = Some(Frame {
                 frame_id: self.frame_id,
                 points: self.points(),
-                reflect: self.reflect.iter().cloned().collect(),
-                nir: self.nir.iter().cloned().collect(),
             });
 
             self.frame_id = header.frame_id();
@@ -476,28 +528,27 @@ impl FrameReader {
         Ok(frame)
     }
 
-    fn points(&self) -> Vec<(f32, f32, f32)> {
-        let n = (self.beam_to_lidar[[0, 3]].powi(2) + self.beam_to_lidar[[2, 3]].powi(2)).sqrt();
+    fn points(&self) -> Vec<Point> {
         let mut points = Vec::with_capacity(self.cols * self.rows);
 
         for col in 0..self.cols {
-            let enc = 2.0 * PI * (1.0 - col as f32 / self.cols as f32);
-            let x_delta = self.beam_to_lidar[[0, 3]] * enc.cos();
-            let y_delta = self.beam_to_lidar[[0, 3]] * enc.sin();
+            let x_delta_col = self.x_delta[col];
+            let y_delta_col = self.y_delta[col];
 
             for row in 0..self.rows {
                 if self.range[[col, row]] > 0 {
-                    let r = self.range[[col, row]] as f32 * 10.0 - n;
-                    let azi = -2.0 * PI * (self.beam_azimuth_angles[row] / 360.0);
-                    let alt = 2.0 * PI * (self.beam_altitude_angles[row] / 360.0);
+                    let r = self.range[[col, row]] as f32 * 8.0 - self.range_delta;
+                    let x = r * self.x_range[[col, row]] + x_delta_col;
+                    let y = r * self.y_range[[col, row]] + y_delta_col;
+                    let z = r * self.altitude_angles[row] + self.beam_to_lidar[[2, 3]];
 
-                    let x = r * (enc + azi).cos() * alt.cos() + x_delta;
-                    let y = r * (enc + azi).sin() * alt.cos() + y_delta;
-                    let z = r * alt.sin() + self.beam_to_lidar[[2, 3]];
-
-                    points.push((x / 1000.0, y / 1000.0, z / 1000.0));
-                } else {
-                    points.push((0.0, 0.0, 0.0));
+                    points.push(Point {
+                        x: x / 1000.0,
+                        y: y / 1000.0,
+                        z: z / 1000.0,
+                        reflect: self.reflect[[col, row]],
+                        nir: self.nir[[col, row]],
+                    });
                 }
             }
         }
