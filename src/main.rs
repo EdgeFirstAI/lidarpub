@@ -47,7 +47,7 @@ struct Args {
     #[arg(long, num_args = 2, value_names = ["START", "STOP"], value_delimiter=' ', default_value = "0 360")]
     azimuth: Vec<u32>,
 
-    /// LiDAR columns per frame.
+    /// LiDAR column and refresh rate mode.  The format is "COLxHZ".
     #[arg(long, default_value = "1024x10", 
           value_parser = PossibleValuesParser::new(["512x10", "1024x10", "2048x10", "512x20", "1024x20",]))]
     mode: String,
