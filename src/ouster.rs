@@ -7,6 +7,7 @@ pub struct Config {
     pub udp_dest: String,
     pub udp_port_lidar: u16,
     pub udp_profile_lidar: String,
+    pub lidar_mode: String,
     pub azimuth_window: [u32; 2],
 }
 
@@ -16,6 +17,7 @@ impl Default for Config {
             udp_dest: "".to_owned(),
             udp_port_lidar: 7502,
             udp_profile_lidar: "RNG15_RFL8_NIR8".to_owned(),
+            lidar_mode: "1024x10".to_owned(),
             azimuth_window: [0, 360000],
         }
     }
@@ -362,8 +364,7 @@ impl<'a> ColumnHeaderSlice<'a> {
         }
 
         Ok(DataBlock {
-            range: u16::from_le_bytes([self.slice[offset], self.slice[offset + 1] & 0x7F]) as u32
-                * 8,
+            range: u16::from_le_bytes([self.slice[offset], self.slice[offset + 1] & 0x7F]),
             reflect: self.slice[offset + 2],
             nir: self.slice[offset + 3],
         })
@@ -373,7 +374,7 @@ impl<'a> ColumnHeaderSlice<'a> {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct DataBlock {
     /// Range in millimeters, discretized to the nearest 1 millimeters.
-    pub range: u32,
+    pub range: u16,
     /// Sensor Signal Photons measurements are scaled based on measured range
     /// and sensor sensitivity at that range, providing an indication of target
     /// reflectivity.
@@ -403,7 +404,7 @@ pub struct FrameReader {
     beam_altitude_angles: Vec<f32>,
     beam_to_lidar: Array2<f32>,
     frame_id: u16,
-    range: Array2<u32>,
+    range: Array2<u16>,
     reflect: Array2<u8>,
     nir: Array2<u8>,
 }
@@ -485,15 +486,19 @@ impl FrameReader {
             let y_delta = self.beam_to_lidar[[0, 3]] * enc.sin();
 
             for row in 0..self.rows {
-                let r = self.range[[col, row]] as f32 * 10.0 - n;
-                let azi = -2.0 * PI * (self.beam_azimuth_angles[row] / 360.0);
-                let alt = 2.0 * PI * (self.beam_altitude_angles[row] / 360.0);
+                if self.range[[col, row]] > 0 {
+                    let r = self.range[[col, row]] as f32 * 10.0 - n;
+                    let azi = -2.0 * PI * (self.beam_azimuth_angles[row] / 360.0);
+                    let alt = 2.0 * PI * (self.beam_altitude_angles[row] / 360.0);
 
-                let x = r * (enc + azi).cos() * alt.cos() + x_delta;
-                let y = r * (enc + azi).sin() * alt.cos() + y_delta;
-                let z = r * alt.sin() + self.beam_to_lidar[[2, 3]];
+                    let x = r * (enc + azi).cos() * alt.cos() + x_delta;
+                    let y = r * (enc + azi).sin() * alt.cos() + y_delta;
+                    let z = r * alt.sin() + self.beam_to_lidar[[2, 3]];
 
-                points.push((x, y, z));
+                    points.push((x / 1000.0, y / 1000.0, z / 1000.0));
+                } else {
+                    points.push((0.0, 0.0, 0.0));
+                }
             }
         }
 

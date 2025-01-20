@@ -10,8 +10,10 @@ use itertools::izip;
 use lidarpub::ouster::{
     BeamIntrinsics, Config, FrameReader, LidarDataFormat, Parameters, SensorInfo,
 };
-use log::{debug, error, trace};
+use log::{debug, error, info, trace};
 use std::{
+    io::IsTerminal as _,
+    io::Write as _,
     net::TcpStream,
     str::FromStr as _,
     sync::Arc,
@@ -41,10 +43,10 @@ struct Args {
     #[arg(env)]
     target: String,
 
-    /// Beam horizontal field of view start and stop angles in degrees.  
+    /// Azimuth field of view start and stop angles in degrees.  
     /// The 0 degree point is the rear connector of the LiDAR.
     #[arg(long, num_args = 2, value_names = ["START", "STOP"], value_delimiter=' ', default_value = "0 360")]
-    view: Vec<u32>,
+    azimuth: Vec<u32>,
 
     /// LiDAR columns per frame.
     #[arg(long, default_value = "1024x10", 
@@ -114,6 +116,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = Config {
         udp_dest: local.to_string(),
+        lidar_mode: args.mode.clone(),
+        azimuth_window: args
+            .azimuth
+            .iter()
+            .map(|x| x * 1000)
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap(),
         ..Default::default()
     };
 
@@ -121,11 +131,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = ureq::get(&format!("{}/config", api))
         .call()?
         .into_json::<Config>()?;
-    println!("config: {:?}", config);
+    info!("{:?}", config);
 
-    let sensor_info = ureq::get(&format!("{}/metadata/sensor_info", api))
-        .call()?
-        .into_json::<SensorInfo>()?;
+    // Get sensor_info continuously until it is running with the updated config.
+    let sensor_info = {
+        if std::io::stdout().is_terminal() {
+            print!("Waiting for LiDAR to initialize");
+            std::io::stdout().flush()?;
+        }
+
+        loop {
+            let sensor_info = ureq::get(&format!("{}/metadata/sensor_info", api))
+                .call()?
+                .into_json::<SensorInfo>()?;
+            if sensor_info.status == "RUNNING" {
+                if std::io::stdout().is_terminal() {
+                    println!("done.");
+                } else {
+                    info!("LiDAR initialization complete");
+                }
+                break sensor_info;
+            }
+
+            if std::io::stdout().is_terminal() {
+                print!(".");
+                std::io::stdout().flush()?;
+            }
+
+            sleep(Duration::from_secs(1));
+        }
+    };
+
     let lidar_data_format = ureq::get(&format!("{}/metadata/lidar_data_format", api))
         .call()?
         .into_json::<LidarDataFormat>()?;
@@ -139,6 +175,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         beam_intrinsics,
     };
 
+    debug!("{:?}", params);
+
     // On Linux [::] will bind to IPv4 and IPv6 but not on Windows so we bind
     // according to the local address IP version.
     let bind_addr = match local.is_ipv4() {
@@ -148,6 +186,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let socket = std::net::UdpSocket::bind(bind_addr)?;
     let mut buf = [0u8; 16 * 1024];
     let mut frame_reader = FrameReader::new(params)?;
+
+    let publisher = match session
+        .declare_publisher(args.lidar_topic.clone())
+        .priority(Priority::DataHigh)
+        .congestion_control(CongestionControl::Drop)
+        .res_async()
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            error!("Failed to create publisher {}: {:?}", args.lidar_topic, e);
+            return Err(e);
+        }
+    };
 
     loop {
         let (len, _src) = socket.recv_from(&mut buf)?;
@@ -187,17 +239,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let n_points = frame.points.len();
             let data: Vec<_> = izip!(frame.points, frame.reflect, frame.nir)
-                .map(|(p, reflect, nir)| {
-                    let x = p.0.to_le_bytes();
-                    let y = p.1.to_le_bytes();
-                    let z = p.2.to_le_bytes();
+                .flat_map(|(p, reflect, nir)| {
+                    let x = p.0.to_ne_bytes();
+                    let y = p.1.to_ne_bytes();
+                    let z = p.2.to_ne_bytes();
 
-                    vec![
+                    [
                         x[0], x[1], x[2], x[3], y[0], y[1], y[2], y[3], z[0], z[1], z[2], z[3],
                         reflect, nir,
                     ]
                 })
-                .flatten()
                 .collect();
 
             let msg = PointCloud2 {
@@ -214,17 +265,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 data,
                 is_dense: true,
             };
+            
             let encoded = cdr::serialize::<_, _, CdrLe>(&msg, Infinite)?;
+            let encoded = Value::from(encoded).encoding(Encoding::WithSuffix(
+                KnownEncoding::AppOctetStream,
+                "sensor_msgs/msg/PointCloud2".into(),
+            ));
 
-            match session
-                .put(&args.lidar_topic, encoded)
-                .encoding(Encoding::WithSuffix(
-                    KnownEncoding::AppOctetStream,
-                    "sensor_msgs/msg/PointCloud2".into(),
-                ))
-                .res_async()
-                .await
-            {
+            match publisher.put(encoded).res_async().await {
                 Ok(_) => trace!("{} message sent", args.lidar_topic),
                 Err(e) => error!("{} message error: {:?}", args.lidar_topic, e),
             }
@@ -277,17 +325,19 @@ async fn spawn_tf_static(
             "geometry_msgs/msg/TransformStamped".into(),
         ));
 
-    thread::spawn(move || {
-        let interval = Duration::from_secs(1);
-        let mut target_time = Instant::now() + interval;
+    thread::Builder::new()
+        .name("tf_static".to_string())
+        .spawn(move || {
+            let interval = Duration::from_secs(1);
+            let mut target_time = Instant::now() + interval;
 
-        loop {
-            publisher.put(msg.clone()).res_sync().unwrap();
-            trace!("lidarpub publishing rt/tf_static");
-            sleep(target_time.duration_since(Instant::now()));
-            target_time += interval
-        }
-    });
+            loop {
+                publisher.put(msg.clone()).res_sync().unwrap();
+                trace!("lidarpub publishing rt/tf_static");
+                sleep(target_time.duration_since(Instant::now()));
+                target_time += interval
+            }
+        })?;
 
     Ok(())
 }

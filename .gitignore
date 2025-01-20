@@ -8,3 +8,4 @@ outdated.json
 sonar-issues.json
 
 perf.data*
+kallsyms*
