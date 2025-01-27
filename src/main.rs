@@ -44,11 +44,11 @@ struct Args {
 
     /// Azimuth field of view start and stop angles in degrees.  
     /// The 0 degree point is the rear connector of the LiDAR.
-    #[arg(long, num_args = 2, value_names = ["START", "STOP"], value_delimiter=' ', default_value = "0 360")]
+    #[arg(long, env, num_args = 2, value_names = ["START", "STOP"], value_delimiter=' ', default_value = "0 360")]
     azimuth: Vec<u32>,
 
     /// LiDAR column and refresh rate mode.  The format is "COLxHZ".
-    #[arg(long, default_value = "1024x10", 
+    #[arg(long, env, default_value = "1024x10", 
           value_parser = PossibleValuesParser::new(["512x10", "1024x10", "2048x10", "512x20", "1024x20",]))]
     mode: String,
 
@@ -81,7 +81,7 @@ struct Args {
     frame_id: String,
 
     /// lidar point cloud topic
-    #[arg(long, default_value = "rt/lidar/points")]
+    #[arg(long, env, default_value = "rt/lidar/points")]
     lidar_topic: String,
 }
 
