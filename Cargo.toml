@@ -24,7 +24,7 @@ path = "src/rerun.rs"
 required-features = ["rerun"]
 
 [features]
-default = ["rerun"]
+default = []
 rerun = ["dep:rerun", "dep:etherparse", "dep:pcap-parser"]
 
 [dependencies]
