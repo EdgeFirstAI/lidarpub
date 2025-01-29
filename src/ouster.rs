@@ -393,19 +393,22 @@ pub struct Point {
     pub x: f32,
     pub y: f32,
     pub z: f32,
-    pub reflect: u8,
-    pub nir: u8,
+    pub r: u8,
 }
 
 #[derive(Clone, Debug)]
 pub struct Frame {
     pub frame_id: u16,
+    pub depth: Array2<u16>,
+    pub reflect: Array2<u8>,
     pub points: Vec<Point>,
 }
 
 pub struct FrameReader {
     pub rows: usize,
     pub cols: usize,
+    pixel_shift_by_row: Vec<i16>,
+    column_window: [usize; 2],
     columns_per_packet: usize,
     beam_to_lidar: Array2<f32>,
     altitude_angles: Vec<f32>,
@@ -415,9 +418,8 @@ pub struct FrameReader {
     x_delta: Vec<f32>,
     y_delta: Vec<f32>,
     frame_id: u16,
-    range: Array2<u16>,
+    depth: Array2<u16>,
     reflect: Array2<u8>,
-    nir: Array2<u8>,
 }
 
 impl FrameReader {
@@ -430,6 +432,8 @@ impl FrameReader {
 
         let cols = params.lidar_data_format.columns_per_frame;
         let rows = params.lidar_data_format.pixels_per_column;
+        let pixel_shift_by_row = params.lidar_data_format.pixel_shift_by_row.clone();
+        let column_window = params.lidar_data_format.column_window;
         let columns_per_packet = params.lidar_data_format.columns_per_packet;
         let beam_to_lidar =
             Array2::from_shape_vec((4, 4), params.beam_intrinsics.beam_to_lidar_transform)?;
@@ -477,6 +481,8 @@ impl FrameReader {
         Ok(FrameReader {
             rows,
             cols,
+            pixel_shift_by_row,
+            column_window,
             columns_per_packet,
             beam_to_lidar,
             altitude_angles: altitude_angles.iter().map(|x| x.sin()).collect(),
@@ -486,9 +492,8 @@ impl FrameReader {
             x_delta,
             y_delta,
             frame_id: 0,
-            range: Array2::zeros((cols, rows)),
+            depth: Array2::zeros((cols, rows)),
             reflect: Array2::zeros((cols, rows)),
-            nir: Array2::zeros((cols, rows)),
         })
     }
 
@@ -497,15 +502,17 @@ impl FrameReader {
         let header = HeaderSlice::from_slice(slice)?;
 
         if self.frame_id != header.frame_id() {
+            let (depth, reflect) = self.images();
             frame = Some(Frame {
                 frame_id: self.frame_id,
                 points: self.points(),
+                depth,
+                reflect,
             });
 
             self.frame_id = header.frame_id();
-            self.range.fill(0);
+            self.depth.fill(0);
             self.reflect.fill(0);
-            self.nir.fill(0);
         }
 
         for i in 0..self.columns_per_packet {
@@ -518,9 +525,8 @@ impl FrameReader {
 
                 for row in 0..self.rows {
                     let data = column.row(row)?;
-                    self.range[[col, row]] = data.range;
+                    self.depth[[col, row]] = data.range;
                     self.reflect[[col, row]] = data.reflect;
-                    self.nir[[col, row]] = data.nir;
                 }
             }
         }
@@ -528,16 +534,58 @@ impl FrameReader {
         Ok(frame)
     }
 
-    fn points(&self) -> Vec<Point> {
-        let mut points = Vec::with_capacity(self.cols * self.rows);
+    fn images(&self) -> (Array2<u16>, Array2<u8>) {
+        let rows = self.rows;
+        let cols = self.column_window[1] - self.column_window[0];
+        let col_offset = self.column_window[0];
 
-        for col in 0..self.cols {
+        let mut depth = Array2::<u16>::zeros((rows, cols));
+        let mut reflect = Array2::<u8>::zeros((rows, cols));
+
+        for row in 0..rows {
+            let shift = self.pixel_shift_by_row[row];
+
+            for col in 0..cols {
+                let colout = col as i16 + shift;
+                let colout = if colout < 0 {
+                    cols as i16 + colout
+                } else if colout >= cols as i16 {
+                    colout - cols as i16
+                } else {
+                    colout
+                } as usize;
+
+                depth[[row, colout]] =
+                    (self.depth[[col + col_offset, row]] as f32 * 8.0 - self.range_delta) as u16;
+                reflect[[row, colout]] = self.reflect[[col + col_offset, row]];
+            }
+        }
+
+        // The left and right columns are incomplete within the pixel shift
+        // region.  We crop out this region to return the clean subset.
+        let mut pixel_shift = self.pixel_shift_by_row.clone();
+        pixel_shift.sort_unstable();
+        let left = pixel_shift[pixel_shift.len() - 1];
+        let right = pixel_shift[0].abs();
+        let right = cols as i16 - right;
+
+        let depth = depth.slice(ndarray::s![.., left as usize..right as usize]);
+        let reflect = reflect.slice(ndarray::s![.., left as usize..right as usize]);
+
+        (depth.to_owned(), reflect.to_owned())
+    }
+
+    fn points(&self) -> Vec<Point> {
+        let (left, right) = (self.column_window[0], self.column_window[1]);
+        let mut points = Vec::with_capacity((right - left) * self.rows);
+
+        for col in left..right {
             let x_delta_col = self.x_delta[col];
             let y_delta_col = self.y_delta[col];
 
             for row in 0..self.rows {
-                if self.range[[col, row]] > 0 {
-                    let r = self.range[[col, row]] as f32 * 8.0 - self.range_delta;
+                if self.depth[[col, row]] > 0 && self.depth[[col, row]] < 65000 {
+                    let r = self.depth[[col, row]] as f32 * 8.0 - self.range_delta;
                     let x = r * self.x_range[[col, row]] + x_delta_col;
                     let y = r * self.y_range[[col, row]] + y_delta_col;
                     let z = r * self.altitude_angles[row] + self.beam_to_lidar[[2, 3]];
@@ -546,8 +594,7 @@ impl FrameReader {
                         x: x * 0.001,
                         y: y * 0.001,
                         z: z * 0.001,
-                        reflect: self.reflect[[col, row]],
-                        nir: self.nir[[col, row]],
+                        r: self.reflect[[col, row]],
                     });
                 }
             }

@@ -3,16 +3,16 @@ use clap::{builder::PossibleValuesParser, Parser};
 use edgefirst_schemas::{
     builtin_interfaces::{self, Time},
     geometry_msgs::{Quaternion, Transform, TransformStamped, Vector3},
-    sensor_msgs::{PointCloud2, PointField},
+    sensor_msgs::{Image, PointCloud2, PointField},
     std_msgs::Header,
 };
 use lidarpub::ouster::{
-    BeamIntrinsics, Config, FrameReader, LidarDataFormat, Parameters, SensorInfo,
+    BeamIntrinsics, Config, FrameReader, LidarDataFormat, Parameters, Point, SensorInfo,
 };
 use log::{debug, error, info, trace};
+use ndarray::Array2;
 use std::{
-    io::IsTerminal as _,
-    io::Write as _,
+    io::{IsTerminal as _, Write as _},
     net::TcpStream,
     str::FromStr as _,
     sync::Arc,
@@ -80,8 +80,8 @@ struct Args {
     #[arg(long, env, default_value = "lidar")]
     frame_id: String,
 
-    /// lidar point cloud topic
-    #[arg(long, env, default_value = "rt/lidar/points")]
+    /// lidar base topic
+    #[arg(long, env, default_value = "rt/lidar")]
     lidar_topic: String,
 }
 
@@ -129,7 +129,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ureq::post(&format!("{}/config", api)).send_json(&config)?;
     let config = ureq::get(&format!("{}/config", api))
         .call()?
-        .into_json::<Config>()?;
+        .body_mut()
+        .read_json::<Config>()?;
     info!("{:?}", config);
 
     // Get sensor_info continuously until it is running with the updated config.
@@ -142,7 +143,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             let sensor_info = ureq::get(&format!("{}/metadata/sensor_info", api))
                 .call()?
-                .into_json::<SensorInfo>()?;
+                .body_mut()
+                .read_json::<SensorInfo>()?;
             if sensor_info.status == "RUNNING" {
                 if std::io::stdout().is_terminal() {
                     println!("done.");
@@ -163,10 +165,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let lidar_data_format = ureq::get(&format!("{}/metadata/lidar_data_format", api))
         .call()?
-        .into_json::<LidarDataFormat>()?;
+        .body_mut()
+        .read_json::<LidarDataFormat>()?;
     let beam_intrinsics = ureq::get(&format!("{}/metadata/beam_intrinsics", api))
         .call()?
-        .into_json::<BeamIntrinsics>()?;
+        .body_mut()
+        .read_json::<BeamIntrinsics>()?;
 
     let params = Parameters {
         sensor_info,
@@ -186,8 +190,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut buf = [0u8; 16 * 1024];
     let mut frame_reader = FrameReader::new(params)?;
 
-    let publisher = match session
-        .declare_publisher(args.lidar_topic.clone())
+    let points_publisher = match session
+        .declare_publisher(format!("{}/points", args.lidar_topic))
         .priority(Priority::DataHigh)
         .congestion_control(CongestionControl::Drop)
         .res_async()
@@ -195,7 +199,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         Ok(v) => v,
         Err(e) => {
-            error!("Failed to create publisher {}: {:?}", args.lidar_topic, e);
+            error!(
+                "Failed to create publisher {}/points: {:?}",
+                args.lidar_topic, e
+            );
+            return Err(e);
+        }
+    };
+
+    let publish_depth = match session
+        .declare_publisher(format!("{}/depth", args.lidar_topic))
+        .priority(Priority::DataHigh)
+        .congestion_control(CongestionControl::Drop)
+        .res_async()
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            error!(
+                "Failed to create publisher {}/depth: {:?}",
+                args.lidar_topic, e
+            );
+            return Err(e);
+        }
+    };
+
+    let publish_reflect = match session
+        .declare_publisher(format!("{}/reflect", args.lidar_topic))
+        .priority(Priority::DataHigh)
+        .congestion_control(CongestionControl::Drop)
+        .res_async()
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            error!(
+                "Failed to create publisher {}/reflect: {:?}",
+                args.lidar_topic, e
+            );
             return Err(e);
         }
     };
@@ -203,82 +244,135 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let (len, _src) = socket.recv_from(&mut buf)?;
         if let Some(frame) = frame_reader.update(&buf[..len])? {
-            let fields = vec![
-                PointField {
-                    name: String::from("x"),
-                    offset: 0,
-                    datatype: PointFieldType::FLOAT32 as u8,
-                    count: 1,
-                },
-                PointField {
-                    name: String::from("y"),
-                    offset: 4,
-                    datatype: PointFieldType::FLOAT32 as u8,
-                    count: 1,
-                },
-                PointField {
-                    name: String::from("z"),
-                    offset: 8,
-                    datatype: PointFieldType::FLOAT32 as u8,
-                    count: 1,
-                },
-                PointField {
-                    name: String::from("reflect"),
-                    offset: 12,
-                    datatype: PointFieldType::UINT8 as u8,
-                    count: 1,
-                },
-                PointField {
-                    name: String::from("nir"),
-                    offset: 13,
-                    datatype: PointFieldType::UINT8 as u8,
-                    count: 1,
-                },
-            ];
+            let points = format_points(frame.points, &args.frame_id)?;
+            let depth = format_depth(frame.depth, &args.frame_id)?;
+            let reflect = format_reflect(frame.reflect, &args.frame_id)?;
 
-            let n_points = frame.points.len();
-            let data: Vec<_> = frame
-                .points
-                .iter()
-                .flat_map(|pt| {
-                    let x = pt.x.to_ne_bytes();
-                    let y = pt.y.to_ne_bytes();
-                    let z = pt.z.to_ne_bytes();
+            let points = points_publisher.put(points).res_async();
+            let depth = publish_depth.put(depth).res_async();
+            let reflect = publish_reflect.put(reflect).res_async();
 
-                    [
-                        x[0], x[1], x[2], x[3], y[0], y[1], y[2], y[3], z[0], z[1], z[2], z[3],
-                        pt.reflect, pt.nir,
-                    ]
-                })
-                .collect();
-
-            let msg = PointCloud2 {
-                header: Header {
-                    stamp: timestamp()?,
-                    frame_id: args.frame_id.clone(),
-                },
-                height: 1,
-                width: n_points as u32,
-                fields,
-                is_bigendian: false,
-                point_step: 14,
-                row_step: 14 * n_points as u32,
-                data,
-                is_dense: true,
-            };
-
-            let encoded = cdr::serialize::<_, _, CdrLe>(&msg, Infinite)?;
-            let encoded = Value::from(encoded).encoding(Encoding::WithSuffix(
-                KnownEncoding::AppOctetStream,
-                "sensor_msgs/msg/PointCloud2".into(),
-            ));
-
-            match publisher.put(encoded).res_async().await {
+            match futures::try_join!(points, depth, reflect) {
                 Ok(_) => trace!("{} message sent", args.lidar_topic),
                 Err(e) => error!("{} message error: {:?}", args.lidar_topic, e),
             }
         }
     }
+}
+
+fn format_points(points: Vec<Point>, frame_id: &str) -> Result<Value, cdr::Error> {
+    let fields = vec![
+        PointField {
+            name: String::from("x"),
+            offset: 0,
+            datatype: PointFieldType::FLOAT32 as u8,
+            count: 1,
+        },
+        PointField {
+            name: String::from("y"),
+            offset: 4,
+            datatype: PointFieldType::FLOAT32 as u8,
+            count: 1,
+        },
+        PointField {
+            name: String::from("z"),
+            offset: 8,
+            datatype: PointFieldType::FLOAT32 as u8,
+            count: 1,
+        },
+        PointField {
+            name: String::from("reflect"),
+            offset: 12,
+            datatype: PointFieldType::UINT8 as u8,
+            count: 1,
+        },
+    ];
+
+    let n_points = points.len();
+    let data: Vec<_> = points
+        .iter()
+        .flat_map(|pt| {
+            let x = pt.x.to_ne_bytes();
+            let y = pt.y.to_ne_bytes();
+            let z = pt.z.to_ne_bytes();
+
+            [
+                x[0], x[1], x[2], x[3], y[0], y[1], y[2], y[3], z[0], z[1], z[2], z[3], pt.r,
+            ]
+        })
+        .collect();
+
+    let msg = PointCloud2 {
+        header: Header {
+            stamp: timestamp()?,
+            frame_id: frame_id.to_string(),
+        },
+        height: 1,
+        width: n_points as u32,
+        fields,
+        is_bigendian: false,
+        point_step: 14,
+        row_step: 14 * n_points as u32,
+        data,
+        is_dense: true,
+    };
+
+    let encoded = cdr::serialize::<_, _, CdrLe>(&msg, Infinite)?;
+    let encoded = Value::from(encoded).encoding(Encoding::WithSuffix(
+        KnownEncoding::AppOctetStream,
+        "sensor_msgs/msg/PointCloud2".into(),
+    ));
+
+    Ok(encoded)
+}
+
+fn format_depth(depth: Array2<u16>, frame_id: &str) -> Result<Value, cdr::Error> {
+    let msg = Image {
+        header: Header {
+            stamp: timestamp()?,
+            frame_id: frame_id.to_string(),
+        },
+        height: depth.shape()[0] as u32,
+        width: depth.shape()[1] as u32,
+        encoding: "mono8".to_owned(),
+        is_bigendian: 0,
+        step: depth.shape()[1] as u32 * 2,
+        data: depth
+            .iter()
+            .flat_map(|&x| x.to_ne_bytes().to_vec())
+            .collect(),
+    };
+
+    let encoded = cdr::serialize::<_, _, CdrLe>(&msg, Infinite)?;
+    let encoded = Value::from(encoded).encoding(Encoding::WithSuffix(
+        KnownEncoding::AppOctetStream,
+        "sensor_msgs/msg/Image".into(),
+    ));
+
+    Ok(encoded)
+}
+
+fn format_reflect(reflect: Array2<u8>, frame_id: &str) -> Result<Value, cdr::Error> {
+    let msg = Image {
+        header: Header {
+            stamp: timestamp()?,
+            frame_id: frame_id.to_string(),
+        },
+        height: reflect.shape()[0] as u32,
+        width: reflect.shape()[1] as u32,
+        encoding: "mono8".to_owned(),
+        is_bigendian: 0,
+        step: reflect.shape()[1] as u32,
+        data: reflect.iter().copied().collect(),
+    };
+
+    let encoded = cdr::serialize::<_, _, CdrLe>(&msg, Infinite)?;
+    let encoded = Value::from(encoded).encoding(Encoding::WithSuffix(
+        KnownEncoding::AppOctetStream,
+        "sensor_msgs/msg/Image".into(),
+    ));
+
+    Ok(encoded)
 }
 
 async fn spawn_tf_static(
@@ -343,6 +437,7 @@ async fn spawn_tf_static(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn timestamp() -> Result<builtin_interfaces::Time, std::io::Error> {
     let mut tp = libc::timespec {
         tv_sec: 0,
@@ -357,4 +452,12 @@ fn timestamp() -> Result<builtin_interfaces::Time, std::io::Error> {
         sec: tp.tv_sec as i32,
         nanosec: tp.tv_nsec as u32,
     })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn timestamp() -> Result<builtin_interfaces::Time, std::io::Error> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "timestamp not implemented",
+    ))
 }

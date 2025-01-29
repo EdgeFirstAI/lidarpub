@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{builder::PossibleValuesParser, Parser};
 use lidarpub::ouster::{
     BeamIntrinsics, Config, Frame, FrameReader, LidarDataFormat, Parameters, SensorInfo,
 };
@@ -8,9 +8,11 @@ use rerun::{external::re_sdk_comms::DEFAULT_SERVER_PORT, RecordingStream};
 use std::{
     error::Error,
     fs::File,
-    io::BufReader,
+    io::{BufReader, IsTerminal as _, Write as _},
     net::{Ipv4Addr, SocketAddr, TcpStream},
     path::Path,
+    thread::sleep,
+    time::Duration,
 };
 
 #[derive(Parser, Debug, Clone)]
@@ -36,6 +38,16 @@ struct Args {
     /// it will be used otherwise it will be tried as a hostname or IP address.
     #[arg()]
     target: String,
+
+    /// Azimuth field of view start and stop angles in degrees.  
+    /// The 0 degree point is the rear connector of the LiDAR.
+    #[arg(long, env, num_args = 2, value_names = ["START", "STOP"], value_delimiter=' ', default_value = "0 360")]
+    azimuth: Vec<u32>,
+
+    /// LiDAR column and refresh rate mode.  The format is "COLxHZ".
+    #[arg(long, env, default_value = "1024x10", 
+          value_parser = PossibleValuesParser::new(["512x10", "1024x10", "2048x10", "512x20", "1024x20",]))]
+    mode: String,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -49,7 +61,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             rerun::RecordingStreamBuilder::new("radarview")
                 .connect_tcp_opts(remote, rerun::default_flush_timeout())?,
         )
-    } else if let Some(record) = args.record {
+    } else if let Some(record) = &args.record {
         Some(rerun::RecordingStreamBuilder::new("radarview").save(record)?)
     } else if args.viewer {
         Some(rerun::RecordingStreamBuilder::new("radarview").spawn()?)
@@ -60,7 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if Path::new(&args.target).exists() {
         pcap_loop(&rr, &args.target)?;
     } else {
-        live_loop(&rr, &args.target)?;
+        live_loop(&rr, &args)?;
     }
 
     Ok(())
@@ -124,43 +136,80 @@ fn pcap_loop(
     Ok(())
 }
 
-fn live_loop(
-    rr: &Option<RecordingStream>,
-    target: &String,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn live_loop(rr: &Option<RecordingStream>, args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let local = {
-        let stream = TcpStream::connect(format!("{}:80", target))?;
+        let stream = TcpStream::connect(format!("{}:80", &args.target))?;
         stream.local_addr()?.ip()
     };
 
-    let api = format!("http://{}//api/v1/sensor", target);
+    let api = format!("http://{}//api/v1/sensor", &args.target);
 
     let config = Config {
         udp_dest: local.to_string(),
+        lidar_mode: args.mode.clone(),
+        azimuth_window: args
+            .azimuth
+            .iter()
+            .map(|x| x * 1000)
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap(),
         ..Default::default()
     };
 
     ureq::post(&format!("{}/config", api)).send_json(&config)?;
     let config = ureq::get(&format!("{}/config", api))
         .call()?
-        .into_json::<Config>()?;
-    println!("config: {:?}", config);
+        .body_mut()
+        .read_json::<Config>()?;
+    println!("{:?}", config);
 
-    let sensor_info = ureq::get(&format!("{}/metadata/sensor_info", api))
-        .call()?
-        .into_json::<SensorInfo>()?;
+    // Get sensor_info continuously until it is running with the updated config.
+    let sensor_info = {
+        if std::io::stdout().is_terminal() {
+            print!("Waiting for LiDAR to initialize");
+            std::io::stdout().flush()?;
+        }
+
+        loop {
+            let sensor_info = ureq::get(&format!("{}/metadata/sensor_info", api))
+                .call()?
+                .body_mut()
+                .read_json::<SensorInfo>()?;
+            if sensor_info.status == "RUNNING" {
+                if std::io::stdout().is_terminal() {
+                    println!("done.");
+                } else {
+                    println!("LiDAR initialization complete");
+                }
+                break sensor_info;
+            }
+
+            if std::io::stdout().is_terminal() {
+                print!(".");
+                std::io::stdout().flush()?;
+            }
+
+            sleep(Duration::from_secs(1));
+        }
+    };
+
     let lidar_data_format = ureq::get(&format!("{}/metadata/lidar_data_format", api))
         .call()?
-        .into_json::<LidarDataFormat>()?;
+        .body_mut()
+        .read_json::<LidarDataFormat>()?;
     let beam_intrinsics = ureq::get(&format!("{}/metadata/beam_intrinsics", api))
         .call()?
-        .into_json::<BeamIntrinsics>()?;
+        .body_mut()
+        .read_json::<BeamIntrinsics>()?;
 
     let params = Parameters {
         sensor_info,
         lidar_data_format,
         beam_intrinsics,
     };
+
+    println!("{:?}", params);
 
     // On Linux [::] will bind to IPv4 and IPv6 but not on Windows so we bind
     // according to the local address IP version.
@@ -186,11 +235,23 @@ fn frame_handler(rr: &Option<RecordingStream>, frame: Frame) -> Result<(), Box<d
     if let Some(rr) = rr {
         rr.log("n_points", &rerun::Scalar::new(frame.points.len() as f64))?;
         let points: Vec<_> = frame.points.iter().map(|pt| (pt.x, pt.y, pt.z)).collect();
-        let points =
-            rerun::Points3D::new(points).with_colors(frame.points.iter().map(|pt| {
-                rerun::Color::from_rgb(pt.reflect << 1, pt.reflect << 1, pt.reflect << 1)
-            }));
+        let points = rerun::Points3D::new(points).with_colors(
+            frame
+                .points
+                .iter()
+                .map(|pt| rerun::Color::from_rgb(pt.r << 1, pt.r << 1, pt.r << 1)),
+        );
         rr.log("points", &points)?;
+
+        rr.log(
+            "reflect",
+            &rerun::Image::from_color_model_and_tensor(rerun::ColorModel::L, frame.reflect)?,
+        )?;
+
+        rr.log(
+            "depth",
+            &rerun::Image::from_color_model_and_tensor(rerun::ColorModel::L, frame.depth)?,
+        )?;
     }
 
     Ok(())
