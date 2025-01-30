@@ -35,6 +35,7 @@ edgefirst-schemas = "1.2.4"
 env_logger = "0.11"
 etherparse = { version = "0.17.0", optional = true }
 futures = "0.3.31"
+kanal = { git = "https://github.com/fereidani/kanal", rev = "b6aeab2" }
 libc = "0.2.167"
 log = "0.4.25"
 ndarray = "0.16.1"

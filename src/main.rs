@@ -1,3 +1,4 @@
+use async_std::task::block_on;
 use cdr::{CdrLe, Infinite};
 use clap::{builder::PossibleValuesParser, Parser};
 use edgefirst_schemas::{
@@ -7,7 +8,7 @@ use edgefirst_schemas::{
     std_msgs::Header,
 };
 use lidarpub::ouster::{
-    BeamIntrinsics, Config, FrameReader, LidarDataFormat, Parameters, Point, SensorInfo,
+    udp_read, BeamIntrinsics, Config, FrameReader, LidarDataFormat, Parameters, Point, SensorInfo,
 };
 use log::{debug, error, info, trace};
 use ndarray::Array2;
@@ -179,6 +180,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     debug!("{:?}", params);
+    let mut frame_reader = FrameReader::new(params)?;
 
     // On Linux [::] will bind to IPv4 and IPv6 but not on Windows so we bind
     // according to the local address IP version.
@@ -186,9 +188,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         true => format!("0.0.0.0:{}", config.udp_port_lidar),
         false => format!("[::]:{}", config.udp_port_lidar),
     };
-    let socket = std::net::UdpSocket::bind(bind_addr)?;
-    let mut buf = [0u8; 16 * 1024];
-    let mut frame_reader = FrameReader::new(params)?;
+
+    let (tx, rx) = kanal::bounded_async(256);
+
+    thread::Builder::new()
+        .name("udp_read".to_string())
+        .spawn(move || block_on(udp_read(tx, &bind_addr)))?;
 
     let points_publisher = match session
         .declare_publisher(format!("{}/points", args.lidar_topic))
@@ -242,8 +247,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     loop {
-        let (len, _src) = socket.recv_from(&mut buf)?;
-        if let Some(frame) = frame_reader.update(&buf[..len])? {
+        let buf = match rx.recv().await {
+            Ok(buf) => buf,
+            Err(e) => {
+                error!("udp_read recv error: {:?}", e);
+                continue;
+            }
+        };
+
+        if let Some(frame) = frame_reader.update(&buf)? {
             let points = format_points(frame.points, &args.frame_id)?;
             let depth = format_depth(frame.depth, &args.frame_id)?;
             let reflect = format_reflect(frame.reflect, &args.frame_id)?;
@@ -311,8 +323,8 @@ fn format_points(points: Vec<Point>, frame_id: &str) -> Result<Value, cdr::Error
         width: n_points as u32,
         fields,
         is_bigendian: false,
-        point_step: 14,
-        row_step: 14 * n_points as u32,
+        point_step: 13,
+        row_step: 13 * n_points as u32,
         data,
         is_dense: true,
     };
@@ -334,12 +346,12 @@ fn format_depth(depth: Array2<u16>, frame_id: &str) -> Result<Value, cdr::Error>
         },
         height: depth.shape()[0] as u32,
         width: depth.shape()[1] as u32,
-        encoding: "mono8".to_owned(),
+        encoding: "mono16".to_owned(),
         is_bigendian: 0,
         step: depth.shape()[1] as u32 * 2,
         data: depth
             .iter()
-            .flat_map(|&x| x.to_ne_bytes().to_vec())
+            .flat_map(|&x| x.to_le_bytes().to_vec())
             .collect(),
     };
 

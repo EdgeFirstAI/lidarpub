@@ -3842,6 +3842,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kanal"
+version = "0.1.0-pre8"
+source = "git+https://github.com/fereidani/kanal?rev=b6aeab2#b6aeab28802b87c42063b29eb40b51dde560967c"
+dependencies = [
+ "futures-core",
+ "lock_api",
+]
+
+[[package]]
 name = "keccak"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4031,6 +4040,7 @@ dependencies = [
  "env_logger 0.11.6",
  "etherparse",
  "futures",
+ "kanal",
  "libc",
  "log",
  "ndarray",

@@ -1,6 +1,7 @@
+use async_std::task::block_on;
 use clap::{builder::PossibleValuesParser, Parser};
 use lidarpub::ouster::{
-    BeamIntrinsics, Config, Frame, FrameReader, LidarDataFormat, Parameters, SensorInfo,
+    udp_read, BeamIntrinsics, Config, Frame, FrameReader, LidarDataFormat, Parameters, SensorInfo,
 };
 use log::error;
 use pcap_parser::{traits::PcapReaderIterator, *};
@@ -11,7 +12,7 @@ use std::{
     io::{BufReader, IsTerminal as _, Write as _},
     net::{Ipv4Addr, SocketAddr, TcpStream},
     path::Path,
-    thread::sleep,
+    thread::{self, sleep},
     time::Duration,
 };
 
@@ -72,7 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if Path::new(&args.target).exists() {
         pcap_loop(&rr, &args.target)?;
     } else {
-        live_loop(&rr, &args)?;
+        block_on(live_loop(&rr, &args))?;
     }
 
     Ok(())
@@ -136,7 +137,10 @@ fn pcap_loop(
     Ok(())
 }
 
-fn live_loop(rr: &Option<RecordingStream>, args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+async fn live_loop(
+    rr: &Option<RecordingStream>,
+    args: &Args,
+) -> Result<(), Box<dyn std::error::Error>> {
     let local = {
         let stream = TcpStream::connect(format!("{}:80", &args.target))?;
         stream.local_addr()?.ip()
@@ -210,6 +214,7 @@ fn live_loop(rr: &Option<RecordingStream>, args: &Args) -> Result<(), Box<dyn st
     };
 
     println!("{:?}", params);
+    let mut frame_reader = FrameReader::new(params)?;
 
     // On Linux [::] will bind to IPv4 and IPv6 but not on Windows so we bind
     // according to the local address IP version.
@@ -217,15 +222,23 @@ fn live_loop(rr: &Option<RecordingStream>, args: &Args) -> Result<(), Box<dyn st
         true => format!("0.0.0.0:{}", config.udp_port_lidar),
         false => format!("[::]:{}", config.udp_port_lidar),
     };
-    let socket = std::net::UdpSocket::bind(bind_addr)?;
-    let mut buf = [0u8; 16 * 1024];
-    let mut frame_reader = FrameReader::new(params)?;
+
+    let (tx, rx) = kanal::bounded_async(256);
+
+    thread::Builder::new()
+        .name("udp_read".to_string())
+        .spawn(move || block_on(udp_read(tx, &bind_addr)))?;
 
     loop {
-        let (len, _src) = socket.recv_from(&mut buf)?;
+        let buf = match rx.recv().await {
+            Ok(buf) => buf,
+            Err(e) => {
+                error!("udp_read recv error: {:?}", e);
+                continue;
+            }
+        };
 
-        if let Some(frame) = frame_reader.update(&buf[..len])? {
-            // println!("frame_id: {:?}", frame.frame_id);
+        if let Some(frame) = frame_reader.update(&buf)? {
             frame_handler(rr, frame)?;
         }
     }
