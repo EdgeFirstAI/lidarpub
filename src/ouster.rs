@@ -391,21 +391,20 @@ impl DataBlock {
     pub const LEN: usize = 4;
 }
 
-#[derive(Clone, Debug)]
-pub struct Point {
-    pub x: f32,
-    pub y: f32,
-    pub z: f32,
-    pub r: u8,
+pub struct Points {
+    pub x: Vec<f32>,
+    pub y: Vec<f32>,
+    pub z: Vec<f32>,
+    pub l: Vec<u8>,
 }
 
-impl Default for Point {
-    fn default() -> Self {
-        Point {
-            x: 0.0,
-            y: 0.0,
-            z: 0.0,
-            r: 0,
+impl Points {
+    pub fn new(len: usize) -> Self {
+        Points {
+            x: vec![0f32; len],
+            y: vec![0f32; len],
+            z: vec![0f32; len],
+            l: vec![0u8; len],
         }
     }
 }
@@ -413,9 +412,30 @@ impl Default for Point {
 #[derive(Clone, Debug)]
 pub struct Frame {
     pub frame_id: u16,
-    pub depth: Array2<u16>,
-    pub reflect: Array2<u8>,
-    pub points: Vec<Point>,
+    pub n_points: usize,
+    pub crop: (usize, usize),
+}
+
+struct FrameBuffers {
+    range: Vec<f32>,
+    x_range: Vec<f32>,
+    y_range: Vec<f32>,
+    x_delta: Vec<f32>,
+    y_delta: Vec<f32>,
+    altitude: Vec<f32>,
+}
+
+impl FrameBuffers {
+    fn new(maxlen: usize) -> Self {
+        FrameBuffers {
+            range: vec![0f32; maxlen],
+            x_range: vec![0f32; maxlen],
+            y_range: vec![0f32; maxlen],
+            x_delta: vec![0f32; maxlen],
+            y_delta: vec![0f32; maxlen],
+            altitude: vec![0f32; maxlen],
+        }
+    }
 }
 
 pub struct FrameReader {
@@ -434,6 +454,8 @@ pub struct FrameReader {
     frame_id: u16,
     depth: Array2<u16>,
     reflect: Array2<u8>,
+    crop: (usize, usize),
+    buffers: FrameBuffers,
 }
 
 impl FrameReader {
@@ -453,6 +475,17 @@ impl FrameReader {
             Array2::from_shape_vec((4, 4), params.beam_intrinsics.beam_to_lidar_transform)?;
         let range_delta = (beam_to_lidar[[0, 3]].powi(2) + beam_to_lidar[[2, 3]].powi(2)).sqrt();
 
+        // The left and right columns are incomplete within the pixel shift
+        // region.  We crop out this region to return the clean subset.
+        let crop = {
+            let mut pixel_shift = pixel_shift_by_row.clone();
+            pixel_shift.sort_unstable();
+            let left = pixel_shift[pixel_shift.len() - 1];
+            let right = pixel_shift[0].abs();
+            let right = (column_window[1] - column_window[0]) as i16 - right;
+            (left as usize, right as usize)
+        };
+
         let enc = (0..cols)
             .map(|col| 2.0 * PI * (1.0 - col as f32 / cols as f32))
             .collect::<Vec<_>>();
@@ -471,14 +504,14 @@ impl FrameReader {
             .map(|x| 2.0 * PI * (x / 360.0))
             .collect();
 
-        let mut x_range = Array2::zeros((cols, rows));
-        let mut y_range = Array2::zeros((cols, rows));
+        let mut x_range = Array2::zeros((rows, cols));
+        let mut y_range = Array2::zeros((rows, cols));
 
-        for col in 0..cols {
-            for row in 0..rows {
-                x_range[[col, row]] =
+        for row in 0..rows {
+            for col in 0..cols {
+                x_range[[row, col]] =
                     (enc[col] + azimuth_angles[row]).cos() * altitude_angles[row].cos();
-                y_range[[col, row]] =
+                y_range[[row, col]] =
                     (enc[col] + azimuth_angles[row]).sin() * altitude_angles[row].cos();
             }
         }
@@ -506,22 +539,31 @@ impl FrameReader {
             x_delta,
             y_delta,
             frame_id: 0,
-            depth: Array2::zeros((cols, rows)),
-            reflect: Array2::zeros((cols, rows)),
+            depth: Array2::zeros((rows, cols)),
+            reflect: Array2::zeros((rows, cols)),
+            crop,
+            buffers: FrameBuffers::new(rows * cols),
         })
     }
 
-    pub fn update(&mut self, slice: &[u8]) -> Result<Option<Frame>, Error> {
+    pub fn update(
+        &mut self,
+        points: &mut Points,
+        depth: &mut Array2<u16>,
+        reflect: &mut Array2<u8>,
+        slice: &[u8],
+    ) -> Result<Option<Frame>, Error> {
         let mut frame = None;
         let header = HeaderSlice::from_slice(slice)?;
 
         if self.frame_id != header.frame_id() {
-            let (depth, reflect) = self.images();
+            self.images(depth, reflect);
+            let n_points = self.points(points, depth, reflect);
+
             frame = Some(Frame {
                 frame_id: self.frame_id,
-                points: self.points(),
-                depth,
-                reflect,
+                n_points,
+                crop: self.crop,
             });
 
             self.frame_id = header.frame_id();
@@ -533,14 +575,12 @@ impl FrameReader {
             let column = header.column(self.rows, i)?;
             if column.status() {
                 let col = column.measurement_id() as usize;
-                if col >= self.cols {
-                    return Err(Error::TooManyColumns(col));
-                }
-
-                for row in 0..self.rows {
-                    let data = column.row(row)?;
-                    self.depth[[col, row]] = data.range;
-                    self.reflect[[col, row]] = data.reflect;
+                if col < self.cols {
+                    for row in 0..self.rows {
+                        let data = column.row(row)?;
+                        self.depth[[row, col]] = data.range;
+                        self.reflect[[row, col]] = data.reflect;
+                    }
                 }
             }
         }
@@ -548,76 +588,61 @@ impl FrameReader {
         Ok(frame)
     }
 
-    fn images(&self) -> (Array2<u16>, Array2<u8>) {
+    fn images(&self, depth: &mut Array2<u16>, reflect: &mut Array2<u8>) {
         let rows = self.rows;
         let cols = self.column_window[1] - self.column_window[0];
         let col_offset = self.column_window[0];
-
-        let mut depth = Array2::<u16>::zeros((rows, cols));
-        let mut reflect = Array2::<u8>::zeros((rows, cols));
 
         for row in 0..rows {
             let shift = self.pixel_shift_by_row[row];
 
             for col in 0..cols {
-                let colout = col as i16 + shift;
-                let colout = if colout < 0 {
-                    cols as i16 + colout
-                } else if colout >= cols as i16 {
-                    colout - cols as i16
-                } else {
-                    colout
-                } as usize;
-
-                depth[[row, colout]] =
-                    (self.depth[[col + col_offset, row]] as f32 * 8.0 - self.range_delta) as u16;
-                reflect[[row, colout]] = self.reflect[[col + col_offset, row]];
+                let colout = (col as i16 + shift).clamp(0, cols as i16 - 1) as usize;
+                depth[[row, colout]] = match self.depth[[row, col + col_offset]] {
+                    0 => 0,
+                    r => (r as f32 * 8.0 - self.range_delta) as u16,
+                };
+                reflect[[row, colout]] = self.reflect[[row, col + col_offset]];
             }
         }
-
-        // The left and right columns are incomplete within the pixel shift
-        // region.  We crop out this region to return the clean subset.
-        let mut pixel_shift = self.pixel_shift_by_row.clone();
-        pixel_shift.sort_unstable();
-        let left = pixel_shift[pixel_shift.len() - 1];
-        let right = pixel_shift[0].abs();
-        let right = cols as i16 - right;
-
-        let depth = depth.slice(ndarray::s![.., left as usize..right as usize]);
-        let reflect = reflect.slice(ndarray::s![.., left as usize..right as usize]);
-
-        (depth.to_owned(), reflect.to_owned())
     }
 
-    fn points(&self) -> Vec<Point> {
-        let (left, right) = (self.column_window[0], self.column_window[1]);
-        let mut points = vec![Point::default(); (right - left) * self.rows];
+    fn points(&mut self, points: &mut Points, depth: &Array2<u16>, reflect: &Array2<u8>) -> usize {
+        let col_base = self.column_window[0] as i16;
         let mut index = 0;
 
-        for col in left..right {
-            let x_delta_col = self.x_delta[col];
-            let y_delta_col = self.y_delta[col];
+        for row in 0..self.rows {
+            let col_offset = (col_base - self.pixel_shift_by_row[row]).max(0) as usize;
 
-            for row in 0..self.rows {
-                if self.depth[[col, row]] > 0 && self.depth[[col, row]] < 65000 {
-                    let r = self.depth[[col, row]] as f32 * 8.0 - self.range_delta;
-                    let x = r * self.x_range[[col, row]] + x_delta_col;
-                    let y = r * self.y_range[[col, row]] + y_delta_col;
-                    let z = r * self.altitude_angles[row] + self.beam_to_lidar[[2, 3]];
+            for col in self.crop.0..self.crop.1 {
+                self.buffers.range[index] = depth[[row, col]] as f32;
+                points.l[index] = reflect[[row, col]];
 
-                    points[index] = Point {
-                        x: x * 0.001,
-                        y: y * 0.001,
-                        z: z * 0.001,
-                        r: self.reflect[[col, row]],
-                    };
+                self.buffers.x_range[index] = self.x_range[[row, col + col_offset]];
+                self.buffers.y_range[index] = self.y_range[[row, col + col_offset]];
 
-                    index += 1;
-                }
+                self.buffers.x_delta[index] = self.x_delta[col + col_offset];
+                self.buffers.y_delta[index] = self.y_delta[col + col_offset];
+
+                self.buffers.altitude[index] = self.altitude_angles[row];
+
+                index += 1;
             }
         }
 
-        points
+        self.make_points(points, &self.buffers, index);
+        index
+    }
+
+    fn make_points(&self, points: &mut Points, buffers: &FrameBuffers, len: usize) {
+        let beam_to_lidar = self.beam_to_lidar[[2, 3]];
+
+        for index in 0..len {
+            let r = buffers.range[index];
+            points.x[index] = (r * buffers.x_range[index] + buffers.x_delta[index]) * 0.001;
+            points.y[index] = (r * buffers.y_range[index] + buffers.y_delta[index]) * 0.001;
+            points.z[index] = (r * buffers.altitude[index] + beam_to_lidar) * 0.001;
+        }
     }
 }
 

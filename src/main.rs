@@ -8,7 +8,8 @@ use edgefirst_schemas::{
     std_msgs::Header,
 };
 use lidarpub::ouster::{
-    udp_read, BeamIntrinsics, Config, FrameReader, LidarDataFormat, Parameters, Point, SensorInfo,
+    udp_read, BeamIntrinsics, Config, FrameReader, LidarDataFormat, Parameters, Points,
+    SensorInfo,
 };
 use log::{debug, error, info, trace};
 use ndarray::Array2;
@@ -181,6 +182,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     debug!("{:?}", params);
     let mut frame_reader = FrameReader::new(params)?;
+    let mut points = Points::new(frame_reader.rows * frame_reader.cols);
+    let mut depth = Array2::<u16>::zeros((frame_reader.rows, frame_reader.cols));
+    let mut reflect = Array2::<u8>::zeros((frame_reader.rows, frame_reader.cols));
 
     // On Linux [::] will bind to IPv4 and IPv6 but not on Windows so we bind
     // according to the local address IP version.
@@ -255,10 +259,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        if let Some(frame) = frame_reader.update(&buf)? {
-            let points = format_points(frame.points, &args.frame_id)?;
-            let depth = format_depth(frame.depth, &args.frame_id)?;
-            let reflect = format_reflect(frame.reflect, &args.frame_id)?;
+        if let Some(frame) = frame_reader.update(&mut points, &mut depth, &mut reflect, &buf)? {
+            let points = format_points(&points, frame.n_points, &args.frame_id)?;
+            let depth = format_depth(&depth, &args.frame_id)?;
+            let reflect = format_reflect(&reflect, &args.frame_id)?;
 
             let points = points_publisher.put(points).res_async();
             let depth = publish_depth.put(depth).res_async();
@@ -272,7 +276,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn format_points(points: Vec<Point>, frame_id: &str) -> Result<Value, cdr::Error> {
+fn format_points(points: &Points, n_points: usize, frame_id: &str) -> Result<Value, cdr::Error> {
     let fields = vec![
         PointField {
             name: String::from("x"),
@@ -300,16 +304,23 @@ fn format_points(points: Vec<Point>, frame_id: &str) -> Result<Value, cdr::Error
         },
     ];
 
-    let n_points = points.len();
-    let data: Vec<_> = points
+    let x = &points.x[..n_points];
+    let y = &points.y[..n_points];
+    let z = &points.z[..n_points];
+    let l = &points.l[..n_points];
+
+    let data: Vec<_> = x
         .iter()
-        .flat_map(|pt| {
-            let x = pt.x.to_ne_bytes();
-            let y = pt.y.to_ne_bytes();
-            let z = pt.z.to_ne_bytes();
+        .zip(y.iter())
+        .zip(z.iter())
+        .zip(l.iter())
+        .flat_map(|(((x, y), z), l)| {
+            let x = x.to_ne_bytes();
+            let y = y.to_ne_bytes();
+            let z = z.to_ne_bytes();
 
             [
-                x[0], x[1], x[2], x[3], y[0], y[1], y[2], y[3], z[0], z[1], z[2], z[3], pt.r,
+                x[0], x[1], x[2], x[3], y[0], y[1], y[2], y[3], z[0], z[1], z[2], z[3], *l,
             ]
         })
         .collect();
@@ -338,7 +349,7 @@ fn format_points(points: Vec<Point>, frame_id: &str) -> Result<Value, cdr::Error
     Ok(encoded)
 }
 
-fn format_depth(depth: Array2<u16>, frame_id: &str) -> Result<Value, cdr::Error> {
+fn format_depth(depth: &Array2<u16>, frame_id: &str) -> Result<Value, cdr::Error> {
     let msg = Image {
         header: Header {
             stamp: timestamp()?,
@@ -364,7 +375,7 @@ fn format_depth(depth: Array2<u16>, frame_id: &str) -> Result<Value, cdr::Error>
     Ok(encoded)
 }
 
-fn format_reflect(reflect: Array2<u8>, frame_id: &str) -> Result<Value, cdr::Error> {
+fn format_reflect(reflect: &Array2<u8>, frame_id: &str) -> Result<Value, cdr::Error> {
     let msg = Image {
         header: Header {
             stamp: timestamp()?,

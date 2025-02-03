@@ -1,9 +1,11 @@
 use async_std::task::block_on;
 use clap::{builder::PossibleValuesParser, Parser};
 use lidarpub::ouster::{
-    udp_read, BeamIntrinsics, Config, Frame, FrameReader, LidarDataFormat, Parameters, SensorInfo,
+    udp_read, BeamIntrinsics, Config, Frame, FrameReader, LidarDataFormat, Parameters, Points,
+    SensorInfo,
 };
 use log::error;
+use ndarray::Array2;
 use pcap_parser::{traits::PcapReaderIterator, *};
 use rerun::{external::re_sdk_comms::DEFAULT_SERVER_PORT, RecordingStream};
 use std::{
@@ -87,6 +89,9 @@ fn pcap_loop(
     let json = File::open(json_path)?;
     let params: Parameters = serde_json::from_reader(json)?;
     let mut frame_reader = FrameReader::new(params)?;
+    let mut points = Points::new(frame_reader.rows * frame_reader.cols);
+    let mut depth = Array2::<u16>::zeros((frame_reader.rows, frame_reader.cols));
+    let mut reflect = Array2::<u8>::zeros((frame_reader.rows, frame_reader.cols));
 
     let pcap_path = Path::new(path).with_extension("pcap");
     let pcap = File::open(pcap_path)?;
@@ -108,7 +113,12 @@ fn pcap_loop(
                                         continue;
                                     }
 
-                                    if let Some(frame) = frame_reader.update(udp.payload())? {
+                                    if let Some(frame) = frame_reader.update(
+                                        &mut points,
+                                        &mut depth,
+                                        &mut reflect,
+                                        udp.payload(),
+                                    )? {
                                         if let Some(rr) = rr {
                                             rr.set_time_seconds(
                                                 "stable_time",
@@ -116,7 +126,7 @@ fn pcap_loop(
                                             );
                                         }
 
-                                        frame_handler(rr, frame)?;
+                                        frame_handler(rr, frame, &points, &depth, &reflect)?;
                                     }
                                 }
                             }
@@ -215,6 +225,9 @@ async fn live_loop(
 
     println!("{:?}", params);
     let mut frame_reader = FrameReader::new(params)?;
+    let mut points = Points::new(frame_reader.rows * frame_reader.cols);
+    let mut depth = Array2::<u16>::zeros((frame_reader.rows, frame_reader.cols));
+    let mut reflect = Array2::<u8>::zeros((frame_reader.rows, frame_reader.cols));
 
     // On Linux [::] will bind to IPv4 and IPv6 but not on Windows so we bind
     // according to the local address IP version.
@@ -238,32 +251,58 @@ async fn live_loop(
             }
         };
 
-        if let Some(frame) = frame_reader.update(&buf)? {
-            frame_handler(rr, frame)?;
+        if let Some(frame) = frame_reader.update(&mut points, &mut depth, &mut reflect, &buf)? {
+            frame_handler(rr, frame, &points, &depth, &reflect)?;
         }
     }
 }
 
-fn frame_handler(rr: &Option<RecordingStream>, frame: Frame) -> Result<(), Box<dyn Error>> {
+fn frame_handler(
+    rr: &Option<RecordingStream>,
+    frame: Frame,
+    points: &Points,
+    depth: &Array2<u16>,
+    reflect: &Array2<u8>,
+) -> Result<(), Box<dyn Error>> {
     if let Some(rr) = rr {
-        rr.log("n_points", &rerun::Scalar::new(frame.points.len() as f64))?;
-        let points: Vec<_> = frame.points.iter().map(|pt| (pt.x, pt.y, pt.z)).collect();
+        let x = &points.x[..frame.n_points];
+        let y = &points.y[..frame.n_points];
+        let z = &points.z[..frame.n_points];
+        let l = &points.l[..frame.n_points];
+
+        rr.log("n_points", &rerun::Scalar::new(frame.n_points as f64))?;
+        let points: Vec<_> = x
+            .iter()
+            .zip(y.iter())
+            .zip(z.iter())
+            .map(|((x, y), z)| (*x, *y, *z))
+            .collect();
         let points = rerun::Points3D::new(points).with_colors(
-            frame
-                .points
-                .iter()
-                .map(|pt| rerun::Color::from_rgb(pt.r << 1, pt.r << 1, pt.r << 1)),
+            l.iter()
+                .map(|l| rerun::Color::from_rgb(l << 1, l << 1, l << 1)),
         );
         rr.log("points", &points)?;
 
         rr.log(
             "reflect",
-            &rerun::Image::from_color_model_and_tensor(rerun::ColorModel::L, frame.reflect)?,
+            &rerun::Image::from_color_model_and_tensor(
+                rerun::ColorModel::L,
+                reflect
+                    .slice(ndarray::s![.., frame.crop.0..frame.crop.1])
+                    .as_standard_layout()
+                    .to_owned(),
+            )?,
         )?;
 
         rr.log(
             "depth",
-            &rerun::Image::from_color_model_and_tensor(rerun::ColorModel::L, frame.depth)?,
+            &rerun::Image::from_color_model_and_tensor(
+                rerun::ColorModel::L,
+                depth
+                    .slice(ndarray::s![.., frame.crop.0..frame.crop.1])
+                    .as_standard_layout()
+                    .to_owned(),
+            )?,
         )?;
     }
 
