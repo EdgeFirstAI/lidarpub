@@ -3,7 +3,7 @@ use kanal::AsyncSender;
 use log::error;
 use ndarray::Array2;
 use serde::{Deserialize, Serialize};
-use std::{f32::consts::PI, fmt};
+use std::{f32::consts::PI, fmt, simd::{LaneCount, Simd, SupportedLaneCount}};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
@@ -630,18 +630,43 @@ impl FrameReader {
             }
         }
 
-        self.make_points(points, &self.buffers, index);
+        self.make_points::<4>(points, &self.buffers, index);
         index
     }
 
-    fn make_points(&self, points: &mut Points, buffers: &FrameBuffers, len: usize) {
-        let beam_to_lidar = self.beam_to_lidar[[2, 3]];
+    #[inline(never)]
+    fn make_points<const N: usize>(&self, points: &mut Points, buffers: &FrameBuffers, len: usize)
+    where
+    LaneCount<N>: SupportedLaneCount, {
+        let beam_to_lidar = Simd::<f32, N>::splat(self.beam_to_lidar[[2, 3]]);
+        let scale = Simd::<f32, N>::splat(0.001);
 
-        for index in 0..len {
+        for index in (0..len).step_by(N) {
+            let r = Simd::<f32, N>::from_slice(&buffers.range[index..]);
+
+            let x_range = Simd::<f32, N>::from_slice(&buffers.x_range[index..]);
+            let x_delta = Simd::<f32, N>::from_slice(&buffers.x_delta[index..]);
+            let x = r * x_range + x_delta;
+            let x = x * scale;
+            x.copy_to_slice(&mut points.x[index..]);
+
+            let y_range = Simd::<f32, N>::from_slice(&buffers.y_range[index..]);
+            let y_delta = Simd::<f32, N>::from_slice(&buffers.y_delta[index..]);
+            let y = r * y_range + y_delta;
+            let y = y * scale;
+            y.copy_to_slice(&mut points.y[index..]);
+
+            let altitude = Simd::<f32, N>::from_slice(&buffers.altitude[index..]);
+            let z = r * altitude + beam_to_lidar;
+            let z = z * scale;
+            z.copy_to_slice(&mut points.z[index..]);
+        }
+
+        for index in len - len % N..len {
             let r = buffers.range[index];
             points.x[index] = (r * buffers.x_range[index] + buffers.x_delta[index]) * 0.001;
             points.y[index] = (r * buffers.y_range[index] + buffers.y_delta[index]) * 0.001;
-            points.z[index] = (r * buffers.altitude[index] + beam_to_lidar) * 0.001;
+            points.z[index] = (r * buffers.altitude[index] + self.beam_to_lidar[[2, 3]]) * 0.001;
         }
     }
 }
