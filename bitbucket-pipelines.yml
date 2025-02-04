@@ -24,12 +24,12 @@ definitions:
             else
               export VERSION=${BITBUCKET_TAG}
             fi
-          - sed -i "s/0.0.0/$VERSION/g" Cargo.toml
-          - cargo build --target=aarch64-unknown-linux-gnu --config target.aarch64-unknown-linux-gnu.linker=\"aarch64-linux-gnu-gcc\" --release
-          - cargo clippy --target=aarch64-unknown-linux-gnu --message-format=json > clippy.json || true
+          - sed -i "s/0.0.0/$VERSION/g" Cargo.toml          
+          - cargo clippy --message-format=json > clippy.json || true
           - cargo audit --json > audit.json || true
           - cargo outdated --depth 1 --format json > outdated.json || true
           - cargo sonar --clippy --audit --outdated
+          - RUSTFLAGS='-C target-cpu=cortex-a53' cargo build --target=aarch64-unknown-linux-gnu --config target.aarch64-unknown-linux-gnu.linker=\"aarch64-linux-gnu-gcc\" --release
         artifacts:
           - target/aarch64-unknown-linux-gnu/release/lidarpub
           - sonar-issues.json
