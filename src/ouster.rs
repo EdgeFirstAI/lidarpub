@@ -1,9 +1,10 @@
-use async_std::net::UdpSocket;
-use kanal::AsyncSender;
-use log::error;
 use ndarray::Array2;
 use serde::{Deserialize, Serialize};
-use std::{f32::consts::PI, fmt, simd::{LaneCount, Simd, SupportedLaneCount}};
+use std::{
+    f32::consts::PI,
+    fmt,
+    simd::{LaneCount, Simd, SupportedLaneCount},
+};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
@@ -637,7 +638,8 @@ impl FrameReader {
     #[inline(never)]
     fn make_points<const N: usize>(&self, points: &mut Points, buffers: &FrameBuffers, len: usize)
     where
-    LaneCount<N>: SupportedLaneCount, {
+        LaneCount<N>: SupportedLaneCount,
+    {
         let beam_to_lidar = Simd::<f32, N>::splat(self.beam_to_lidar[[2, 3]]);
         let scale = Simd::<f32, N>::splat(0.001);
 
@@ -667,144 +669,6 @@ impl FrameReader {
             points.x[index] = (r * buffers.x_range[index] + buffers.x_delta[index]) * 0.001;
             points.y[index] = (r * buffers.y_range[index] + buffers.y_delta[index]) * 0.001;
             points.z[index] = (r * buffers.altitude[index] + self.beam_to_lidar[[2, 3]]) * 0.001;
-        }
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-pub async fn udp_read(tx: AsyncSender<Vec<u8>>, bind_addr: &str) {
-    let sock = UdpSocket::bind(bind_addr).await.unwrap();
-    let mut buf = [0u8; 16 * 1024];
-
-    loop {
-        match sock.recv_from(&mut buf).await {
-            Ok((n, _)) => match tx.send(buf[..n].to_vec()).await {
-                Ok(_) => (),
-                Err(e) => error!("udp_read error: {:?}", e),
-            },
-            Err(e) => error!("udp_read error: {:?}", e),
-        }
-    }
-}
-
-/// The udp_read implementation on Linux uses the recvmmsg system call to
-/// enable bulk reads of UDP packets.
-#[cfg(target_os = "linux")]
-pub async fn udp_read(tx: AsyncSender<Vec<u8>>, bind_addr: &str) {
-    use libc::{sched_param, SCHED_FIFO};
-    use log::{trace, warn};
-    use std::{mem, os::fd::AsRawFd, thread, time::Duration};
-
-    const VLEN: usize = 50;
-    const BUFLEN: usize = 16 * 1024;
-    const RETRY_TIME: Duration = Duration::from_micros(250);
-
-    let mut vlen_history = [0; 1000];
-    let mut vlen_index = 0;
-
-    let mut mmsgs = vec![
-        libc::mmsghdr {
-            msg_hdr: libc::msghdr {
-                msg_name: std::ptr::null_mut(),
-                msg_namelen: 0,
-                msg_iov: std::ptr::null_mut(),
-                msg_iovlen: 0,
-                msg_control: std::ptr::null_mut(),
-                msg_controllen: 0,
-                msg_flags: 0,
-            },
-            msg_len: 0,
-        };
-        VLEN
-    ];
-    let mut iovecs = vec![
-        libc::iovec {
-            iov_base: std::ptr::null_mut(),
-            iov_len: 0,
-        };
-        VLEN
-    ];
-    let mut bufs = vec![[0; BUFLEN]; VLEN];
-
-    let mut param = sched_param { sched_priority: 10 };
-    let pid = unsafe { libc::pthread_self() };
-    let err =
-        unsafe { libc::pthread_setschedparam(pid, SCHED_FIFO, &mut param as *mut sched_param) };
-    if err != 0 {
-        let err = std::io::Error::last_os_error();
-        warn!("unable to set udp_read real-time fifo scheduler: {}", err);
-    }
-
-    let sock = UdpSocket::bind(bind_addr).await.unwrap();
-
-    let maxbuf: libc::c_int = 2 * 1024 * 1024;
-    let err = unsafe {
-        libc::setsockopt(
-            sock.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_RCVBUFFORCE,
-            &maxbuf as *const _ as *const libc::c_void,
-            mem::size_of_val(&maxbuf) as libc::socklen_t,
-        )
-    };
-    if err != 0 {
-        let err = std::io::Error::last_os_error();
-        warn!(
-            "unable to set udp_read socket buffer size to {}: {}",
-            maxbuf, err
-        );
-    }
-
-    loop {
-        for i in 0..VLEN {
-            iovecs[i].iov_base = bufs[i].as_mut_ptr() as *mut libc::c_void;
-            iovecs[i].iov_len = BUFLEN;
-            mmsgs[i].msg_hdr.msg_iov = &mut iovecs[i];
-            mmsgs[i].msg_hdr.msg_iovlen = 1;
-            mmsgs[i].msg_hdr.msg_name = std::ptr::null_mut();
-            mmsgs[i].msg_hdr.msg_namelen = 0;
-            mmsgs[i].msg_hdr.msg_control = std::ptr::null_mut();
-            mmsgs[i].msg_hdr.msg_controllen = 0;
-            mmsgs[i].msg_hdr.msg_flags = 0;
-            mmsgs[i].msg_len = 0;
-        }
-
-        match unsafe {
-            libc::recvmmsg(
-                sock.as_raw_fd(),
-                mmsgs.as_mut_ptr(),
-                VLEN as u32,
-                0,
-                std::ptr::null_mut(),
-            )
-        } {
-            -1 => {
-                let err = std::io::Error::last_os_error();
-                match err.kind() {
-                    std::io::ErrorKind::Interrupted => (),
-                    std::io::ErrorKind::WouldBlock => thread::sleep(RETRY_TIME),
-                    _ => error!("udp_read error: {:?}", err),
-                }
-            }
-            n => {
-                vlen_history[vlen_index] = n;
-                vlen_index += 1;
-                if vlen_index == vlen_history.len() {
-                    vlen_index = 0;
-                    let avg = vlen_history.iter().sum::<i32>() / vlen_history.len() as i32;
-                    let min = vlen_history.iter().min().unwrap();
-                    let max = vlen_history.iter().max().unwrap();
-                    trace!("recvmmsg avg={} min={} max={}", avg, min, max);
-                }
-
-                for i in 0..n as usize {
-                    let len = mmsgs[i].msg_len as usize;
-                    match tx.send(bufs[i][..len].to_vec()).await {
-                        Ok(_) => (),
-                        Err(e) => error!("udp_read error: {:?}", e),
-                    }
-                }
-            }
         }
     }
 }

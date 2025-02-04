@@ -24,7 +24,7 @@ path = "src/rerun.rs"
 required-features = ["rerun"]
 
 [features]
-default = ["rerun"]
+default = []
 rerun = ["dep:rerun", "dep:etherparse", "dep:pcap-parser"]
 
 [dependencies]
@@ -35,7 +35,6 @@ edgefirst-schemas = "1.2.4"
 env_logger = "0.11"
 etherparse = { version = "0.17.0", optional = true }
 futures = "0.3.31"
-kanal = { git = "https://github.com/fereidani/kanal", rev = "b6aeab2" }
 libc = "0.2.167"
 log = "0.4.25"
 ndarray = "0.16.1"
@@ -44,5 +43,5 @@ rerun = { version = "0.21.0", optional = true }
 serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "1.0.138"
 unix-ts = "1.0"
-ureq = { version = "3.0.2", features = ["json"] }
+ureq = { version = "3.0.4", features = ["json"] }
 zenoh = "0.10.0-rc"

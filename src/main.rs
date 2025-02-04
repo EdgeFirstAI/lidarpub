@@ -1,4 +1,6 @@
-use async_std::task::block_on;
+#![feature(portable_simd)]
+
+use async_std::net::UdpSocket;
 use cdr::{CdrLe, Infinite};
 use clap::{builder::PossibleValuesParser, Parser};
 use edgefirst_schemas::{
@@ -8,20 +10,22 @@ use edgefirst_schemas::{
     std_msgs::Header,
 };
 use lidarpub::ouster::{
-    udp_read, BeamIntrinsics, Config, FrameReader, LidarDataFormat, Parameters, Points,
-    SensorInfo,
+    BeamIntrinsics, Config, FrameReader, LidarDataFormat, Parameters, Points, SensorInfo,
 };
 use log::{debug, error, info, trace};
 use ndarray::Array2;
 use std::{
     io::{IsTerminal as _, Write as _},
     net::TcpStream,
+    simd::{Simd, ToBytes as _},
     str::FromStr as _,
     sync::Arc,
     thread::{self, sleep},
     time::{Duration, Instant},
 };
 use zenoh::prelude::{r#async::*, sync::SyncResolve};
+
+mod common;
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -193,16 +197,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         false => format!("[::]:{}", config.udp_port_lidar),
     };
 
-    let (tx, rx) = kanal::bounded_async(256);
+    common::set_process_priority();
+    let sock = UdpSocket::bind(bind_addr).await?;
+    let sock = common::set_socket_bufsize(sock, 16 * 1024 * 1024);
 
-    thread::Builder::new()
-        .name("udp_read".to_string())
-        .spawn(move || block_on(udp_read(tx, &bind_addr)))?;
+    let mut buf = [0u8; 16 * 1024];
 
     let points_publisher = match session
+        .clone()
         .declare_publisher(format!("{}/points", args.lidar_topic))
         .priority(Priority::DataHigh)
-        .congestion_control(CongestionControl::Drop)
+        .congestion_control(CongestionControl::Block)
         .res_async()
         .await
     {
@@ -217,9 +222,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let publish_depth = match session
+        .clone()
         .declare_publisher(format!("{}/depth", args.lidar_topic))
         .priority(Priority::DataHigh)
-        .congestion_control(CongestionControl::Drop)
+        .congestion_control(CongestionControl::Block)
         .res_async()
         .await
     {
@@ -234,9 +240,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let publish_reflect = match session
+        .clone()
         .declare_publisher(format!("{}/reflect", args.lidar_topic))
         .priority(Priority::DataHigh)
-        .congestion_control(CongestionControl::Drop)
+        .congestion_control(CongestionControl::Block)
         .res_async()
         .await
     {
@@ -251,21 +258,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     loop {
-        let buf = match rx.recv().await {
-            Ok(buf) => buf,
+        let len = match sock.recv_from(&mut buf).await {
+            Ok((len, _)) => len,
             Err(e) => {
                 error!("udp_read recv error: {:?}", e);
                 continue;
             }
         };
 
-        if let Some(frame) = frame_reader.update(&mut points, &mut depth, &mut reflect, &buf)? {
+        if let Some(frame) =
+            frame_reader.update(&mut points, &mut depth, &mut reflect, &buf[..len])?
+        {
             let points = format_points(&points, frame.n_points, &args.frame_id)?;
-            let depth = format_depth(&depth, &args.frame_id)?;
-            let reflect = format_reflect(&reflect, &args.frame_id)?;
-
             let points = points_publisher.put(points).res_async();
+            let depth = format_depth(&depth, &frame.crop, &args.frame_id)?;
             let depth = publish_depth.put(depth).res_async();
+            let reflect = format_reflect(&reflect, &frame.crop, &args.frame_id)?;
             let reflect = publish_reflect.put(reflect).res_async();
 
             match futures::try_join!(points, depth, reflect) {
@@ -277,6 +285,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn format_points(points: &Points, n_points: usize, frame_id: &str) -> Result<Value, cdr::Error> {
+    const N: usize = 4;
+
     let fields = vec![
         PointField {
             name: String::from("x"),
@@ -304,26 +314,53 @@ fn format_points(points: &Points, n_points: usize, frame_id: &str) -> Result<Val
         },
     ];
 
-    let x = &points.x[..n_points];
-    let y = &points.y[..n_points];
-    let z = &points.z[..n_points];
-    let l = &points.l[..n_points];
+    let mut data = vec![0u8; 13 * n_points];
 
-    let data: Vec<_> = x
-        .iter()
-        .zip(y.iter())
-        .zip(z.iter())
-        .zip(l.iter())
-        .flat_map(|(((x, y), z), l)| {
-            let x = x.to_ne_bytes();
-            let y = y.to_ne_bytes();
-            let z = z.to_ne_bytes();
+    for index in (0..n_points).step_by(N) {
+        let x = Simd::<f32, N>::from_slice(&points.x[index..index + N]);
+        let x = x.to_le_bytes();
+        let y = Simd::<f32, N>::from_slice(&points.y[index..index + N]);
+        let y = y.to_le_bytes();
+        let z = Simd::<f32, N>::from_slice(&points.z[index..index + N]);
+        let z = z.to_le_bytes();
 
-            [
-                x[0], x[1], x[2], x[3], y[0], y[1], y[2], y[3], z[0], z[1], z[2], z[3], *l,
-            ]
-        })
-        .collect();
+        let out = index * 13;
+        data[out..out + 4].copy_from_slice(&x[..4]);
+        data[out + 4..out + 8].copy_from_slice(&y[..4]);
+        data[out + 8..out + 12].copy_from_slice(&z[..4]);
+        data[out + 12] = points.l[index];
+
+        let out = (index + 1) * 13;
+        data[out..out + 4].copy_from_slice(&x[4..8]);
+        data[out + 4..out + 8].copy_from_slice(&y[4..8]);
+        data[out + 8..out + 12].copy_from_slice(&z[4..8]);
+        data[out + 12] = points.l[index];
+
+        let out = (index + 2) * 13;
+        data[out..out + 4].copy_from_slice(&x[8..12]);
+        data[out + 4..out + 8].copy_from_slice(&y[8..12]);
+        data[out + 8..out + 12].copy_from_slice(&z[8..12]);
+        data[out + 12] = points.l[index];
+
+        let out = (index + 3) * 13;
+        data[out..out + 4].copy_from_slice(&x[12..16]);
+        data[out + 4..out + 8].copy_from_slice(&y[12..16]);
+        data[out + 8..out + 12].copy_from_slice(&z[12..16]);
+        data[out + 12] = points.l[index];
+    }
+
+    for index in n_points - n_points % N..n_points {
+        let x = points.x[index].to_le_bytes();
+        let y = points.y[index].to_le_bytes();
+        let z = points.z[index].to_le_bytes();
+        let l = points.l[index];
+
+        let out = index * 13;
+        data[out..out + 4].copy_from_slice(&x);
+        data[out + 4..out + 8].copy_from_slice(&y);
+        data[out + 8..out + 12].copy_from_slice(&z);
+        data[out + 12] = l;
+    }
 
     let msg = PointCloud2 {
         header: Header {
@@ -349,21 +386,40 @@ fn format_points(points: &Points, n_points: usize, frame_id: &str) -> Result<Val
     Ok(encoded)
 }
 
-fn format_depth(depth: &Array2<u16>, frame_id: &str) -> Result<Value, cdr::Error> {
+fn format_depth(
+    depth: &Array2<u16>,
+    crop: &(usize, usize),
+    frame_id: &str,
+) -> Result<Value, cdr::Error> {
+    const N: usize = 8;
+
+    let depth = depth
+        .slice(ndarray::s![.., crop.0..crop.1])
+        .as_standard_layout()
+        .to_owned();
+    let (height, width) = depth.dim();
+    let depth = depth.as_slice().unwrap();
+    let mut data = vec![0u8; height * width * 2];
+
+    for index in (0..height * width).step_by(N) {
+        let x = Simd::<u16, N>::from_slice(&depth[index..]);
+        let x = x.to_le_bytes();
+
+        let out = index * 2;
+        x.copy_to_slice(&mut data[out..out + 16]);
+    }
+
     let msg = Image {
         header: Header {
             stamp: timestamp()?,
             frame_id: frame_id.to_string(),
         },
-        height: depth.shape()[0] as u32,
-        width: depth.shape()[1] as u32,
+        height: height as u32,
+        width: width as u32,
         encoding: "mono16".to_owned(),
         is_bigendian: 0,
-        step: depth.shape()[1] as u32 * 2,
-        data: depth
-            .iter()
-            .flat_map(|&x| x.to_le_bytes().to_vec())
-            .collect(),
+        step: width as u32 * 2,
+        data,
     };
 
     let encoded = cdr::serialize::<_, _, CdrLe>(&msg, Infinite)?;
@@ -375,18 +431,28 @@ fn format_depth(depth: &Array2<u16>, frame_id: &str) -> Result<Value, cdr::Error
     Ok(encoded)
 }
 
-fn format_reflect(reflect: &Array2<u8>, frame_id: &str) -> Result<Value, cdr::Error> {
+fn format_reflect(
+    reflect: &Array2<u8>,
+    crop: &(usize, usize),
+    frame_id: &str,
+) -> Result<Value, cdr::Error> {
+    let reflect = reflect
+        .slice(ndarray::s![.., crop.0..crop.1])
+        .as_standard_layout()
+        .to_owned();
+    let (height, width) = reflect.dim();
+
     let msg = Image {
         header: Header {
             stamp: timestamp()?,
             frame_id: frame_id.to_string(),
         },
-        height: reflect.shape()[0] as u32,
-        width: reflect.shape()[1] as u32,
+        height: height as u32,
+        width: width as u32,
         encoding: "mono8".to_owned(),
         is_bigendian: 0,
-        step: reflect.shape()[1] as u32,
-        data: reflect.iter().copied().collect(),
+        step: width as u32,
+        data: reflect.as_slice().unwrap().to_vec(),
     };
 
     let encoded = cdr::serialize::<_, _, CdrLe>(&msg, Infinite)?;

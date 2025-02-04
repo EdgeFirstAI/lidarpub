@@ -1,8 +1,7 @@
-use async_std::task::block_on;
+use async_std::{net::UdpSocket, task::block_on};
 use clap::{builder::PossibleValuesParser, Parser};
 use lidarpub::ouster::{
-    udp_read, BeamIntrinsics, Config, Frame, FrameReader, LidarDataFormat, Parameters, Points,
-    SensorInfo,
+    BeamIntrinsics, Config, Frame, FrameReader, LidarDataFormat, Parameters, Points, SensorInfo,
 };
 use log::error;
 use ndarray::Array2;
@@ -14,9 +13,11 @@ use std::{
     io::{BufReader, IsTerminal as _, Write as _},
     net::{Ipv4Addr, SocketAddr, TcpStream},
     path::Path,
-    thread::{self, sleep},
+    thread::sleep,
     time::Duration,
 };
+
+mod common;
 
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
@@ -236,22 +237,24 @@ async fn live_loop(
         false => format!("[::]:{}", config.udp_port_lidar),
     };
 
-    let (tx, rx) = kanal::bounded_async(256);
+    common::set_process_priority();
+    let sock = UdpSocket::bind(bind_addr).await?;
+    let sock = common::set_socket_bufsize(sock, 16 * 1024 * 1024);
 
-    thread::Builder::new()
-        .name("udp_read".to_string())
-        .spawn(move || block_on(udp_read(tx, &bind_addr)))?;
+    let mut buf = [0u8; 16 * 1024];
 
     loop {
-        let buf = match rx.recv().await {
-            Ok(buf) => buf,
+        let len = match sock.recv_from(&mut buf).await {
+            Ok((len, _)) => len,
             Err(e) => {
                 error!("udp_read recv error: {:?}", e);
                 continue;
             }
         };
 
-        if let Some(frame) = frame_reader.update(&mut points, &mut depth, &mut reflect, &buf)? {
+        if let Some(frame) =
+            frame_reader.update(&mut points, &mut depth, &mut reflect, &buf[..len])?
+        {
             frame_handler(rr, frame, &points, &depth, &reflect)?;
         }
     }
