@@ -284,6 +284,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+#[inline(never)]
 fn format_points(points: &Points, n_points: usize, frame_id: &str) -> Result<Value, cdr::Error> {
     const N: usize = 4;
 
@@ -386,6 +387,7 @@ fn format_points(points: &Points, n_points: usize, frame_id: &str) -> Result<Val
     Ok(encoded)
 }
 
+#[inline(never)]
 fn format_depth(
     depth: &Array2<u16>,
     crop: &(usize, usize),
@@ -431,6 +433,7 @@ fn format_depth(
     Ok(encoded)
 }
 
+#[inline(never)]
 fn format_reflect(
     reflect: &Array2<u8>,
     crop: &(usize, usize),
