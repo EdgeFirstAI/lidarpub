@@ -7,7 +7,7 @@ use cdr::{CdrLe, Infinite};
 use clap::{builder::PossibleValuesParser, Parser};
 use common::TimestampMode;
 use edgefirst_schemas::{
-    builtin_interfaces::{self, Time},
+    builtin_interfaces::{Time},
     geometry_msgs::{Quaternion, Transform, TransformStamped, Vector3},
     sensor_msgs::{Image, PointCloud2, PointField},
     std_msgs::Header,
