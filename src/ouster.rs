@@ -13,6 +13,7 @@ pub struct Config {
     pub udp_profile_lidar: String,
     pub lidar_mode: String,
     pub azimuth_window: [u32; 2],
+    pub timestamp_mode: String,
 }
 
 impl Default for Config {
@@ -23,6 +24,7 @@ impl Default for Config {
             udp_profile_lidar: "RNG15_RFL8_NIR8".to_owned(),
             lidar_mode: "1024x10".to_owned(),
             azimuth_window: [0, 360000],
+            timestamp_mode: "TIME_FROM_INTERNAL_OSC".to_owned(),
         }
     }
 }
@@ -412,6 +414,7 @@ impl Points {
 
 #[derive(Clone, Debug)]
 pub struct Frame {
+    pub timestamp: u64,
     pub frame_id: u16,
     pub n_points: usize,
     pub crop: (usize, usize),
@@ -456,6 +459,7 @@ pub struct FrameReader {
     depth: Array2<u16>,
     reflect: Array2<u8>,
     crop: (usize, usize),
+    timestamp: u64,
     buffers: FrameBuffers,
 }
 
@@ -543,6 +547,7 @@ impl FrameReader {
             depth: Array2::zeros((rows, cols)),
             reflect: Array2::zeros((rows, cols)),
             crop,
+            timestamp: 0,
             buffers: FrameBuffers::new(rows * cols),
         })
     }
@@ -562,6 +567,7 @@ impl FrameReader {
             let n_points = self.points(points, depth, reflect);
 
             frame = Some(Frame {
+                timestamp: self.timestamp,
                 frame_id: self.frame_id,
                 n_points,
                 crop: self.crop,
@@ -583,6 +589,10 @@ impl FrameReader {
                         self.reflect[[row, col]] = data.reflect;
                     }
                 }
+            }
+
+            if i == self.columns_per_packet - 1 {
+                self.timestamp = column.timestamp();
             }
         }
 

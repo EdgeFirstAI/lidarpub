@@ -1,8 +1,11 @@
 #![feature(portable_simd)]
 
+mod common;
+
 use async_std::net::UdpSocket;
 use cdr::{CdrLe, Infinite};
 use clap::{builder::PossibleValuesParser, Parser};
+use common::TimestampMode;
 use edgefirst_schemas::{
     builtin_interfaces::{self, Time},
     geometry_msgs::{Quaternion, Transform, TransformStamped, Vector3},
@@ -21,11 +24,9 @@ use std::{
     str::FromStr as _,
     sync::Arc,
     thread::{self, sleep},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use zenoh::prelude::{r#async::*, sync::SyncResolve};
-
-mod common;
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -57,6 +58,12 @@ struct Args {
     #[arg(long, env, default_value = "1024x10", 
           value_parser = PossibleValuesParser::new(["512x10", "1024x10", "2048x10", "512x20", "1024x20",]))]
     mode: String,
+
+    /// LiDAR timestamp mode.  If using the PTP1588 timestamp mode the LiDAR
+    /// must be connected to a PTP1588 enabled network, the Maivin can provide
+    /// this time through the ptp4l service.
+    #[arg(long, env, default_value = "internal")]
+    timestamp_mode: TimestampMode,
 
     /// Frame transformation vector from the base_link
     #[arg(
@@ -122,6 +129,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config {
         udp_dest: local.to_string(),
         lidar_mode: args.mode.clone(),
+        timestamp_mode: args.timestamp_mode.to_string(),
         azimuth_window: args
             .azimuth
             .iter()
@@ -207,7 +215,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .clone()
         .declare_publisher(format!("{}/points", args.lidar_topic))
         .priority(Priority::DataHigh)
-        .congestion_control(CongestionControl::Block)
+        .congestion_control(CongestionControl::Drop)
         .res_async()
         .await
     {
@@ -225,7 +233,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .clone()
         .declare_publisher(format!("{}/depth", args.lidar_topic))
         .priority(Priority::DataHigh)
-        .congestion_control(CongestionControl::Block)
+        .congestion_control(CongestionControl::Drop)
         .res_async()
         .await
     {
@@ -243,7 +251,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .clone()
         .declare_publisher(format!("{}/reflect", args.lidar_topic))
         .priority(Priority::DataHigh)
-        .congestion_control(CongestionControl::Block)
+        .congestion_control(CongestionControl::Drop)
         .res_async()
         .await
     {
@@ -269,11 +277,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(frame) =
             frame_reader.update(&mut points, &mut depth, &mut reflect, &buf[..len])?
         {
-            let points = format_points(&points, frame.n_points, &args.frame_id)?;
+            let timestamp = Time::from_nanos(frame.timestamp);
+            let points = format_points(
+                &points,
+                frame.n_points,
+                timestamp.clone(),
+                args.frame_id.clone(),
+            )?;
             let points = points_publisher.put(points).res_async();
-            let depth = format_depth(&depth, &frame.crop, &args.frame_id)?;
+            let depth = format_depth(
+                &depth,
+                &frame.crop,
+                timestamp.clone(),
+                args.frame_id.clone(),
+            )?;
             let depth = publish_depth.put(depth).res_async();
-            let reflect = format_reflect(&reflect, &frame.crop, &args.frame_id)?;
+            let reflect = format_reflect(&reflect, &frame.crop, timestamp, args.frame_id.clone())?;
             let reflect = publish_reflect.put(reflect).res_async();
 
             match futures::try_join!(points, depth, reflect) {
@@ -285,7 +304,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[inline(never)]
-fn format_points(points: &Points, n_points: usize, frame_id: &str) -> Result<Value, cdr::Error> {
+fn format_points(
+    points: &Points,
+    n_points: usize,
+    timestamp: Time,
+    frame_id: String,
+) -> Result<Value, cdr::Error> {
     const N: usize = 4;
 
     let fields = vec![
@@ -365,8 +389,8 @@ fn format_points(points: &Points, n_points: usize, frame_id: &str) -> Result<Val
 
     let msg = PointCloud2 {
         header: Header {
-            stamp: timestamp()?,
-            frame_id: frame_id.to_string(),
+            stamp: timestamp,
+            frame_id,
         },
         height: 1,
         width: n_points as u32,
@@ -391,7 +415,8 @@ fn format_points(points: &Points, n_points: usize, frame_id: &str) -> Result<Val
 fn format_depth(
     depth: &Array2<u16>,
     crop: &(usize, usize),
-    frame_id: &str,
+    timestamp: Time,
+    frame_id: String,
 ) -> Result<Value, cdr::Error> {
     const N: usize = 8;
 
@@ -413,8 +438,8 @@ fn format_depth(
 
     let msg = Image {
         header: Header {
-            stamp: timestamp()?,
-            frame_id: frame_id.to_string(),
+            stamp: timestamp,
+            frame_id,
         },
         height: height as u32,
         width: width as u32,
@@ -437,7 +462,8 @@ fn format_depth(
 fn format_reflect(
     reflect: &Array2<u8>,
     crop: &(usize, usize),
-    frame_id: &str,
+    timestamp: Time,
+    frame_id: String,
 ) -> Result<Value, cdr::Error> {
     let reflect = reflect
         .slice(ndarray::s![.., crop.0..crop.1])
@@ -447,8 +473,8 @@ fn format_reflect(
 
     let msg = Image {
         header: Header {
-            stamp: timestamp()?,
-            frame_id: frame_id.to_string(),
+            stamp: timestamp,
+            frame_id,
         },
         height: height as u32,
         width: width as u32,
@@ -485,10 +511,12 @@ async fn spawn_tf_static(
         }
     };
 
+    let timestamp = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?;
+    let timestamp = Time::from_nanos(timestamp.as_nanos() as u64);
     let msg = TransformStamped {
         header: Header {
             frame_id: args.base_frame_id.clone(),
-            stamp: timestamp().unwrap_or(Time { sec: 0, nanosec: 0 }),
+            stamp: timestamp,
         },
         child_frame_id: args.frame_id.clone(),
         transform: Transform {
@@ -527,29 +555,4 @@ async fn spawn_tf_static(
         })?;
 
     Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn timestamp() -> Result<builtin_interfaces::Time, std::io::Error> {
-    let mut tp = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    let err = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, &mut tp) };
-    if err != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    Ok(builtin_interfaces::Time {
-        sec: tp.tv_sec as i32,
-        nanosec: tp.tv_nsec as u32,
-    })
-}
-
-#[cfg(not(target_os = "linux"))]
-fn timestamp() -> Result<builtin_interfaces::Time, std::io::Error> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "timestamp not implemented",
-    ))
 }

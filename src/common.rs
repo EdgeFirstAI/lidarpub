@@ -1,5 +1,39 @@
 use async_std::net::UdpSocket;
+use clap::ValueEnum;
+use std::fmt;
+
+#[cfg(target_os = "linux")]
 use log::warn;
+
+#[derive(Copy, Clone, Debug, PartialEq, ValueEnum)]
+pub enum TimestampMode {
+    Internal,
+    SyncPulse,
+    Ptp1588,
+}
+
+impl fmt::Display for TimestampMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TimestampMode::Internal => write!(f, "TIME_FROM_INTERNAL_OSC"),
+            TimestampMode::SyncPulse => write!(f, "TIME_FROM_SYNC_PULSE_IN"),
+            TimestampMode::Ptp1588 => write!(f, "TIME_FROM_PTP_1588"),
+        }
+    }
+}
+
+impl TryFrom<&str> for TimestampMode {
+    type Error = String;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "TIME_FROM_INTERNAL_OSC" => Ok(TimestampMode::Internal),
+            "TIME_FROM_SYNC_PULSE_IN" => Ok(TimestampMode::SyncPulse),
+            "TIME_FROM_PTP_1588" => Ok(TimestampMode::Ptp1588),
+            _ => Err(format!("Invalid timestamp mode: {}", value)),
+        }
+    }
+}
 
 #[cfg(target_os = "linux")]
 pub fn set_process_priority() {
@@ -42,6 +76,6 @@ pub fn set_socket_bufsize(socket: UdpSocket, size: usize) -> UdpSocket {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn set_socket_bufsize(socket: UdpSocket, size: usize) -> UdpSocket {
+pub fn set_socket_bufsize(socket: UdpSocket, _size: usize) -> UdpSocket {
     socket
 }

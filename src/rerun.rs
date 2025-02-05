@@ -1,5 +1,8 @@
+mod common;
+
 use async_std::{net::UdpSocket, task::block_on};
 use clap::{builder::PossibleValuesParser, Parser};
+use common::TimestampMode;
 use lidarpub::ouster::{
     BeamIntrinsics, Config, Frame, FrameReader, LidarDataFormat, Parameters, Points, SensorInfo,
 };
@@ -16,8 +19,6 @@ use std::{
     thread::sleep,
     time::Duration,
 };
-
-mod common;
 
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
@@ -52,6 +53,12 @@ struct Args {
     #[arg(long, env, default_value = "1024x10", 
           value_parser = PossibleValuesParser::new(["512x10", "1024x10", "2048x10", "512x20", "1024x20",]))]
     mode: String,
+
+    /// LiDAR timestamp mode.  If using the PTP1588 timestamp mode the LiDAR
+    /// must be connected to a PTP1588 enabled network, the Maivin can provide
+    /// this time through the ptp4l service.
+    #[arg(long, env, value_enum, default_value = "internal")]
+    timestamp_mode: TimestampMode,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -123,7 +130,7 @@ fn pcap_loop(
                                         if let Some(rr) = rr {
                                             rr.set_time_seconds(
                                                 "stable_time",
-                                                frame.frame_id as f64 / 10.0,
+                                                frame.timestamp as f64 / 1e9,
                                             );
                                         }
 
@@ -162,6 +169,7 @@ async fn live_loop(
     let config = Config {
         udp_dest: local.to_string(),
         lidar_mode: args.mode.clone(),
+        timestamp_mode: args.timestamp_mode.to_string(),
         azimuth_window: args
             .azimuth
             .iter()
@@ -255,6 +263,10 @@ async fn live_loop(
         if let Some(frame) =
             frame_reader.update(&mut points, &mut depth, &mut reflect, &buf[..len])?
         {
+            if let Some(rr) = rr {
+                rr.set_time_seconds("stable_time", frame.timestamp as f64 / 1e9);
+            }
+
             frame_handler(rr, frame, &points, &depth, &reflect)?;
         }
     }
