@@ -28,20 +28,18 @@ default = []
 rerun = ["dep:rerun", "dep:etherparse", "dep:pcap-parser"]
 
 [dependencies]
-async-std = { version = "1.12.0", features = ["attributes"] }
 cdr = "0.2.4"
 clap = { version = "4.5.28", features = ["derive", "env"] }
 edgefirst-schemas = "1.2.4"
 env_logger = "0.11"
 etherparse = { version = "0.17.0", optional = true }
-futures = "0.3.31"
 libc = "0.2.167"
 log = "0.4.25"
 ndarray = "0.16.1"
 pcap-parser = { version = "0.16.0", optional = true }
-rerun = { version = "0.21.0", optional = true }
+rerun = { version = "0.22.0", optional = true }
 serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "1.0.138"
-unix-ts = "1.0"
+tokio = { version = "1.43.0", features = ["rt-multi-thread", "time", "io-std"] }
 ureq = { version = "3.0.4", features = ["json"] }
-zenoh = "0.10.0-rc"
+zenoh = "1.2.1"

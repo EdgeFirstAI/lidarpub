@@ -1,6 +1,5 @@
 mod common;
 
-use async_std::{net::UdpSocket, task::block_on};
 use clap::{builder::PossibleValuesParser, Parser};
 use common::TimestampMode;
 use lidarpub::ouster::{
@@ -14,7 +13,7 @@ use std::{
     error::Error,
     fs::File,
     io::{BufReader, IsTerminal as _, Write as _},
-    net::{Ipv4Addr, SocketAddr, TcpStream},
+    net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket},
     path::Path,
     thread::sleep,
     time::Duration,
@@ -52,7 +51,7 @@ struct Args {
     /// LiDAR column and refresh rate mode.  The format is "COLxHZ".
     #[arg(long, env, default_value = "1024x10", 
           value_parser = PossibleValuesParser::new(["512x10", "1024x10", "2048x10", "512x20", "1024x20",]))]
-    mode: String,
+    lidar_mode: String,
 
     /// LiDAR timestamp mode.  If using the PTP1588 timestamp mode the LiDAR
     /// must be connected to a PTP1588 enabled network, the Maivin can provide
@@ -83,7 +82,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if Path::new(&args.target).exists() {
         pcap_loop(&rr, &args.target)?;
     } else {
-        block_on(live_loop(&rr, &args))?;
+        live_loop(&rr, &args)?;
     }
 
     Ok(())
@@ -155,10 +154,7 @@ fn pcap_loop(
     Ok(())
 }
 
-async fn live_loop(
-    rr: &Option<RecordingStream>,
-    args: &Args,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn live_loop(rr: &Option<RecordingStream>, args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let local = {
         let stream = TcpStream::connect(format!("{}:80", &args.target))?;
         stream.local_addr()?.ip()
@@ -168,7 +164,7 @@ async fn live_loop(
 
     let config = Config {
         udp_dest: local.to_string(),
-        lidar_mode: args.mode.clone(),
+        lidar_mode: args.lidar_mode.clone(),
         timestamp_mode: args.timestamp_mode.to_string(),
         azimuth_window: args
             .azimuth
@@ -246,13 +242,13 @@ async fn live_loop(
     };
 
     common::set_process_priority();
-    let sock = UdpSocket::bind(bind_addr).await?;
+    let sock = UdpSocket::bind(bind_addr)?;
     let sock = common::set_socket_bufsize(sock, 16 * 1024 * 1024);
 
     let mut buf = [0u8; 16 * 1024];
 
     loop {
-        let len = match sock.recv_from(&mut buf).await {
+        let len = match sock.recv_from(&mut buf) {
             Ok((len, _)) => len,
             Err(e) => {
                 error!("udp_read recv error: {:?}", e);

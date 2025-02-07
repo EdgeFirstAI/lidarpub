@@ -1,13 +1,13 @@
 #![feature(portable_simd)]
 
+mod args;
 mod common;
 
-use async_std::net::UdpSocket;
+use args::Args;
 use cdr::{CdrLe, Infinite};
-use clap::{builder::PossibleValuesParser, Parser};
-use common::TimestampMode;
+use clap::Parser as _;
 use edgefirst_schemas::{
-    builtin_interfaces::{Time},
+    builtin_interfaces::Time,
     geometry_msgs::{Quaternion, Transform, TransformStamped, Vector3},
     sensor_msgs::{Image, PointCloud2, PointField},
     std_msgs::Header,
@@ -21,12 +21,15 @@ use std::{
     io::{IsTerminal as _, Write as _},
     net::TcpStream,
     simd::{Simd, ToBytes as _},
-    str::FromStr as _,
-    sync::Arc,
-    thread::{self, sleep},
+    thread::sleep,
     time::{Duration, Instant, SystemTime},
 };
-use zenoh::prelude::{r#async::*, sync::SyncResolve};
+use tokio::net::UdpSocket;
+use zenoh::{
+    bytes::{Encoding, ZBytes},
+    qos::{CongestionControl, Priority},
+    Session,
+};
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -41,83 +44,14 @@ pub enum PointFieldType {
     FLOAT64 = 8,
 }
 
-#[derive(Parser, Debug, Clone)]
-#[command(author, version, about, long_about = None)]
-struct Args {
-    /// Connect to target device or pcap file.  If target is a valid pcap file,
-    /// it will be used otherwise it will be tried as a hostname or IP address.
-    #[arg(env)]
-    target: String,
-
-    /// Azimuth field of view start and stop angles in degrees.  
-    /// The 0 degree point is the rear connector of the LiDAR.
-    #[arg(long, env, num_args = 2, value_names = ["START", "STOP"], value_delimiter=' ', default_value = "0 360")]
-    azimuth: Vec<u32>,
-
-    /// LiDAR column and refresh rate mode.  The format is "COLxHZ".
-    #[arg(long, env, default_value = "1024x10", 
-          value_parser = PossibleValuesParser::new(["512x10", "1024x10", "2048x10", "512x20", "1024x20",]))]
-    mode: String,
-
-    /// LiDAR timestamp mode.  If using the PTP1588 timestamp mode the LiDAR
-    /// must be connected to a PTP1588 enabled network, the Maivin can provide
-    /// this time through the ptp4l service.
-    #[arg(long, env, default_value = "internal")]
-    timestamp_mode: TimestampMode,
-
-    /// Frame transformation vector from the base_link
-    #[arg(
-        long,
-        env,
-        default_value = "0 0 0",
-        value_delimiter = ' ',
-        num_args = 3
-    )]
-    tf_vec: Vec<f64>,
-
-    /// Frame transformation quaternion from the base_link
-    #[arg(
-        long,
-        env,
-        default_value = "0 0 0 1",
-        value_delimiter = ' ',
-        num_args = 4
-    )]
-    tf_quat: Vec<f64>,
-
-    /// The name of the base frame
-    #[arg(long, env, default_value = "base_link")]
-    base_frame_id: String,
-
-    /// The name of the lidar frame
-    #[arg(long, env, default_value = "lidar")]
-    frame_id: String,
-
-    /// lidar base topic
-    #[arg(long, env, default_value = "rt/lidar")]
-    lidar_topic: String,
-}
-
-#[async_std::main]
+#[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
     env_logger::init();
 
-    let mut zenoh_config = zenoh::config::Config::default();
-    zenoh_config
-        .set_mode(Some(zenoh::config::WhatAmI::Client))
-        .unwrap();
-    let endpoint = zenoh::config::Locator::from_str("tcp/127.0.0.1:7447").unwrap();
-    zenoh_config.connect.endpoints = vec![endpoint.into()];
-    let _ = zenoh_config.scouting.multicast.set_enabled(Some(false));
-    let session = zenoh::open(zenoh_config)
-        .res_async()
-        .await
-        .unwrap()
-        .into_arc();
-    debug!("opened zenoh session");
+    let args = Args::parse();
+    let session = zenoh::open(args.clone()).await.unwrap();
 
-    spawn_tf_static(session.clone(), &args).await.unwrap();
+    tokio::spawn(tf_static_loop(session.clone(), args.clone()));
 
     let local = {
         let stream = TcpStream::connect(format!("{}:80", &args.target))?;
@@ -128,7 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = Config {
         udp_dest: local.to_string(),
-        lidar_mode: args.mode.clone(),
+        lidar_mode: args.lidar_mode.clone(),
         timestamp_mode: args.timestamp_mode.to_string(),
         azimuth_window: args
             .azimuth
@@ -207,63 +141,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     common::set_process_priority();
     let sock = UdpSocket::bind(bind_addr).await?;
-    let sock = common::set_socket_bufsize(sock, 16 * 1024 * 1024);
+    let sock = common::set_socket_bufsize(sock.into_std()?, 16 * 1024 * 1024);
+    let sock = UdpSocket::from_std(sock)?;
 
     let mut buf = [0u8; 16 * 1024];
 
-    let points_publisher = match session
+    let points_publisher = session
         .clone()
         .declare_publisher(format!("{}/points", args.lidar_topic))
         .priority(Priority::DataHigh)
         .congestion_control(CongestionControl::Drop)
-        .res_async()
         .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            error!(
-                "Failed to create publisher {}/points: {:?}",
-                args.lidar_topic, e
-            );
-            return Err(e);
-        }
-    };
+        .unwrap();
 
-    let publish_depth = match session
+    let publish_depth = session
         .clone()
         .declare_publisher(format!("{}/depth", args.lidar_topic))
         .priority(Priority::DataHigh)
         .congestion_control(CongestionControl::Drop)
-        .res_async()
         .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            error!(
-                "Failed to create publisher {}/depth: {:?}",
-                args.lidar_topic, e
-            );
-            return Err(e);
-        }
-    };
+        .unwrap();
 
-    let publish_reflect = match session
+    let publish_reflect = session
         .clone()
         .declare_publisher(format!("{}/reflect", args.lidar_topic))
         .priority(Priority::DataHigh)
         .congestion_control(CongestionControl::Drop)
-        .res_async()
         .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            error!(
-                "Failed to create publisher {}/reflect: {:?}",
-                args.lidar_topic, e
-            );
-            return Err(e);
-        }
-    };
+        .unwrap();
 
     loop {
         let len = match sock.recv_from(&mut buf).await {
@@ -278,24 +183,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             frame_reader.update(&mut points, &mut depth, &mut reflect, &buf[..len])?
         {
             let timestamp = Time::from_nanos(frame.timestamp);
-            let points = format_points(
+            let (msg, enc) = format_points(
                 &points,
                 frame.n_points,
                 timestamp.clone(),
                 args.frame_id.clone(),
             )?;
-            let points = points_publisher.put(points).res_async();
-            let depth = format_depth(
+            let points = points_publisher.put(msg).encoding(enc);
+            let (msg, enc) = format_depth(
                 &depth,
                 &frame.crop,
                 timestamp.clone(),
                 args.frame_id.clone(),
             )?;
-            let depth = publish_depth.put(depth).res_async();
-            let reflect = format_reflect(&reflect, &frame.crop, timestamp, args.frame_id.clone())?;
-            let reflect = publish_reflect.put(reflect).res_async();
+            let depth = publish_depth.put(msg).encoding(enc);
+            let (msg, enc) =
+                format_reflect(&reflect, &frame.crop, timestamp, args.frame_id.clone())?;
+            let reflect = publish_reflect.put(msg).encoding(enc);
 
-            match futures::try_join!(points, depth, reflect) {
+            match tokio::try_join!(points, depth, reflect) {
                 Ok(_) => trace!("{} message sent", args.lidar_topic),
                 Err(e) => error!("{} message error: {:?}", args.lidar_topic, e),
             }
@@ -309,7 +215,7 @@ fn format_points(
     n_points: usize,
     timestamp: Time,
     frame_id: String,
-) -> Result<Value, cdr::Error> {
+) -> Result<(ZBytes, Encoding), cdr::Error> {
     const N: usize = 4;
 
     let fields = vec![
@@ -402,13 +308,10 @@ fn format_points(
         is_dense: true,
     };
 
-    let encoded = cdr::serialize::<_, _, CdrLe>(&msg, Infinite)?;
-    let encoded = Value::from(encoded).encoding(Encoding::WithSuffix(
-        KnownEncoding::AppOctetStream,
-        "sensor_msgs/msg/PointCloud2".into(),
-    ));
+    let msg = ZBytes::from(cdr::serialize::<_, _, CdrLe>(&msg, Infinite)?);
+    let enc = Encoding::APPLICATION_CDR.with_schema("sensor_msgs/msg/PointCloud2");
 
-    Ok(encoded)
+    Ok((msg, enc))
 }
 
 #[inline(never)]
@@ -417,7 +320,7 @@ fn format_depth(
     crop: &(usize, usize),
     timestamp: Time,
     frame_id: String,
-) -> Result<Value, cdr::Error> {
+) -> Result<(ZBytes, Encoding), cdr::Error> {
     const N: usize = 8;
 
     let depth = depth
@@ -449,13 +352,10 @@ fn format_depth(
         data,
     };
 
-    let encoded = cdr::serialize::<_, _, CdrLe>(&msg, Infinite)?;
-    let encoded = Value::from(encoded).encoding(Encoding::WithSuffix(
-        KnownEncoding::AppOctetStream,
-        "sensor_msgs/msg/Image".into(),
-    ));
+    let msg = ZBytes::from(cdr::serialize::<_, _, CdrLe>(&msg, Infinite).unwrap());
+    let enc = Encoding::APPLICATION_CDR.with_schema("sensor_msgs/msg/Image");
 
-    Ok(encoded)
+    Ok((msg, enc))
 }
 
 #[inline(never)]
@@ -464,7 +364,7 @@ fn format_reflect(
     crop: &(usize, usize),
     timestamp: Time,
     frame_id: String,
-) -> Result<Value, cdr::Error> {
+) -> Result<(ZBytes, Encoding), cdr::Error> {
     let reflect = reflect
         .slice(ndarray::s![.., crop.0..crop.1])
         .as_standard_layout()
@@ -484,34 +384,23 @@ fn format_reflect(
         data: reflect.as_slice().unwrap().to_vec(),
     };
 
-    let encoded = cdr::serialize::<_, _, CdrLe>(&msg, Infinite)?;
-    let encoded = Value::from(encoded).encoding(Encoding::WithSuffix(
-        KnownEncoding::AppOctetStream,
-        "sensor_msgs/msg/Image".into(),
-    ));
+    let msg = ZBytes::from(cdr::serialize::<_, _, CdrLe>(&msg, Infinite).unwrap());
+    let enc = Encoding::APPLICATION_CDR.with_schema("sensor_msgs/msg/Image");
 
-    Ok(encoded)
+    Ok((msg, enc))
 }
 
-async fn spawn_tf_static(
-    session: Arc<zenoh::Session>,
-    args: &Args,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let publisher = match session
-        .declare_publisher("rt/tf_static".to_string())
+async fn tf_static_loop(session: Session, args: Args) {
+    let publisher = session
+        .declare_publisher("rt/tf".to_string())
         .priority(Priority::Background)
         .congestion_control(CongestionControl::Drop)
-        .res_async()
         .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            error!("Failed to create publisher rt/tf_static: {:?}", e);
-            return Err(e);
-        }
-    };
+        .unwrap();
 
-    let timestamp = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?;
+    let timestamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap();
     let timestamp = Time::from_nanos(timestamp.as_nanos() as u64);
     let msg = TransformStamped {
         header: Header {
@@ -534,25 +423,20 @@ async fn spawn_tf_static(
         },
     };
 
-    let msg =
-        Value::from(cdr::serialize::<_, _, CdrLe>(&msg, Infinite)?).encoding(Encoding::WithSuffix(
-            KnownEncoding::AppOctetStream,
-            "geometry_msgs/msg/TransformStamped".into(),
-        ));
+    let msg = ZBytes::from(cdr::serialize::<_, _, CdrLe>(&msg, Infinite).unwrap());
+    let enc = Encoding::APPLICATION_CDR.with_schema("geometry_msgs/msg/TransformStamped");
 
-    thread::Builder::new()
-        .name("tf_static".to_string())
-        .spawn(move || {
-            let interval = Duration::from_secs(1);
-            let mut target_time = Instant::now() + interval;
+    let interval = Duration::from_secs(1);
+    let mut target_time = Instant::now() + interval;
 
-            loop {
-                publisher.put(msg.clone()).res_sync().unwrap();
-                trace!("lidarpub publishing rt/tf_static");
-                sleep(target_time.duration_since(Instant::now()));
-                target_time += interval
-            }
-        })?;
-
-    Ok(())
+    loop {
+        publisher
+            .put(msg.clone())
+            .encoding(enc.clone())
+            .await
+            .unwrap();
+        trace!("lidarpub publishing rt/tf");
+        sleep(target_time.duration_since(Instant::now()));
+        target_time += interval
+    }
 }
