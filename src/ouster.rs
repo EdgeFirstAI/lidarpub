@@ -5,6 +5,7 @@ use std::{
     fmt,
     simd::{LaneCount, Simd, SupportedLaneCount},
 };
+use tracing::{info_span, instrument, warn};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
@@ -412,72 +413,119 @@ impl Points {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct Frame {
-    pub timestamp: u64,
-    pub frame_id: u16,
-    pub n_points: usize,
-    pub crop: (usize, usize),
-}
-
-struct FrameBuffers {
-    range: Vec<f32>,
-    x_range: Vec<f32>,
-    y_range: Vec<f32>,
-    x_delta: Vec<f32>,
-    y_delta: Vec<f32>,
-    altitude: Vec<f32>,
-}
-
-impl FrameBuffers {
-    fn new(maxlen: usize) -> Self {
-        FrameBuffers {
-            range: vec![0f32; maxlen],
-            x_range: vec![0f32; maxlen],
-            y_range: vec![0f32; maxlen],
-            x_delta: vec![0f32; maxlen],
-            y_delta: vec![0f32; maxlen],
-            altitude: vec![0f32; maxlen],
-        }
-    }
-}
-
 pub struct FrameReader {
     pub rows: usize,
     pub cols: usize,
-    pixel_shift_by_row: Vec<i16>,
-    column_window: [usize; 2],
     columns_per_packet: usize,
+    frame_id: u16,
+    depth: Array2<u16>,
+    reflect: Array2<u8>,
+    timestamp: u64,
+}
+
+impl FrameReader {
+    pub fn new(lidar_data_format: &LidarDataFormat) -> Result<FrameReader, Error> {
+        if lidar_data_format.udp_profile_lidar != "RNG15_RFL8_NIR8" {
+            return Err(Error::UnsupportedDataFormat(
+                lidar_data_format.udp_profile_lidar.clone(),
+            ));
+        }
+
+        let cols = lidar_data_format.columns_per_frame;
+        let rows = lidar_data_format.pixels_per_column;
+        let columns_per_packet = lidar_data_format.columns_per_packet;
+
+        Ok(FrameReader {
+            rows,
+            cols,
+            columns_per_packet,
+            frame_id: 0,
+            depth: Array2::zeros((rows, cols)),
+            reflect: Array2::zeros((rows, cols)),
+            timestamp: 0,
+        })
+    }
+
+    pub fn update<F>(&mut self, slice: &[u8], complete: F) -> Result<(), Error>
+    where
+        F: Fn(u64, u16, Array2<u16>, Array2<u8>),
+    {
+        let header = HeaderSlice::from_slice(slice)?;
+
+        if self.frame_id != header.frame_id() {
+            info_span!("make_frame").in_scope(|| {
+                complete(
+                    self.timestamp,
+                    self.frame_id,
+                    self.depth.clone(),
+                    self.reflect.clone(),
+                );
+
+                self.frame_id = header.frame_id();
+                self.depth.fill(0);
+                self.reflect.fill(0);
+            });
+        }
+
+        for i in 0..self.columns_per_packet {
+            let column = header.column(self.rows, i)?;
+            if column.status() {
+                let col = column.measurement_id() as usize;
+                if col < self.cols {
+                    for row in 0..self.rows {
+                        let data = column.row(row)?;
+                        self.depth[[row, col]] = data.range;
+                        self.reflect[[row, col]] = data.reflect;
+                    }
+                }
+            }
+
+            if i == self.columns_per_packet - 1 {
+                self.timestamp = column.timestamp();
+            }
+        }
+
+        Ok(())
+    }
+}
+
+pub struct FrameBuilder {
+    pub rows: usize,
+    pub cols: usize,
+    pub points: Points,
+    pub n_points: usize,
+    pub depth: Array2<u16>,
+    pub reflect: Array2<u8>,
+    pub crop: (usize, usize),
+    column_window: [usize; 2],
+    pixel_shift_by_row: Vec<i16>,
     beam_to_lidar: Array2<f32>,
     altitude_angles: Vec<f32>,
+    range: Vec<f32>,
     range_delta: f32,
     x_range: Array2<f32>,
     y_range: Array2<f32>,
     x_delta: Vec<f32>,
     y_delta: Vec<f32>,
-    frame_id: u16,
-    depth: Array2<u16>,
-    reflect: Array2<u8>,
-    crop: (usize, usize),
-    timestamp: u64,
-    buffers: FrameBuffers,
+    x_range_cache: Vec<f32>,
+    y_range_cache: Vec<f32>,
+    x_delta_cache: Vec<f32>,
+    y_delta_cache: Vec<f32>,
+    altitude: Vec<f32>,
 }
 
-impl FrameReader {
-    pub fn new(params: Parameters) -> Result<FrameReader, Error> {
-        if params.lidar_data_format.udp_profile_lidar != "RNG15_RFL8_NIR8" {
-            return Err(Error::UnsupportedDataFormat(
-                params.lidar_data_format.udp_profile_lidar,
-            ));
-        }
-
-        let cols = params.lidar_data_format.columns_per_frame;
+impl FrameBuilder {
+    pub fn new(params: &Parameters) -> Self {
         let rows = params.lidar_data_format.pixels_per_column;
+        let cols = params.lidar_data_format.columns_per_frame;
+        let maxlen = rows * cols;
         let pixel_shift_by_row = params.lidar_data_format.pixel_shift_by_row.clone();
         let column_window = params.lidar_data_format.column_window;
-        let columns_per_packet = params.lidar_data_format.columns_per_packet;
-        let beam_to_lidar =
-            Array2::from_shape_vec((4, 4), params.beam_intrinsics.beam_to_lidar_transform)?;
+        let beam_to_lidar = Array2::from_shape_vec(
+            (4, 4),
+            params.beam_intrinsics.beam_to_lidar_transform.clone(),
+        )
+        .unwrap();
         let range_delta = (beam_to_lidar[[0, 3]].powi(2) + beam_to_lidar[[2, 3]].powi(2)).sqrt();
 
         // The left and right columns are incomplete within the pixel shift
@@ -530,76 +578,39 @@ impl FrameReader {
             .map(|x| beam_to_lidar[[0, 3]] * x.sin())
             .collect();
 
-        Ok(FrameReader {
+        FrameBuilder {
             rows,
             cols,
-            pixel_shift_by_row,
+            points: Points::new(maxlen),
+            n_points: 0,
+            depth: Array2::zeros((rows, cols)),
+            reflect: Array2::zeros((rows, cols)),
             column_window,
-            columns_per_packet,
+            pixel_shift_by_row,
             beam_to_lidar,
             altitude_angles: altitude_angles.iter().map(|x| x.sin()).collect(),
+            crop,
             range_delta,
+            range: vec![0f32; maxlen],
+            altitude: vec![0f32; maxlen],
             x_range,
             y_range,
             x_delta,
             y_delta,
-            frame_id: 0,
-            depth: Array2::zeros((rows, cols)),
-            reflect: Array2::zeros((rows, cols)),
-            crop,
-            timestamp: 0,
-            buffers: FrameBuffers::new(rows * cols),
-        })
+            x_range_cache: vec![0f32; maxlen],
+            y_range_cache: vec![0f32; maxlen],
+            x_delta_cache: vec![0f32; maxlen],
+            y_delta_cache: vec![0f32; maxlen],
+        }
     }
 
-    pub fn update(
-        &mut self,
-        points: &mut Points,
-        depth: &mut Array2<u16>,
-        reflect: &mut Array2<u8>,
-        slice: &[u8],
-    ) -> Result<Option<Frame>, Error> {
-        let mut frame = None;
-        let header = HeaderSlice::from_slice(slice)?;
-
-        if self.frame_id != header.frame_id() {
-            self.images(depth, reflect);
-            let n_points = self.points(points, depth, reflect);
-
-            frame = Some(Frame {
-                timestamp: self.timestamp,
-                frame_id: self.frame_id,
-                n_points,
-                crop: self.crop,
-            });
-
-            self.frame_id = header.frame_id();
-            self.depth.fill(0);
-            self.reflect.fill(0);
-        }
-
-        for i in 0..self.columns_per_packet {
-            let column = header.column(self.rows, i)?;
-            if column.status() {
-                let col = column.measurement_id() as usize;
-                if col < self.cols {
-                    for row in 0..self.rows {
-                        let data = column.row(row)?;
-                        self.depth[[row, col]] = data.range;
-                        self.reflect[[row, col]] = data.reflect;
-                    }
-                }
-            }
-
-            if i == self.columns_per_packet - 1 {
-                self.timestamp = column.timestamp();
-            }
-        }
-
-        Ok(frame)
+    pub fn update(&mut self, depth: &Array2<u16>, reflect: &Array2<u8>) {
+        self.update_images(depth, reflect);
+        self.update_points();
     }
 
-    fn images(&self, depth: &mut Array2<u16>, reflect: &mut Array2<u8>) {
+    #[instrument(skip_all, fields(rows = self.rows, cols = self.cols))]
+    fn update_images(&mut self, depth: &Array2<u16>, reflect: &Array2<u8>) {
         let rows = self.rows;
         let cols = self.column_window[1] - self.column_window[0];
         let col_offset = self.column_window[0];
@@ -609,16 +620,17 @@ impl FrameReader {
 
             for col in 0..cols {
                 let colout = (col as i16 + shift).clamp(0, cols as i16 - 1) as usize;
-                depth[[row, colout]] = match self.depth[[row, col + col_offset]] {
+                self.depth[[row, colout]] = match depth[[row, col + col_offset]] {
                     0 => 0,
                     r => (r as f32 * 8.0 - self.range_delta) as u16,
                 };
-                reflect[[row, colout]] = self.reflect[[row, col + col_offset]];
+                self.reflect[[row, colout]] = reflect[[row, col + col_offset]];
             }
         }
     }
 
-    fn points(&mut self, points: &mut Points, depth: &Array2<u16>, reflect: &Array2<u8>) -> usize {
+    #[instrument(skip_all, fields(rows = self.rows, cols = self.cols))]
+    fn update_points(&mut self) {
         let col_base = self.column_window[0] as i16;
         let mut index = 0;
 
@@ -626,27 +638,27 @@ impl FrameReader {
             let col_offset = (col_base - self.pixel_shift_by_row[row]).max(0) as usize;
 
             for col in self.crop.0..self.crop.1 {
-                self.buffers.range[index] = depth[[row, col]] as f32;
-                points.l[index] = reflect[[row, col]];
+                self.range[index] = self.depth[[row, col]] as f32;
+                self.points.l[index] = self.reflect[[row, col]];
 
-                self.buffers.x_range[index] = self.x_range[[row, col + col_offset]];
-                self.buffers.y_range[index] = self.y_range[[row, col + col_offset]];
+                self.x_range_cache[index] = self.x_range[[row, col + col_offset]];
+                self.y_range_cache[index] = self.y_range[[row, col + col_offset]];
 
-                self.buffers.x_delta[index] = self.x_delta[col + col_offset];
-                self.buffers.y_delta[index] = self.y_delta[col + col_offset];
+                self.x_delta_cache[index] = self.x_delta[col + col_offset];
+                self.y_delta_cache[index] = self.y_delta[col + col_offset];
 
-                self.buffers.altitude[index] = self.altitude_angles[row];
+                self.altitude[index] = self.altitude_angles[row];
 
                 index += 1;
             }
         }
 
-        self.make_points::<4>(points, &self.buffers, index);
-        index
+        self.calculate_points::<4>(index);
+        self.n_points = index;
     }
 
     #[inline(never)]
-    fn make_points<const N: usize>(&self, points: &mut Points, buffers: &FrameBuffers, len: usize)
+    fn calculate_points<const N: usize>(&mut self, len: usize)
     where
         LaneCount<N>: SupportedLaneCount,
     {
@@ -654,31 +666,33 @@ impl FrameReader {
         let scale = Simd::<f32, N>::splat(0.001);
 
         for index in (0..len).step_by(N) {
-            let r = Simd::<f32, N>::from_slice(&buffers.range[index..]);
+            let r = Simd::<f32, N>::from_slice(&self.range[index..]);
 
-            let x_range = Simd::<f32, N>::from_slice(&buffers.x_range[index..]);
-            let x_delta = Simd::<f32, N>::from_slice(&buffers.x_delta[index..]);
+            let x_range = Simd::<f32, N>::from_slice(&self.x_range_cache[index..]);
+            let x_delta = Simd::<f32, N>::from_slice(&self.x_delta_cache[index..]);
             let x = r * x_range + x_delta;
             let x = x * scale;
-            x.copy_to_slice(&mut points.x[index..]);
+            x.copy_to_slice(&mut self.points.x[index..]);
 
-            let y_range = Simd::<f32, N>::from_slice(&buffers.y_range[index..]);
-            let y_delta = Simd::<f32, N>::from_slice(&buffers.y_delta[index..]);
+            let y_range = Simd::<f32, N>::from_slice(&self.y_range_cache[index..]);
+            let y_delta = Simd::<f32, N>::from_slice(&self.y_delta_cache[index..]);
             let y = r * y_range + y_delta;
             let y = y * scale;
-            y.copy_to_slice(&mut points.y[index..]);
+            y.copy_to_slice(&mut self.points.y[index..]);
 
-            let altitude = Simd::<f32, N>::from_slice(&buffers.altitude[index..]);
+            let altitude = Simd::<f32, N>::from_slice(&self.altitude[index..]);
             let z = r * altitude + beam_to_lidar;
             let z = z * scale;
-            z.copy_to_slice(&mut points.z[index..]);
+            z.copy_to_slice(&mut self.points.z[index..]);
         }
 
         for index in len - len % N..len {
-            let r = buffers.range[index];
-            points.x[index] = (r * buffers.x_range[index] + buffers.x_delta[index]) * 0.001;
-            points.y[index] = (r * buffers.y_range[index] + buffers.y_delta[index]) * 0.001;
-            points.z[index] = (r * buffers.altitude[index] + self.beam_to_lidar[[2, 3]]) * 0.001;
+            let r = self.range[index];
+            self.points.x[index] =
+                (r * self.x_range_cache[index] + self.x_delta_cache[index]) * 0.001;
+            self.points.y[index] =
+                (r * self.y_range_cache[index] + self.y_delta_cache[index]) * 0.001;
+            self.points.z[index] = (r * self.altitude[index] + self.beam_to_lidar[[2, 3]]) * 0.001;
         }
     }
 }

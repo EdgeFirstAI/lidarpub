@@ -12,10 +12,11 @@ use edgefirst_schemas::{
     sensor_msgs::{Image, PointCloud2, PointField},
     std_msgs::Header,
 };
+use kanal::Receiver;
 use lidarpub::ouster::{
-    BeamIntrinsics, Config, FrameReader, LidarDataFormat, Parameters, Points, SensorInfo,
+    BeamIntrinsics, Config, FrameBuilder, FrameReader, LidarDataFormat, Parameters, Points,
+    SensorInfo,
 };
-use log::{debug, error, info, trace};
 use ndarray::Array2;
 use std::{
     io::{IsTerminal as _, Write as _},
@@ -25,11 +26,19 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use tokio::net::UdpSocket;
+use tracing::{debug, error, info, info_span, trace, Instrument};
+use tracing_subscriber::{layer::SubscriberExt as _, Layer as _, Registry};
+use tracy_client::frame_mark;
 use zenoh::{
     bytes::{Encoding, ZBytes},
     qos::{CongestionControl, Priority},
     Session,
 };
+
+#[cfg(feature = "profiling")]
+#[global_allocator]
+static GLOBAL: tracy_client::ProfiledAllocator<std::alloc::System> =
+    tracy_client::ProfiledAllocator::new(std::alloc::System, 100);
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -46,9 +55,31 @@ pub enum PointFieldType {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::init();
-
     let args = Args::parse();
+
+    args.tracy.then(tracy_client::Client::start);
+
+    let stdout_log = tracing_subscriber::fmt::layer()
+        .pretty()
+        .with_filter(args.rust_log);
+
+    let journald = match tracing_journald::layer() {
+        Ok(journald) => Some(journald.with_filter(args.rust_log)),
+        Err(_) => None,
+    };
+
+    let tracy = match args.tracy {
+        true => Some(tracing_tracy::TracyLayer::default().with_filter(args.rust_log)),
+        false => None,
+    };
+
+    let subscriber = Registry::default()
+        .with(stdout_log)
+        .with(journald)
+        .with(tracy);
+    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+    tracing_log::LogTracer::init()?;
+
     let session = zenoh::open(args.clone()).await.unwrap();
 
     tokio::spawn(tf_static_loop(session.clone(), args.clone()));
@@ -127,10 +158,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     debug!("{:?}", params);
-    let mut frame_reader = FrameReader::new(params)?;
-    let mut points = Points::new(frame_reader.rows * frame_reader.cols);
-    let mut depth = Array2::<u16>::zeros((frame_reader.rows, frame_reader.cols));
-    let mut reflect = Array2::<u8>::zeros((frame_reader.rows, frame_reader.cols));
+    let mut frame_reader = FrameReader::new(&params.lidar_data_format)?;
 
     // On Linux [::] will bind to IPv4 and IPv6 but not on Windows so we bind
     // according to the local address IP version.
@@ -145,30 +173,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sock = UdpSocket::from_std(sock)?;
 
     let mut buf = [0u8; 16 * 1024];
+    let (tx, rx) = kanal::bounded(128);
 
-    let points_publisher = session
-        .clone()
-        .declare_publisher(format!("{}/points", args.lidar_topic))
-        .priority(Priority::DataHigh)
-        .congestion_control(CongestionControl::Drop)
-        .await
-        .unwrap();
-
-    let publish_depth = session
-        .clone()
-        .declare_publisher(format!("{}/depth", args.lidar_topic))
-        .priority(Priority::DataHigh)
-        .congestion_control(CongestionControl::Drop)
-        .await
-        .unwrap();
-
-    let publish_reflect = session
-        .clone()
-        .declare_publisher(format!("{}/reflect", args.lidar_topic))
-        .priority(Priority::DataHigh)
-        .congestion_control(CongestionControl::Drop)
-        .await
-        .unwrap();
+    std::thread::Builder::new()
+        .name("processor".to_string())
+        .spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(frame_processor(session, args, params, rx));
+        })?;
 
     loop {
         let len = match sock.recv_from(&mut buf).await {
@@ -179,33 +194,120 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        if let Some(frame) =
-            frame_reader.update(&mut points, &mut depth, &mut reflect, &buf[..len])?
+        frame_reader.update(&buf[..len], |timestamp, frame_id, depth, reflect| match tx
+            .send((timestamp, frame_id, depth, reflect))
         {
-            let timestamp = Time::from_nanos(frame.timestamp);
-            let (msg, enc) = format_points(
-                &points,
-                frame.n_points,
-                timestamp.clone(),
-                args.frame_id.clone(),
-            )?;
-            let points = points_publisher.put(msg).encoding(enc);
-            let (msg, enc) = format_depth(
-                &depth,
-                &frame.crop,
-                timestamp.clone(),
-                args.frame_id.clone(),
-            )?;
-            let depth = publish_depth.put(msg).encoding(enc);
-            let (msg, enc) =
-                format_reflect(&reflect, &frame.crop, timestamp, args.frame_id.clone())?;
-            let reflect = publish_reflect.put(msg).encoding(enc);
+            Ok(_) => {}
+            Err(e) => error!("frame send error: {:?}", e),
+        })?;
+    }
+}
 
-            match tokio::try_join!(points, depth, reflect) {
-                Ok(_) => trace!("{} message sent", args.lidar_topic),
-                Err(e) => error!("{} message error: {:?}", args.lidar_topic, e),
+async fn frame_processor(
+    session: Session,
+    args: Args,
+    params: Parameters,
+    rx: Receiver<(u64, u16, Array2<u16>, Array2<u8>)>,
+) {
+    let points_publisher = session
+        .declare_publisher(format!("{}/points", args.lidar_topic))
+        .priority(Priority::DataHigh)
+        .congestion_control(CongestionControl::Drop)
+        .await
+        .unwrap();
+
+    let depth_publisher = session
+        .declare_publisher(format!("{}/depth", args.lidar_topic))
+        .priority(Priority::DataHigh)
+        .congestion_control(CongestionControl::Drop)
+        .await
+        .unwrap();
+
+    let reflect_publisher = session
+        .declare_publisher(format!("{}/reflect", args.lidar_topic))
+        .priority(Priority::DataHigh)
+        .congestion_control(CongestionControl::Drop)
+        .await
+        .unwrap();
+
+    let mut builder = FrameBuilder::new(&params);
+
+    loop {
+        let (timestamp, frame_id, depth, reflect) = rx.recv().unwrap();
+
+        let span = info_span!("frame");
+        async {
+            builder.update(&depth, &reflect);
+
+            trace!(
+                timestamp = timestamp,
+                frame_id = frame_id,
+                n_points = builder.n_points,
+                "publishing frame"
+            );
+
+            let timestamp = Time::from_nanos(timestamp);
+
+            let publish_points = info_span!("publish_points");
+            async {
+                let (msg, enc) = format_points(
+                    &builder.points,
+                    builder.n_points,
+                    timestamp.clone(),
+                    args.frame_id.clone(),
+                )
+                .unwrap();
+                match points_publisher.put(msg).encoding(enc).await {
+                    Ok(_) => {}
+                    Err(e) => error!("publish points error: {:?}", e),
+                }
             }
+            .instrument(publish_points)
+            .await;
+
+            let publish_depth = info_span!("publish_depth");
+            async {
+                let (msg, enc) = format_depth(
+                    &builder.depth,
+                    &builder.crop,
+                    timestamp.clone(),
+                    args.frame_id.clone(),
+                )
+                .unwrap();
+                match depth_publisher.put(msg).encoding(enc).await {
+                    Ok(_) => {}
+                    Err(e) => error!("depth publish error: {:?}", e),
+                }
+            }
+            .instrument(publish_depth)
+            .await;
+
+            let publish_reflect = info_span!("publish_reflect");
+            async {
+                let (msg, enc) = format_reflect(
+                    &builder.reflect,
+                    &builder.crop,
+                    timestamp,
+                    args.frame_id.clone(),
+                )
+                .unwrap();
+                match reflect_publisher.put(msg).encoding(enc).await {
+                    Ok(_) => {}
+                    Err(e) => error!("reflect publish error: {:?}", e),
+                }
+            }
+            .instrument(publish_reflect)
+            .await;
+
+            // match tokio::try_join!(points_span, depth_span, reflect_span)
+            // {     Ok(_) => trace!("{} message sent",
+            // args.lidar_topic),     Err(e) => error!("{}
+            // message error: {:?}", args.lidar_topic, e), }
         }
+        .instrument(span)
+        .await;
+
+        args.tracy.then(frame_mark);
     }
 }
 

@@ -1,5 +1,6 @@
 use clap::{builder::PossibleValuesParser, Parser};
 use serde_json::json;
+use tracing::level_filters::LevelFilter;
 use zenoh::config::{Config, WhatAmI};
 
 use crate::common::TimestampMode;
@@ -59,6 +60,14 @@ pub struct Args {
     /// lidar base topic
     #[arg(long, env, default_value = "rt/lidar")]
     pub lidar_topic: String,
+
+    /// Application log level
+    #[arg(long, env, default_value = "info")]
+    pub rust_log: LevelFilter,
+
+    /// Enable Tracy profiler broadcast
+    #[arg(long, env)]
+    pub tracy: bool,
 
     /// zenoh connection mode
     #[arg(long, env, default_value = "peer")]

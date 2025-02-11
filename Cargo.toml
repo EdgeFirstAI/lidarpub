@@ -24,8 +24,15 @@ path = "src/rerun.rs"
 required-features = ["rerun"]
 
 [features]
-default = []
+default = ["tracy"]
 rerun = ["dep:rerun", "dep:etherparse", "dep:pcap-parser"]
+tracy = ["tracing-tracy/enable", "tracy-client/enable"]
+profiling = [
+    "tracing-tracy/sampling",
+    "tracing-tracy/system-tracing",
+    "tracy-client/sampling",
+    "tracy-client/system-tracing",
+]
 
 [dependencies]
 cdr = "0.2.4"
@@ -33,6 +40,7 @@ clap = { version = "4.5.28", features = ["derive", "env"] }
 edgefirst-schemas = "1.2.4"
 env_logger = "0.11"
 etherparse = { version = "0.17.0", optional = true }
+kanal = { git = "https://github.com/fereidani/kanal", rev = "b6aeab2" }
 libc = "0.2.167"
 log = "0.4.25"
 ndarray = "0.16.1"
@@ -40,6 +48,27 @@ pcap-parser = { version = "0.16.0", optional = true }
 rerun = { version = "0.22.0", optional = true }
 serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "1.0.138"
-tokio = { version = "1.43.0", features = ["rt-multi-thread", "time", "io-std"] }
+tokio = { version = "1.43.0", features = [
+    "rt-multi-thread",
+    "time",
+    "io-std",
+    "tracing",
+] }
+tracing = "0.1.41"
+tracing-journald = "0.3.1"
+tracing-log = "0.2.0"
+tracing-subscriber = "0.3.19"
+tracing-tracy = { version = "0.11.4", default-features = false, features = [
+    "manual-lifetime",
+    "broadcast",
+    "ondemand",
+    "fibers",
+] }
+tracy-client = { version = "0.18.0", default-features = false, features = [
+    "manual-lifetime",
+    "broadcast",
+    "ondemand",
+    "fibers",
+] }
 ureq = { version = "3.0.4", features = ["json"] }
 zenoh = "1.2.1"
