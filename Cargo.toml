@@ -36,18 +36,18 @@ profiling = [
 
 [dependencies]
 cdr = "0.2.4"
-clap = { version = "4.5.28", features = ["derive", "env"] }
+clap = { version = "4.5.31", features = ["derive", "env"] }
 edgefirst-schemas = "1.2.4"
 env_logger = "0.11"
 etherparse = { version = "0.17.0", optional = true }
 kanal = { git = "https://github.com/fereidani/kanal", rev = "b6aeab2" }
-libc = "0.2.167"
-log = "0.4.25"
+libc = "0.2.170"
+log = "0.4.26"
 ndarray = "0.16.1"
 pcap-parser = { version = "0.16.0", optional = true }
-rerun = { version = "0.22.0", optional = true }
-serde = { version = "1.0.217", features = ["derive"] }
-serde_json = "1.0.138"
+rerun = { version = "0.22.1", optional = true }
+serde = { version = "1.0.218", features = ["derive"] }
+serde_json = "1.0.139"
 tokio = { version = "1.43.0", features = [
     "rt-multi-thread",
     "time",
@@ -70,5 +70,5 @@ tracy-client = { version = "0.18.0", default-features = false, features = [
     "ondemand",
     "fibers",
 ] }
-ureq = { version = "3.0.4", features = ["json"] }
+ureq = { version = "3.0.6", features = ["json"] }
 zenoh = "1.2.1"
