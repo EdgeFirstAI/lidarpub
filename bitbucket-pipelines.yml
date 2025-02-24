@@ -29,7 +29,7 @@ definitions:
           - cargo audit --json > audit.json || true
           - cargo outdated --depth 1 --format json > outdated.json || true
           - cargo sonar --clippy --audit --outdated
-          - RUSTFLAGS='-C target-cpu=cortex-a53' cargo build --target=aarch64-unknown-linux-gnu --config target.aarch64-unknown-linux-gnu.linker=\"aarch64-linux-gnu-gcc\" --release
+          - cargo build --target=aarch64-unknown-linux-gnu --release
         artifacts:
           - target/aarch64-unknown-linux-gnu/release/lidarpub
           - sonar-issues.json
