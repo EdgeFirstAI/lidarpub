@@ -1,4 +1,4 @@
-image: deepview/rust:1.84.0-7
+image: deepview/rust:1.84.1
 
 clone:
   depth: full
@@ -29,7 +29,7 @@ definitions:
           - cargo audit --json > audit.json || true
           - cargo outdated --depth 1 --format json > outdated.json || true
           - cargo sonar --clippy --audit --outdated
-          - RUSTFLAGS='-C target-cpu=cortex-a53' cargo build --target=aarch64-unknown-linux-gnu --config target.aarch64-unknown-linux-gnu.linker=\"aarch64-linux-gnu-gcc\" --release
+          - cargo build --target=aarch64-unknown-linux-gnu --release
         artifacts:
           - target/aarch64-unknown-linux-gnu/release/lidarpub
           - sonar-issues.json
@@ -37,7 +37,7 @@ definitions:
         name: Code Sonar
         runs-on:
           - 'self.hosted'
-        image: sonarsource/sonar-scanner-cli:11
+        image: sonarsource/sonar-scanner-cli:11.2
         script:
           - sonar-scanner
 pipelines:
@@ -62,12 +62,12 @@ pipelines:
           deployment: Production
           script:
             - cp target/aarch64-unknown-linux-gnu/release/lidarpub maivin-lidarpub-$BITBUCKET_TAG
-            - pipe: atlassian/bitbucket-upload-file:0.7.3
+            - pipe: atlassian/bitbucket-upload-file:0.7.4
               variables:
                 BITBUCKET_USERNAME: au-zone-ci
                 BITBUCKET_APP_PASSWORD: $BITBUCKET_PASSWORD
                 FILENAME: "maivin-lidarpub-$BITBUCKET_TAG"
-            - pipe: atlassian/aws-s3-deploy:1.6.1
+            - pipe: atlassian/aws-s3-deploy:2.0.0
               variables:
                 AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
                 AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY

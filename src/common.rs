@@ -1,6 +1,5 @@
-use async_std::net::UdpSocket;
 use clap::ValueEnum;
-use std::fmt;
+use std::{fmt, net::UdpSocket};
 
 #[cfg(target_os = "linux")]
 use log::warn;
@@ -72,6 +71,7 @@ pub fn set_socket_bufsize(socket: UdpSocket, size: usize) -> UdpSocket {
             std::io::Error::last_os_error()
         );
     }
+
     unsafe { UdpSocket::from_raw_fd(fd) }
 }
 

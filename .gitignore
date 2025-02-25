@@ -1,3 +1,5 @@
+/testdata
+
 /target
 /venv
 /.debug
@@ -6,6 +8,9 @@ audit.json
 clippy.json
 outdated.json
 sonar-issues.json
+trace.json
 
 perf.data*
 kallsyms*
+
+uftrace.*
