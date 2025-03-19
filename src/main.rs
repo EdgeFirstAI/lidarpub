@@ -494,7 +494,7 @@ fn format_reflect(
 
 async fn tf_static_loop(session: Session, args: Args) {
     let publisher = session
-        .declare_publisher("rt/tf".to_string())
+        .declare_publisher("rt/tf_static".to_string())
         .priority(Priority::Background)
         .congestion_control(CongestionControl::Drop)
         .await
