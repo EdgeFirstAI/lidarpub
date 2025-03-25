@@ -480,8 +480,8 @@ impl FrameReader {
                 }
             }
 
-            if i == self.columns_per_packet - 1 {
-                self.timestamp = column.timestamp();
+            if i == 0 {
+                self.timestamp = timestamp()?;
             }
         }
 
@@ -695,4 +695,26 @@ impl FrameBuilder {
             self.points.z[index] = (r * self.altitude[index] + self.beam_to_lidar[[2, 3]]) * 0.001;
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn timestamp() -> Result<u64, std::io::Error> {
+    let mut tp = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let err = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, &mut tp) };
+    if err != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    Ok(tp.tv_sec as u64 * 1_000_000_000 + tp.tv_nsec as u64)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn timestamp() -> Result<u64, std::io::Error> {
+    // Fallback to a simple monotonic clock for non-Linux platforms
+    let now = std::time::SystemTime::now();
+    let duration = now.duration_since(std::time::UNIX_EPOCH)?;
+    Ok(duration.as_nanos() as u64)
 }

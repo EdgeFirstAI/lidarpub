@@ -42,7 +42,7 @@ env_logger = "0.11.7"
 etherparse = { version = "0.17.0", optional = true }
 kanal = { git = "https://github.com/fereidani/kanal", rev = "b6aeab2" }
 libc = "0.2.171"
-log = "0.4.26"
+log = "0.4.27"
 ndarray = "0.16.1"
 pcap-parser = { version = "0.16.0", optional = true }
 rerun = { version = "0.22.1", optional = true }
@@ -71,4 +71,4 @@ tracy-client = { version = "0.18.0", default-features = false, features = [
     "fibers",
 ] }
 ureq = { version = "3.0.10", features = ["json"] }
-zenoh = "1.2.1"
+zenoh = "1.3.0"
