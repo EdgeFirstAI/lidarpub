@@ -395,6 +395,7 @@ impl DataBlock {
     pub const LEN: usize = 4;
 }
 
+#[derive(Debug, Clone)]
 pub struct Points {
     pub x: Vec<f32>,
     pub y: Vec<f32>,
@@ -501,7 +502,7 @@ pub struct FrameBuilder {
     pixel_shift_by_row: Vec<i16>,
     beam_to_lidar: Array2<f32>,
     altitude_angles: Vec<f32>,
-    range: Vec<f32>,
+    pub range: Vec<f32>,
     range_delta: f32,
     x_range: Array2<f32>,
     y_range: Array2<f32>,
