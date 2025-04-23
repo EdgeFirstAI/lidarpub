@@ -191,19 +191,20 @@ fn get_valid_neighbours(data: &ClusterData, coord: Coord) -> Vec<Coord> {
 fn expand_cluster(data: &mut ClusterData, coord: Coord, id: u32) -> bool {
     let mut queue = vec![];
     let valid = get_valid_neighbours(data, coord);
-    if valid.len() >= data.min_pts {
-        data.set_id(coord, id);
-        for c in valid {
-            // println!("\t\tc={:?}", c);
-            // all the connected points are at least an Edge
-            if data.get_id(c).unwrap() == 0 {
-                data.set_id(c, id);
-                queue.push(c);
-            }
-        }
-    } else {
+    if valid.len() < data.min_pts {
         return false;
     }
+
+    data.set_id(coord, id);
+    for c in valid {
+        // println!("\t\tc={:?}", c);
+        // all the connected points are at least an Edge
+        if data.get_id(c).unwrap() == 0 {
+            data.set_id(c, id);
+            queue.push(c);
+        }
+    }
+
     while let Some(coord) = queue.pop() {
         let valid = get_valid_neighbours(data, coord);
         // println!("2. Current={:?}\tValid={:?}", coord, valid);
