@@ -242,7 +242,7 @@ async fn frame_processor(
     let mut builder = FrameBuilder::new(&params);
 
     let (tx_cluster, rx_cluster) = kanal::bounded(8);
-    let frame_id = args.frame_id.clone();
+    let args_ = args.clone();
     match std::thread::Builder::new()
         .name("cluster".to_string())
         .spawn(move || {
@@ -255,7 +255,7 @@ async fn frame_processor(
                     cluster_publisher,
                     builder.rows,
                     builder.crop.1 - builder.crop.0,
-                    frame_id,
+                    args_,
                 ));
         }) {
         Ok(_) => {}

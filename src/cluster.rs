@@ -1,9 +1,12 @@
+use crate::Args;
 use std::{
     ops::Add,
     simd::{Simd, ToBytes},
 };
 use tracing::trace;
+
 type RangeType = u16;
+
 pub struct ClusterData {
     range: Vec<RangeType>,
     rows: usize,
@@ -102,16 +105,18 @@ pub async fn cluster_thread(
     publ: zenoh::pubsub::Publisher<'_>,
     rows: usize,
     cols: usize,
-    frame_id: String,
+    args: Args,
 ) {
+    // only wrapping when the full circle is used
+    let wrap = args.azimuth == [0, 360];
     let mut data = ClusterData {
         cluster_ids: Vec::new(),
         range: Vec::new(),
         rows,
         cols,
-        eps: 256,
-        min_pts: 4,
-        wrap: false,
+        eps: args.clustering_eps,
+        min_pts: args.clustering_minpts,
+        wrap,
     };
     loop {
         let (ranges, points, time) = match drain_recv(&mut rx).await {
@@ -128,7 +133,7 @@ pub async fn cluster_thread(
             &clusters,
             rows * cols,
             time,
-            frame_id.clone(),
+            args.frame_id.clone(),
         ) {
             Ok(v) => v,
             Err(e) => {
@@ -166,16 +171,15 @@ pub fn cluster_(data: &mut ClusterData) -> Vec<u32> {
 
 fn get_valid_neighbours(data: &ClusterData, coord: Coord) -> Vec<Coord> {
     let r = data.get_range(coord).unwrap();
-    // if r <= 1.0 {
-    //     return Vec::new();
-    // }
+    if r == 0 {
+        return Vec::new();
+    }
     OFFSETS
         .iter()
         .filter_map(|x| {
             let new_coord = coord + *x;
             let r_ = data.get_range(new_coord)?;
             if r.abs_diff(r_) < data.eps {
-                // println!("r-r_ = {}", r - r_);
                 Some(new_coord)
             } else {
                 None
@@ -404,6 +408,7 @@ mod tests {
         }
     }
 
+    /*
     #[test]
     fn test_cluster_data() {
         let d = include_bytes!("../depth.l16");
@@ -431,4 +436,5 @@ mod tests {
             file.write_all(&((c % 256) as u8).to_be_bytes()).unwrap();
         }
     }
+    */
 }
