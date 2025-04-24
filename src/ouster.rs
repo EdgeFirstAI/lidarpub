@@ -714,7 +714,7 @@ fn timestamp() -> Result<u64, Error> {
     };
     let err = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, &mut tp) };
     if err != 0 {
-        return Err(std::io::Error::last_os_error());
+        return Err(std::io::Error::last_os_error().into());
     }
 
     Ok(tp.tv_sec as u64 * 1_000_000_000 + tp.tv_nsec as u64)
