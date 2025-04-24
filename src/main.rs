@@ -242,25 +242,27 @@ async fn frame_processor(
     let mut builder = FrameBuilder::new(&params);
 
     let (tx_cluster, rx_cluster) = kanal::bounded(8);
-    let args_ = args.clone();
-    match std::thread::Builder::new()
-        .name("cluster".to_string())
-        .spawn(move || {
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(cluster_thread(
-                    rx_cluster,
-                    cluster_publisher,
-                    builder.rows,
-                    builder.crop.1 - builder.crop.0,
-                    args_,
-                ));
-        }) {
-        Ok(_) => {}
-        Err(e) => error!("Could not start clustering thread: {:?}", e),
-    };
+    if args.clustering {
+        let args_ = args.clone();
+        match std::thread::Builder::new()
+            .name("cluster".to_string())
+            .spawn(move || {
+                tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(cluster_thread(
+                        rx_cluster,
+                        cluster_publisher,
+                        builder.rows,
+                        builder.crop.1 - builder.crop.0,
+                        args_,
+                    ));
+            }) {
+            Ok(_) => {}
+            Err(e) => error!("Could not start clustering thread: {:?}", e),
+        };
+    }
 
     loop {
         let (timestamp, frame_id, depth, reflect) = rx.recv().unwrap();
@@ -277,11 +279,14 @@ async fn frame_processor(
             );
 
             let timestamp = Time::from_nanos(timestamp);
-            let _ = tx_cluster.send((
-                builder.range[0..builder.n_points].to_vec(),
-                builder.points.clone(),
-                timestamp.clone(),
-            ));
+            if args.clustering {
+                let _ = tx_cluster.send((
+                    builder.range[0..builder.n_points].to_vec(),
+                    builder.points.clone(),
+                    timestamp.clone(),
+                ));
+            }
+
             let publish_points = info_span!("publish_points");
             async {
                 let (msg, enc) = format_points(

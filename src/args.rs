@@ -69,6 +69,10 @@ pub struct Args {
     #[arg(long, env)]
     pub tracy: bool,
 
+    /// Enable lidar clustering task.
+    #[arg(long, env, default_value = "false")]
+    pub clustering: bool,
+
     /// the distancing metric for clustering, in millimeters
     #[arg(long, env, default_value = "256")]
     pub clustering_eps: u16,
