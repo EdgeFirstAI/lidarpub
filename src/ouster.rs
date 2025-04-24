@@ -67,6 +67,7 @@ pub struct Parameters {
 #[derive(Debug)]
 pub enum Error {
     IoError(std::io::Error),
+    SystemTimeError(std::time::SystemTimeError),
     ShapeError(ndarray::ShapeError),
     UnsupportedDataFormat(String),
     UnexpectedEndOfSlice(usize),
@@ -84,6 +85,12 @@ impl From<std::io::Error> for Error {
     }
 }
 
+impl From<std::time::SystemTimeError> for Error {
+    fn from(err: std::time::SystemTimeError) -> Error {
+        Error::SystemTimeError(err)
+    }
+}
+
 impl From<ndarray::ShapeError> for Error {
     fn from(err: ndarray::ShapeError) -> Error {
         Error::ShapeError(err)
@@ -94,6 +101,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> std::fmt::Result {
         match self {
             Error::IoError(err) => write!(f, "io error: {}", err),
+            Error::SystemTimeError(err) => write!(f, "system time error: {}", err),
             Error::ShapeError(err) => write!(f, "shape error: {}", err),
             Error::UnsupportedDataFormat(format) => {
                 write!(f, "unsupported lidar data format: {}", format)
@@ -699,7 +707,7 @@ impl FrameBuilder {
 }
 
 #[cfg(target_os = "linux")]
-fn timestamp() -> Result<u64, std::io::Error> {
+fn timestamp() -> Result<u64, Error> {
     let mut tp = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -713,7 +721,7 @@ fn timestamp() -> Result<u64, std::io::Error> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn timestamp() -> Result<u64, std::io::Error> {
+fn timestamp() -> Result<u64, Error> {
     // Fallback to a simple monotonic clock for non-Linux platforms
     let now = std::time::SystemTime::now();
     let duration = now.duration_since(std::time::UNIX_EPOCH)?;
