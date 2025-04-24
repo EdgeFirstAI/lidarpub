@@ -219,7 +219,7 @@ async fn frame_processor(
         .unwrap();
 
     let cluster_publisher = session
-        .declare_publisher(format!("{}/cluster", args.lidar_topic))
+        .declare_publisher(format!("{}/clusters", args.lidar_topic))
         .priority(Priority::DataHigh)
         .congestion_control(CongestionControl::Drop)
         .await
