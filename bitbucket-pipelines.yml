@@ -35,7 +35,7 @@ definitions:
         name: Code Sonar
         runs-on:
           - 'self.hosted'
-        image: sonarsource/sonar-scanner-cli:11.2
+        image: sonarsource/sonar-scanner-cli:11.3
         script:
           - sonar-scanner
 pipelines:
@@ -65,7 +65,7 @@ pipelines:
                 BITBUCKET_USERNAME: au-zone-ci
                 BITBUCKET_APP_PASSWORD: $BITBUCKET_PASSWORD
                 FILENAME: "maivin-lidarpub-$BITBUCKET_TAG"
-            - pipe: atlassian/aws-s3-deploy:2.0.0
+            - pipe: atlassian/aws-s3-deploy:2.0.1
               variables:
                 AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
                 AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
