@@ -67,6 +67,7 @@ pub struct Parameters {
 #[derive(Debug)]
 pub enum Error {
     IoError(std::io::Error),
+    SystemTimeError(std::time::SystemTimeError),
     ShapeError(ndarray::ShapeError),
     UnsupportedDataFormat(String),
     UnexpectedEndOfSlice(usize),
@@ -84,6 +85,12 @@ impl From<std::io::Error> for Error {
     }
 }
 
+impl From<std::time::SystemTimeError> for Error {
+    fn from(err: std::time::SystemTimeError) -> Error {
+        Error::SystemTimeError(err)
+    }
+}
+
 impl From<ndarray::ShapeError> for Error {
     fn from(err: ndarray::ShapeError) -> Error {
         Error::ShapeError(err)
@@ -94,6 +101,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> std::fmt::Result {
         match self {
             Error::IoError(err) => write!(f, "io error: {}", err),
+            Error::SystemTimeError(err) => write!(f, "system time error: {}", err),
             Error::ShapeError(err) => write!(f, "shape error: {}", err),
             Error::UnsupportedDataFormat(format) => {
                 write!(f, "unsupported lidar data format: {}", format)
@@ -395,6 +403,7 @@ impl DataBlock {
     pub const LEN: usize = 4;
 }
 
+#[derive(Debug, Clone)]
 pub struct Points {
     pub x: Vec<f32>,
     pub y: Vec<f32>,
@@ -501,7 +510,7 @@ pub struct FrameBuilder {
     pixel_shift_by_row: Vec<i16>,
     beam_to_lidar: Array2<f32>,
     altitude_angles: Vec<f32>,
-    range: Vec<f32>,
+    pub range: Vec<f32>,
     range_delta: f32,
     x_range: Array2<f32>,
     y_range: Array2<f32>,
@@ -698,21 +707,21 @@ impl FrameBuilder {
 }
 
 #[cfg(target_os = "linux")]
-fn timestamp() -> Result<u64, std::io::Error> {
+fn timestamp() -> Result<u64, Error> {
     let mut tp = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
     };
     let err = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, &mut tp) };
     if err != 0 {
-        return Err(std::io::Error::last_os_error());
+        return Err(std::io::Error::last_os_error().into());
     }
 
     Ok(tp.tv_sec as u64 * 1_000_000_000 + tp.tv_nsec as u64)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn timestamp() -> Result<u64, std::io::Error> {
+fn timestamp() -> Result<u64, Error> {
     // Fallback to a simple monotonic clock for non-Linux platforms
     let now = std::time::SystemTime::now();
     let duration = now.duration_since(std::time::UNIX_EPOCH)?;

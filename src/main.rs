@@ -1,11 +1,13 @@
 #![feature(portable_simd)]
 
 mod args;
+mod cluster;
 mod common;
 
 use args::Args;
 use cdr::{CdrLe, Infinite};
 use clap::Parser as _;
+use cluster::cluster_thread;
 use edgefirst_schemas::{
     builtin_interfaces::Time,
     geometry_msgs::{Quaternion, Transform, TransformStamped, Vector3},
@@ -216,6 +218,13 @@ async fn frame_processor(
         .await
         .unwrap();
 
+    let cluster_publisher = session
+        .declare_publisher(format!("{}/clusters", args.lidar_topic))
+        .priority(Priority::DataHigh)
+        .congestion_control(CongestionControl::Drop)
+        .await
+        .unwrap();
+
     let depth_publisher = session
         .declare_publisher(format!("{}/depth", args.lidar_topic))
         .priority(Priority::DataHigh)
@@ -232,6 +241,29 @@ async fn frame_processor(
 
     let mut builder = FrameBuilder::new(&params);
 
+    let (tx_cluster, rx_cluster) = kanal::bounded(8);
+    if args.clustering {
+        let args_ = args.clone();
+        match std::thread::Builder::new()
+            .name("cluster".to_string())
+            .spawn(move || {
+                tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(cluster_thread(
+                        rx_cluster,
+                        cluster_publisher,
+                        builder.rows,
+                        builder.crop.1 - builder.crop.0,
+                        args_,
+                    ));
+            }) {
+            Ok(_) => {}
+            Err(e) => error!("Could not start clustering thread: {:?}", e),
+        };
+    }
+
     loop {
         let (timestamp, frame_id, depth, reflect) = rx.recv().unwrap();
 
@@ -247,6 +279,13 @@ async fn frame_processor(
             );
 
             let timestamp = Time::from_nanos(timestamp);
+            if args.clustering {
+                let _ = tx_cluster.send((
+                    builder.range[0..builder.n_points].to_vec(),
+                    builder.points.clone(),
+                    timestamp.clone(),
+                ));
+            }
 
             let publish_points = info_span!("publish_points");
             async {
