@@ -28,13 +28,13 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use tokio::net::UdpSocket;
-use tracing::{debug, error, info, info_span, trace, Instrument};
-use tracing_subscriber::{layer::SubscriberExt as _, Layer as _, Registry};
+use tracing::{Instrument, debug, error, info, info_span, trace};
+use tracing_subscriber::{Layer as _, Registry, layer::SubscriberExt as _};
 use tracy_client::frame_mark;
 use zenoh::{
+    Session,
     bytes::{Encoding, ZBytes},
     qos::{CongestionControl, Priority},
-    Session,
 };
 
 #[cfg(feature = "profiling")]
@@ -287,56 +287,41 @@ async fn frame_processor(
                 ));
             }
 
-            let publish_points = info_span!("publish_points");
-            async {
-                let (msg, enc) = format_points(
-                    &builder.points,
-                    builder.n_points,
-                    timestamp.clone(),
-                    args.frame_id.clone(),
-                )
-                .unwrap();
-                match points_publisher.put(msg).encoding(enc).await {
-                    Ok(_) => {}
-                    Err(e) => error!("publish points error: {:?}", e),
-                }
+            let (msg, enc) = format_points(
+                &builder.points,
+                builder.n_points,
+                timestamp.clone(),
+                args.frame_id.clone(),
+            )
+            .unwrap();
+            match points_publisher.put(msg).encoding(enc).await {
+                Ok(_) => {}
+                Err(e) => error!("publish points error: {:?}", e),
             }
-            .instrument(publish_points)
-            .await;
 
-            let publish_depth = info_span!("publish_depth");
-            async {
-                let (msg, enc) = format_depth(
-                    &builder.depth,
-                    &builder.crop,
-                    timestamp.clone(),
-                    args.frame_id.clone(),
-                )
-                .unwrap();
-                match depth_publisher.put(msg).encoding(enc).await {
-                    Ok(_) => {}
-                    Err(e) => error!("depth publish error: {:?}", e),
-                }
+            let (msg, enc) = format_depth(
+                &builder.depth,
+                &builder.crop,
+                timestamp.clone(),
+                args.frame_id.clone(),
+            )
+            .unwrap();
+            match depth_publisher.put(msg).encoding(enc).await {
+                Ok(_) => {}
+                Err(e) => error!("depth publish error: {:?}", e),
             }
-            .instrument(publish_depth)
-            .await;
 
-            let publish_reflect = info_span!("publish_reflect");
-            async {
-                let (msg, enc) = format_reflect(
-                    &builder.reflect,
-                    &builder.crop,
-                    timestamp,
-                    args.frame_id.clone(),
-                )
-                .unwrap();
-                match reflect_publisher.put(msg).encoding(enc).await {
-                    Ok(_) => {}
-                    Err(e) => error!("reflect publish error: {:?}", e),
-                }
+            let (msg, enc) = format_reflect(
+                &builder.reflect,
+                &builder.crop,
+                timestamp,
+                args.frame_id.clone(),
+            )
+            .unwrap();
+            match reflect_publisher.put(msg).encoding(enc).await {
+                Ok(_) => {}
+                Err(e) => error!("reflect publish error: {:?}", e),
             }
-            .instrument(publish_reflect)
-            .await;
 
             // match tokio::try_join!(points_span, depth_span, reflect_span)
             // {     Ok(_) => trace!("{} message sent",

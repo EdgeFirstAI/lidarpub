@@ -1,4 +1,4 @@
-use clap::{builder::PossibleValuesParser, Parser};
+use clap::{Parser, builder::PossibleValuesParser};
 use serde_json::json;
 use tracing::level_filters::LevelFilter;
 use zenoh::config::{Config, WhatAmI};

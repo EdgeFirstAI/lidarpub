@@ -3,7 +3,7 @@ use std::{
     ops::Add,
     simd::{Simd, ToBytes},
 };
-use tracing::trace;
+use tracing::{info_span, instrument};
 
 type RangeType = u16;
 
@@ -123,10 +123,11 @@ pub async fn cluster_thread(
             Some(v) => v,
             None => return,
         };
-        let start = std::time::Instant::now();
-        data.range = ranges.into_iter().map(|v| v as RangeType).collect();
-        let clusters = cluster_(&mut data);
-        trace!("Clustering takes {:?}", start.elapsed());
+
+        let clusters = info_span!("clustering").in_scope(|| {
+            data.range = ranges.into_iter().map(|v| v as RangeType).collect();
+            cluster_(&mut data)
+        });
 
         let (msg, enc) = match format_points_clustered(
             &points,
@@ -141,6 +142,7 @@ pub async fn cluster_thread(
                 return;
             }
         };
+
         match publ.put(msg).encoding(enc).await {
             Ok(_) => {}
             Err(e) => error!("cluster publish error: {:?}", e),
@@ -224,6 +226,7 @@ fn expand_cluster(data: &mut ClusterData, coord: Coord, id: u32) -> bool {
     true
 }
 
+#[instrument(skip_all)]
 fn format_points_clustered(
     points: &Points,
     cluster_ids: &[u32],
@@ -350,7 +353,7 @@ mod tests {
 
     use crate::cluster::RangeType;
 
-    use super::{cluster_, ClusterData};
+    use super::{ClusterData, cluster_};
 
     #[test]
     fn test_cluster() {

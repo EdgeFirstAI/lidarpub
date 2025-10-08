@@ -1,8 +1,8 @@
 mod common;
 
-use clap::{builder::PossibleValuesParser, Parser};
+use clap::{Parser, builder::PossibleValuesParser};
 use common::TimestampMode;
-use kanal::Receiver;
+use kanal::{Receiver, Sender};
 use lidarpub::ouster::{
     BeamIntrinsics, Config, FrameBuilder, FrameReader, LidarDataFormat, Parameters, Points,
     SensorInfo,
@@ -10,12 +10,11 @@ use lidarpub::ouster::{
 use log::error;
 use ndarray::Array2;
 use pcap_parser::{traits::PcapReaderIterator, *};
-use rerun::{external::re_sdk_comms::DEFAULT_SERVER_PORT, RecordingStream};
+use rerun::RecordingStream;
 use std::{
-    error::Error,
     fs::File,
     io::{BufReader, IsTerminal as _, Write as _},
-    net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket},
+    net::{TcpStream, UdpSocket},
     path::Path,
     thread::sleep,
     time::Duration,
@@ -24,21 +23,9 @@ use std::{
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// connect to remote rerun viewer at this address
-    #[arg(short, long)]
-    connect: Option<Ipv4Addr>,
-
-    /// record rerun data to file instead of live viewer
-    #[arg(short, long)]
-    record: Option<String>,
-
-    /// launch local rerun viewer
-    #[arg(short, long)]
-    viewer: bool,
-
-    /// use this port for the rerun viewer (remote or web server)
-    #[arg(short, long)]
-    port: Option<u16>,
+    /// Rerun parameters
+    #[command(flatten)]
+    pub rerun: rerun::clap::RerunArgs,
 
     /// Connect to target device or pcap file.  If target is a valid pcap file,
     /// it will be used otherwise it will be tried as a hostname or IP address.
@@ -66,25 +53,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
     let args = Args::parse();
 
-    let rr = if let Some(addr) = args.connect {
-        let port = args.port.unwrap_or(DEFAULT_SERVER_PORT);
-        let remote = SocketAddr::new(addr.into(), port);
-        Some(
-            rerun::RecordingStreamBuilder::new("radarview")
-                .connect_tcp_opts(remote, rerun::default_flush_timeout())?,
-        )
-    } else if let Some(record) = &args.record {
-        Some(rerun::RecordingStreamBuilder::new("radarview").save(record)?)
-    } else if args.viewer {
-        Some(rerun::RecordingStreamBuilder::new("radarview").spawn()?)
-    } else {
-        None
-    };
+    // Create Rerun logger using the provided parameters
+    let (rr, _serve_guard) = args.rerun.init("lidar")?;
 
     if Path::new(&args.target).exists() {
-        pcap_loop(&rr, &args.target)?;
+        pcap_loop(&Some(rr), &args.target)?;
     } else {
-        live_loop(&rr, &args)?;
+        live_loop(&Some(rr), &args)?;
     }
 
     Ok(())
@@ -104,7 +79,7 @@ fn frame_handler(
         let z = &points.z[..n_points];
         let l = &points.l[..n_points];
 
-        rr.log("n_points", &rerun::Scalar::new(n_points as f64))
+        rr.log("n_points", &rerun::Scalars::new([n_points as f64]))
             .unwrap();
         let points: Vec<_> = x
             .iter()
@@ -157,7 +132,7 @@ async fn frame_processor(
         frame_builder.update(&depth, &reflect);
 
         if let Some(rr) = &rr {
-            rr.set_time_seconds("stable_time", timestamp as f64 / 1e9);
+            rr.set_time_secs("stable_time", timestamp as f64 / 1e9);
             rr.log(
                 "frame",
                 &rerun::TextLog::new(format!(
@@ -169,7 +144,7 @@ async fn frame_processor(
         }
 
         frame_handler(
-            &rr,
+            rr,
             frame_builder.n_points,
             &frame_builder.points,
             &frame_builder.depth,
@@ -187,7 +162,6 @@ fn pcap_loop(
     let json = File::open(json_path)?;
     let params: Parameters = serde_json::from_reader(json)?;
     let mut frame_reader = FrameReader::new(&params.lidar_data_format)?;
-    let mut frame_builder = FrameBuilder::new(&params);
 
     let pcap_path = Path::new(path).with_extension("pcap");
     let pcap = File::open(pcap_path)?;
@@ -210,44 +184,57 @@ fn pcap_loop(
     loop {
         match pcap_reader.next() {
             Ok((offset, block)) => {
-                match block {
-                    PcapBlockOwned::LegacyHeader(_) => (),
-                    PcapBlockOwned::Legacy(block) => {
-                        match etherparse::SlicedPacket::from_ethernet(block.data) {
-                            Err(err) => error!("Err {:?}", err),
-                            Ok(pkt) => {
-                                if let Some(etherparse::TransportSlice::Udp(udp)) = pkt.transport {
-                                    if udp.destination_port() != 7502 {
-                                        pcap_reader.consume(offset);
-                                        continue;
-                                    }
-
-                                    frame_reader.update(
-                                        udp.payload(),
-                                        |timestamp, frame_id, depth, reflect| match tx
-                                            .send((timestamp, frame_id, depth, reflect))
-                                        {
-                                            Ok(_) => {}
-                                            Err(e) => error!("frame send error: {:?}", e),
-                                        },
-                                    )?;
-                                }
-                            }
-                        }
-                    }
-                    PcapBlockOwned::NG(_) => unreachable!(),
-                }
+                let should_continue = process_block(block, &mut frame_reader, &tx)?;
                 pcap_reader.consume(offset);
+                if should_continue {
+                    continue;
+                }
             }
-            Err(PcapError::Eof) => break,
-            Err(PcapError::Incomplete(_)) => {
-                pcap_reader.refill().unwrap();
+            Err(_e) => {
+                // Handle error
+                break;
             }
-            Err(e) => panic!("error while reading: {:?}", e),
         }
     }
 
     Ok(())
+}
+
+fn process_block(
+    block: PcapBlockOwned,
+    frame_reader: &mut FrameReader,
+    tx: &Sender<(u64, u16, Array2<u16>, Array2<u8>)>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    match block {
+        PcapBlockOwned::LegacyHeader(_) => Ok(false),
+        PcapBlockOwned::NG(_) => Ok(false),
+        PcapBlockOwned::Legacy(block) => {
+            match etherparse::SlicedPacket::from_ethernet(block.data) {
+                Err(err) => {
+                    error!("Err {:?}", err);
+                    Ok(false)
+                }
+                Ok(pkt) => {
+                    if let Some(etherparse::TransportSlice::Udp(udp)) = pkt.transport {
+                        if udp.destination_port() != 7502 {
+                            return Ok(true); // Continue to next packet
+                        }
+
+                        frame_reader.update(
+                            udp.payload(),
+                            |timestamp, frame_id, depth, reflect| match tx
+                                .send((timestamp, frame_id, depth, reflect))
+                            {
+                                Ok(_) => {}
+                                Err(e) => error!("frame send error: {:?}", e),
+                            },
+                        )?;
+                    }
+                    Ok(false)
+                }
+            }
+        }
+    }
 }
 
 fn live_loop(rr: &Option<RecordingStream>, args: &Args) -> Result<(), Box<dyn std::error::Error>> {
@@ -326,7 +313,6 @@ fn live_loop(rr: &Option<RecordingStream>, args: &Args) -> Result<(), Box<dyn st
 
     println!("{:?}", params);
     let mut frame_reader = FrameReader::new(&params.lidar_data_format)?;
-    let mut frame_builder = FrameBuilder::new(&params);
 
     // On Linux [::] will bind to IPv4 and IPv6 but not on Windows so we bind
     // according to the local address IP version.
