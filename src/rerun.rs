@@ -93,29 +93,37 @@ fn frame_handler(
         );
         rr.log("points", &points).unwrap();
 
+        let reflect_slice = reflect.slice(ndarray::s![.., crop.0..crop.1]);
+        let reflect_shape = reflect_slice.shape();
+        let reflect_data: Vec<u8> = if reflect_slice.is_standard_layout() {
+            reflect_slice.iter().copied().collect()
+        } else {
+            reflect_slice.as_standard_layout().iter().copied().collect()
+        };
         rr.log(
             "reflect",
-            &rerun::Image::from_color_model_and_tensor(
-                rerun::ColorModel::L,
-                reflect
-                    .slice(ndarray::s![.., crop.0..crop.1])
-                    .as_standard_layout()
-                    .to_owned(),
-            )
-            .unwrap(),
+            &rerun::Image::from_elements(
+                &reflect_data,
+                [reflect_shape[1] as u32, reflect_shape[0] as u32],
+                rerun::datatypes::ColorModel::L,
+            ),
         )
         .unwrap();
 
+        let depth_slice = depth.slice(ndarray::s![.., crop.0..crop.1]);
+        let depth_shape = depth_slice.shape();
+        let depth_data: Vec<u16> = if depth_slice.is_standard_layout() {
+            depth_slice.iter().copied().collect()
+        } else {
+            depth_slice.as_standard_layout().iter().copied().collect()
+        };
         rr.log(
             "depth",
-            &rerun::Image::from_color_model_and_tensor(
-                rerun::ColorModel::L,
-                depth
-                    .slice(ndarray::s![.., crop.0..crop.1])
-                    .as_standard_layout()
-                    .to_owned(),
-            )
-            .unwrap(),
+            &rerun::Image::from_elements(
+                &depth_data,
+                [depth_shape[1] as u32, depth_shape[0] as u32],
+                rerun::datatypes::ColorModel::L,
+            ),
         )
         .unwrap();
     }
@@ -132,7 +140,7 @@ async fn frame_processor(
         frame_builder.update(&depth, &reflect);
 
         if let Some(rr) = &rr {
-            rr.set_time_secs("stable_time", timestamp as f64 / 1e9);
+            rr.set_timestamp_secs_since_epoch("stable_time", timestamp as f64 / 1e9);
             rr.log(
                 "frame",
                 &rerun::TextLog::new(format!(

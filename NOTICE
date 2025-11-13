@@ -1,0 +1,29 @@
+# NOTICE
+
+EdgeFirst LiDAR Publisher  
+Copyright 2025 Au-Zone Technologies
+
+This product includes software developed at Au-Zone Technologies (https://au-zone.com/).
+
+## Third-Party Software
+
+This project makes use of numerous open source libraries from the Rust ecosystem (see `Cargo.toml`).
+
+Representative dependencies may include (non-exhaustive):
+- `anyhow` (error handling)
+- `tokio` (async runtime)
+- `zenoh` (messaging)
+- `rerun` (visualization) when enabled
+- `flatbuffers` (binary serialization)
+
+Complete attribution and license information for third-party components is provided via their respective crates on crates.io and source repositories.
+
+If a `THIRD_PARTY.md` file is added in future releases it will contain a comprehensive, version-pinned attribution list.
+
+## Trademarks
+
+Ouster® is a registered trademark of Ouster, Inc. ROS2® is a registered trademark of Open Source Robotics Foundation. Maivin™ is a trademark of Au-Zone Technologies.
+
+## License
+
+This project is licensed under the Apache License 2.0. See `LICENSE` for details.
