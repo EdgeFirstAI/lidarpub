@@ -102,7 +102,7 @@ jobs:
       - name: Set up Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: stable
+          toolchain: nightly
 
       - name: Check for outdated dependencies
         run: |
@@ -112,4 +112,5 @@ jobs:
       - name: Check licenses
         run: |
           cargo install cargo-license
-          cargo license --json | grep -i "GPL" && exit 1 || true
+          # Check for GPL-only licenses (not OR combinations with Apache/MIT)
+          cargo license --json | jq -r '.[] | select(.license | (contains("GPL") and (contains(" OR ") | not))) | .license' | grep -q GPL && echo "Found GPL-only license!" && exit 1 || true
