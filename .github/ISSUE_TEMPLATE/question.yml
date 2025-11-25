@@ -1,0 +1,62 @@
+name: Question
+description: Ask a question about using the EdgeFirst LiDAR Publisher
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Have a question about using the LiDAR Publisher? We're here to help!
+        
+        **Before asking:**
+        - Check the [README](https://github.com/EdgeFirstAI/lidarpub/blob/main/README.md)
+        - Check the [Documentation](https://doc.edgefirst.ai/perception/lidar)
+        - Search [existing issues](https://github.com/EdgeFirstAI/lidarpub/issues) and [discussions](https://github.com/EdgeFirstAI/lidarpub/discussions)
+
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+      description: What would you like to know?
+      placeholder: Ask your question here...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: category
+    attributes:
+      label: Category
+      description: What is your question about?
+      options:
+        - Installation/Setup
+        - Sensor Configuration
+        - Point Cloud Processing
+        - Zenoh/ROS2 Integration
+        - Performance Tuning
+        - Hardware Compatibility
+        - Troubleshooting
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Provide context to help us answer your question (platform, sensor, configuration, etc.)
+      placeholder: |
+        Platform: Maivin / x86_64 / etc.
+        Sensor: Ouster OS1-64
+        What you're trying to accomplish...
+    validations:
+      required: false
+
+  - type: textarea
+    id: attempted
+    attributes:
+      label: What Have You Tried?
+      description: What have you already attempted?
+      placeholder: |
+        I tried...
+        I looked at...
+    validations:
+      required: false

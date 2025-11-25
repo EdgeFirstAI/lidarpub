@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: GitHub Discussions
+    url: https://github.com/EdgeFirstAI/lidarpub/discussions
+    about: Ask questions and discuss ideas with the community
+  - name: Documentation
+    url: https://doc.edgefirst.ai/perception/lidar
+    about: Read the complete documentation
+  - name: Commercial Support
+    url: mailto:support@au-zone.com
+    about: Contact Au-Zone for commercial support and services

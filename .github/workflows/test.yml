@@ -1,0 +1,115 @@
+# GitHub Actions workflow for testing and code quality
+#
+# This workflow runs tests, collects coverage data, and performs static analysis
+# for the EdgeFirst LiDAR Publisher Rust project.
+#
+# Code coverage is reported to SonarCloud (see sonar-project.properties).
+#
+# Action Versions (verified November 2025):
+# - actions/checkout@v4 (latest)
+# - actions-rust-lang/setup-rust-toolchain@v1 (latest)
+# - taiki-e/install-action@v2 (latest for cargo-llvm-cov)
+# - SonarSource/sonarcloud-github-action@v3 (latest)
+
+name: Test
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_call:  # Allow other workflows to call this
+
+jobs:
+  test:
+    name: Test and Coverage (${{ matrix.platform.name }})
+    runs-on: ${{ matrix.platform.runner }}
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
+    strategy:
+      matrix:
+        platform:
+          - name: x86_64
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          # ARM64 testing requires self-hosted runner or cross-compilation
+          # - name: aarch64
+          #   runner: ubuntu-22.04-arm
+          #   target: aarch64-unknown-linux-gnu
+      fail-fast: false
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for better analysis
+
+      - name: Set up Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+          target: ${{ matrix.platform.target }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Build
+        run: cargo build --target ${{ matrix.platform.target }} --verbose
+
+      - name: Run tests
+        run: cargo test --workspace --verbose
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Generate coverage for SonarCloud
+        run: cargo llvm-cov --lcov --output-path lcov.info --workspace
+
+      - name: Run SonarCloud analysis
+        uses: SonarSource/sonarcloud-github-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.coverageReportPaths=lcov.info
+
+      - name: Security audit
+        run: |
+          cargo install cargo-audit
+          cargo audit
+
+  lint:
+    name: Additional Linting
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Check for outdated dependencies
+        run: |
+          cargo install cargo-outdated
+          cargo outdated --exit-code 1 --depth 1 || true
+
+      - name: Check licenses
+        run: |
+          cargo install cargo-license
+          cargo license --json | grep -i "GPL" && exit 1 || true

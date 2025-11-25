@@ -1,0 +1,126 @@
+name: Bug Report
+description: Report a bug in the EdgeFirst LiDAR Publisher
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug! Please fill out the information below to help us diagnose and fix the issue.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug Description
+      description: A clear and concise description of what the bug is.
+      placeholder: Describe the bug...
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to Reproduce
+      description: Detailed steps to reproduce the behavior
+      value: |
+        1. Run command '...'
+        2. Configure sensor with '...'
+        3. Observe error '...'
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What did you expect to happen?
+      placeholder: Describe expected behavior...
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behavior
+      description: What actually happened?
+      placeholder: Describe actual behavior...
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: What version of lidarpub are you using?
+      placeholder: "e.g., v1.3.1 or commit hash"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      description: What platform are you running on?
+      options:
+        - x86_64 Linux (Ubuntu/Debian)
+        - x86_64 Linux (Other distro)
+        - ARM64 Linux (Maivin)
+        - ARM64 Linux (Raivin)
+        - ARM64 Linux (NXP i.MX8)
+        - ARM64 Linux (Jetson)
+        - ARM64 Linux (Raspberry Pi)
+        - ARM64 Linux (Other)
+        - Other (specify in additional context)
+    validations:
+      required: true
+
+  - type: input
+    id: sensor
+    attributes:
+      label: LiDAR Sensor
+      description: What LiDAR sensor model are you using?
+      placeholder: "e.g., Ouster OS1-64 firmware 2.5.3"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant Logs
+      description: |
+        Please provide relevant log output. Run with `RUST_LOG=debug` for detailed logs.
+        Tip: You can attach log files by clicking this area to upload them.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Configuration
+      description: Command-line arguments or environment variables used
+      placeholder: |
+        lidarpub --target 192.168.1.100 --lidar-mode 1024x10 --cluster
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional Context
+      description: Any other context about the problem (network setup, Zenoh configuration, etc.)
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      description: Please confirm the following
+      options:
+        - label: I have searched existing issues to avoid duplicates
+          required: true
+        - label: I am using a supported LiDAR sensor (see README.md)
+          required: false
+        - label: I have tested with the latest version
+          required: false

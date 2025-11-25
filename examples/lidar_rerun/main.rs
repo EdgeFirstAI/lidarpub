@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2025 Au-Zone Technologies. All Rights Reserved.
+
 mod common;
 
 use clap::{Parser, builder::PossibleValuesParser};
@@ -189,19 +192,11 @@ fn pcap_loop(
                 .block_on(frame_processor(&rr, params, rx));
         })?;
 
-    loop {
-        match pcap_reader.next() {
-            Ok((offset, block)) => {
-                let should_continue = process_block(block, &mut frame_reader, &tx)?;
-                pcap_reader.consume(offset);
-                if should_continue {
-                    continue;
-                }
-            }
-            Err(_e) => {
-                // Handle error
-                break;
-            }
+    while let Ok((offset, block)) = pcap_reader.next() {
+        let should_continue = process_block(block, &mut frame_reader, &tx)?;
+        pcap_reader.consume(offset);
+        if !should_continue {
+            break;
         }
     }
 

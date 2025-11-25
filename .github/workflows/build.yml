@@ -1,0 +1,128 @@
+# GitHub Actions workflow for building release artifacts and documentation
+#
+# This workflow builds release binaries for x86_64 and aarch64, generates
+# API documentation, and uploads artifacts.
+#
+# Action Versions (verified November 2025):
+# - actions/checkout@v4 (latest)
+# - actions-rust-lang/setup-rust-toolchain@v1 (latest)
+# - actions/upload-artifact@v4 (latest)
+# - peaceiris/actions-gh-pages@v4 (latest)
+
+name: Build
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_call:
+    outputs:
+      version:
+        description: "Project version"
+        value: ${{ jobs.build.outputs.version }}
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+      fail-fast: false
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building version: $VERSION"
+
+      - name: Set up Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          cargo install cross
+
+      - name: Build release binary (x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build release binary (aarch64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/lidarpub \
+             dist/edgefirst-lidarpub-${{ steps.version.outputs.version }}-${{ matrix.target }}
+          chmod +x dist/edgefirst-lidarpub-*
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lidarpub-${{ matrix.target }}
+          path: dist/edgefirst-lidarpub-*
+          retention-days: 30
+
+  documentation:
+    name: Generate Documentation
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Generate API documentation
+        run: cargo doc --no-deps --document-private-items --workspace
+
+      - name: Add index redirect
+        run: |
+          cat > target/doc/index.html <<EOF
+          <!DOCTYPE html>
+          <html>
+          <head>
+            <meta http-equiv="refresh" content="0; url=lidarpub/index.html">
+          </head>
+          <body>
+            <p>Redirecting to <a href="lidarpub/index.html">lidarpub documentation</a>...</p>
+          </body>
+          </html>
+          EOF
+
+      - name: Upload documentation artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: documentation
+          path: target/doc/
+          retention-days: 30
+
+      - name: Deploy to GitHub Pages (main branch only)
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./target/doc
+          force_orphan: true

@@ -1,678 +1,785 @@
 # AGENTS.md - AI Assistant Development Guidelines
 
-This document provides instructions for AI coding assistants (GitHub Copilot, Cursor, Claude Code, etc.) working on the EdgeFirst LiDAR Publisher project. These guidelines ensure consistent code quality, proper workflow adherence, and maintainable contributions.
+**Purpose:** Project-specific instructions for AI coding assistants (GitHub Copilot, Claude, Cursor, etc.)
 
-**Version:** 1.0  
-**Last Updated:** November 2025  
-**Project:** EdgeFirst LiDAR Publisher  
-**Organization:** Au-Zone Technologies
+**Organization Standards:** See [Au-Zone SPS 05-copilot-instructions.md](https://github.com/au-zone/sps/blob/main/05-copilot-instructions.md) for universal rules
 
----
-
-## Table of Contents
-
-1. [Project Overview](#project-overview)
-2. [Git Workflow](#git-workflow)
-3. [Code Quality Standards](#code-quality-standards)
-4. [Testing Requirements](#testing-requirements)
-5. [Documentation Expectations](#documentation-expectations)
-6. [License Policy](#license-policy)
-7. [Security Practices](#security-practices)
-8. [Performance & Edge Considerations](#performance--edge-considerations)
+**Version:** 2.0
+**Last Updated:** 2025-11-22
+**Project:** EdgeFirst LiDAR Publisher
 
 ---
 
-## Project Overview
+## Overview
 
-A high-performance Rust application that ingests Ouster LiDAR UDP packets, constructs point cloud frames, applies optional clustering, and publishes data over Zenoh (and optionally ROS2-compatible formats) with visualization via Rerun.
+This file provides **project-specific** guidelines for the EdgeFirst LiDAR Publisher. ALL contributors must also follow:
 
-**Part of EdgeFirst Perception Middleware**: This is one component of Au-Zone Technologies' EdgeFirst Perception stack — a modular collection of highly-optimized Rust services that deliver the building blocks for spatial perception systems on edge hardware. The middleware provides ROS2-compatible messaging over Zenoh for cameras, LiDAR, radar, IMU, GPS, and AI inference services.
+- **Organization-wide:** Au-Zone SPS 05-copilot-instructions.md - License policy, security, Git/JIRA
+- **Process docs:** Au-Zone Software Process Specification (SPS) repository
+- **This file:** LiDAR Publisher conventions, module structure, naming patterns, domain specifics
 
-**Technology Stack:**
-- **Language**: Rust 2024 edition (see `rust-toolchain.toml`)
-- **Build System**: Cargo with workspace configuration
-- **Key Dependencies**: tokio (async), zenoh (messaging), cdr (ROS2 serialization), rerun (visualization)
-- **Serialization**: CDR (Common Data Representation) for ROS2 compatibility
-- **Message Schemas**: ROS2 common_interfaces (sensor_msgs, geometry_msgs)
-- **Target Platforms**: Edge AI modules (Maivin, Raivin), x86_64, ARM64
-- **Cross-Platform**: Linux primary; macOS/Windows for development
+**Hierarchy:** Org standards (mandatory) → SPS processes (required) → This file (project-specific)
 
-**Sensor Support:**
-- **Current**: Ouster LiDAR sensors (tested with OS1-64 RevD, firmware 2.5.3)
-- **Packet Format**: RNG15_RFL8_NIR8 (15-bit range, 8-bit reflectivity, 8-bit NIR)
-- **Future**: Additional packet formats, newer firmware, Velodyne, Livox, and other vendors
-- **References**:
-  - [Ouster HTTP API v1](https://static.ouster.dev/sensor-docs/image_route1/image_route2/common_sections/API/http-api-v1.html)
-  - [Ouster Sensor Data](https://static.ouster.dev/sensor-docs/image_route1/image_route2/sensor_data/sensor-data.html)
-  - [Lidar Packet Format](https://static.ouster.dev/sensor-docs/image_route1/image_route2/sensor_data/sensor-data.html#lidar-data-packet-format)
-
-**Architecture:**
-- **Pattern**: Event-driven pipeline with async processing
-- **Data Flow**: UDP Receiver → Frame Builder → Point Cloud Processor → Zenoh Publisher
-- **Serialization**: CDR (Common Data Representation) for ROS2-compatible messages
-- **Message Format**: Publishes `sensor_msgs/msg/PointCloud2`, `sensor_msgs/msg/Image`, `geometry_msgs/msg/TransformStamped`
-- **Transport**: Zenoh pub/sub with configurable QoS (priority, congestion control)
-- **Components**:
-  - `ouster.rs` – Sensor data handling & UDP packet parsing
-  - `cluster.rs` – Point cloud clustering algorithms
-  - `args.rs` – CLI argument parsing
-  - `rerun.rs` – Optional visualization integration
-  - `main.rs` / `lib.rs` – Entrypoint and core orchestration logic
-
-**Performance Context:**
-- Real-time LiDAR processing at 10-20Hz frame rates
-- Low-latency requirements (<10ms processing per frame)
-- Edge deployment on resource-constrained platforms
-- Maivin/Raivin module integration for NPU/GPU acceleration
-
-**Related Middleware Services:**
-
-The EdgeFirst Perception Middleware is a modular software stack where services communicate over Zenoh using ROS2 CDR message encoding. Other services in the stack include:
-
-- **Camera Service** - ISP integration, H.265 encoding for streaming/recording
-- **Radar Publisher** - Radar sensor integration and processing  
-- **Vision Model Service** - AI inference for object detection and segmentation
-- **Fusion Model Service** - Multi-sensor fusion for 3D perception
-- **IMU Publisher** - Inertial measurement unit data
-- **GPS/NavSat Publisher** - GNSS positioning data
-- **Recorder Service** - MCAP recording for data capture and replay
-- **Studio Client** - EdgeFirst Studio integration and telemetry
-
-Contributors should understand how this LiDAR publisher fits into the broader perception ecosystem and consider compatibility with other services when making architectural decisions.
-
-**Learn More:** [EdgeFirst Perception Documentation](https://doc.edgefirst.ai/test/perception/)
+**EdgeFirst LiDAR Publisher** is a high-performance Rust-based point cloud publisher connecting Ouster LiDAR sensors to the Zenoh messaging framework with ROS2-compatible serialization. Part of the EdgeFirst Perception Middleware — a collection of highly-optimized services for spatial perception systems on edge hardware (Maivin, Raivin platforms).
 
 ---
 
-## Git Workflow
+**Branch:** `<type>/EDGEAI-###[-desc]` (feature/bugfix/hotfix, JIRA key required)
+**Commit:** `EDGEAI-###: Brief description` (50-72 chars, what done not how)
+**PR:** main=2 approvals, develop=1. Link JIRA, squash features, merge commits for releases.
 
-### Branch Naming Convention
-
-**REQUIRED FORMAT**: `<type>/<PROJECTKEY-###>[-optional-description]`
-
-**Branch Types:**
-- `feature/` - New features and enhancements
-- `bugfix/` - Non-critical bug fixes
-- `hotfix/` - Critical production issues requiring immediate fix
-
-**Examples:**
+**Example:**
 ```bash
-feature/LIDAR-123-add-velodyne-support
-bugfix/LIDAR-456-fix-clustering-crash
-hotfix/LIDAR-789-packet-parsing-overflow
+# Good branch names
+feature/EDGEAI-854-add-velodyne-support
+bugfix/EDGEAI-857-fix-packet-loss
+
+# Good commits
+EDGEAI-854: Add Velodyne VLP-16 packet parser
+EDGEAI-857: Fix UDP packet reassembly race condition
 ```
 
-**Rules:**
-- JIRA key is REQUIRED (format: `PROJECTKEY-###`)
-- Description is OPTIONAL but recommended for clarity
-- Use kebab-case for descriptions (lowercase with hyphens)
-- Branch from `develop` for features/bugfixes, from `main` for hotfixes
+**External Contributors:** Use `feature/issue-###-description` format referencing GitHub issues.
 
-**Note**: External contributors without JIRA access can use GitHub issue references: `feature/issue-123-description`
+---
 
-### Commit Message Format
+## ⚠️ CRITICAL RULES
 
-**REQUIRED FORMAT**: `PROJECTKEY-###: Brief description of what was done`
+### #1: NEVER Use cd Commands
 
-**Rules:**
-- Subject line: 50-72 characters ideal
-- Focus on WHAT changed, not HOW (implementation details belong in code)
-- No type prefixes (`feat:`, `fix:`, etc.) - JIRA provides context
-- Optional body: Use bullet points for additional detail
+Modern build tools work from project root. Changing directories causes AI assistants to lose context and creates non-reproducible workflows.
 
-**Examples of Good Commits:**
 ```bash
-LIDAR-123: Add Velodyne VLP-16 sensor support
+# ✅ CORRECT: Modern Rust workflow (stay in project root)
+cargo build --release
+cargo test --workspace
+cargo clippy -- -D warnings
+cargo doc --no-deps --open
 
-LIDAR-456: Fix clustering crash on empty point clouds
+# ✅ CORRECT: Cross-compilation from root
+cross build --target aarch64-unknown-linux-gnu
 
-LIDAR-789: Optimize SIMD point transformations
-- Implemented vectorized distance calculations
-- Reduced frame processing latency by 30%
-- Added benchmarks to verify improvements
+# ❌ WRONG: Changing directories
+cd target && ./debug/lidarpub  # AI loses context!
+cd src && cargo build          # Breaks workspace structure!
 ```
 
-**Conventional Commits Alternative:**
+**Rationale:**
+- AI assistants lose working directory context after `cd`
+- Cargo works perfectly from project root
+- Commands become non-reproducible
+- Recovery from subdirectories is error-prone
 
-For external contributors or pre-JIRA work, use conventional commits:
+**Rare Exception - Subshell Pattern:**
 ```bash
-feat: add Velodyne VLP-16 support
-fix: resolve clustering crash on empty frames
-perf: optimize SIMD transformations
-docs: improve installation instructions
-test: add integration tests for Zenoh publisher
+# If you MUST run a legacy tool requiring specific directory
+(cd subdir && legacy-tool)
+# Subshell exits automatically, returns to original directory
 ```
 
-Types: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `chore`
+**Project-Specific:** NEVER use `cd` in this project. Cargo handles all paths correctly from root.
+
+---
+
+### #2: ALWAYS Use Python venv (If Applicable)
+
+**Note:** This project is pure Rust and doesn't use Python. This rule applies if you add Python tooling (e.g., code generation, analysis scripts).
+
+```bash
+# ✅ If adding Python scripts, create venv first
+python3 -m venv venv
+venv/bin/pip install -r requirements-dev.txt
+
+# ✅ Direct invocation (no activation needed)
+venv/bin/python scripts/generate_bindings.py
+venv/bin/pytest tests/
+
+# ❌ WRONG: System Python pollution
+python scripts/generate_bindings.py  # Which Python?
+pip install package                  # Pollutes system!
+```
+
+**requirements.txt - Semver ranges:**
+```txt
+# ✅ Allow patches/minors, block breaking changes
+pytest>=7.4.0,<8.0.0
+mypy>=1.5.0,<2.0.0
+
+# ❌ Exact pins block security patches
+pytest==7.4.3
+```
+
+**Current Status:** No Python dependencies. Add venv if introducing Python tooling.
+
+---
+
+### #3: env.sh for Integration Tests (Optional)
+
+Integration tests MAY require external configuration (sensor IP addresses, Zenoh endpoints). Manage through optional `env.sh`.
+
+```bash
+# env.sh - LOCAL ONLY (.gitignore, NEVER commit!)
+export OUSTER_IP="192.168.1.100"         # Test LiDAR sensor
+export ZENOH_ENDPOINT="tcp/127.0.0.1:7447"  # Local Zenoh router
+export TEST_TIMEOUT="30"                 # Test timeout seconds
+```
+
+**Usage in tests:**
+```bash
+# Source env.sh if present (tests skip if missing)
+[[ -f env.sh ]] && source env.sh
+
+# Run integration tests with sensor communication
+cargo test --test integration -- --nocapture
+```
+
+**Security:**
+- ✅ Ephemeral config, no secrets
+- ✅ MUST be in `.gitignore` (already added)
+- ❌ NEVER commit sensor IPs or network config
+- ❌ NO passwords or API keys (use test sensors only)
+
+**Tests without env.sh:**
+- Unit tests: Always run (no external dependencies)
+- Integration tests: Skip tests requiring sensor if env vars missing
+- CI/CD: Uses GitHub Secrets for sensor configuration
+
+**Current Status:** Not yet implemented. Add if integration tests need sensor configuration.
 
 ---
 
 ## Code Quality Standards
 
-### Rust-Specific Best Practices
+### Edge-First Development
 
-### Rust-Specific Best Practices
+This project targets **resource-constrained edge platforms**:
 
-- **Code Style**: Rust 2024 edition; follow `cargo fmt` defaults
-- **Error Handling**: Define custom error enums with `From` implementations for underlying library errors; avoid `unwrap()` in non-test code
-- **Logging**: Use `tracing` crate for structured logging and diagnostics
-- **Performance**: Minimize allocations in hot loops (packet processing & clustering)
-- **Zero-Copy**: Use iterator adaptors & slices for zero-copy where possible
-- **Ownership**: Minimize clones, use references where possible
-- **Async**: Use Tokio runtime properly, avoid blocking in async contexts
-- **Safety**: Minimize `unsafe` code, document why it's needed
+- **Memory:** Typical 512MB-2GB RAM, minimize allocations
+- **CPU:** ARM Cortex-A series, optimize hot paths with SIMD
+- **Latency:** <10ms frame processing target
+- **Lifespan:** 5-10 year deployment lifecycle
 
-### Code Review Checklist
+**Platform Targets:**
+- **Maivin** - Vision module (NXP i.MX 8M Plus)
+- **Raivin** - Vision + radar module (NXP i.MX 8M Plus, SmartMicro DRVEGRD-169 radar)
+- **Generic ARM64** - Jetson, Raspberry Pi, embedded Linux
 
-Before submitting code, verify:
-- [ ] Code follows Rust conventions (`cargo fmt` and `cargo clippy` pass)
-- [ ] No `unwrap()` or `expect()` in library code (tests are OK)
-- [ ] Complex logic has explanatory comments
-- [ ] Public APIs have rustdoc documentation
-- [ ] No hardcoded values that should be CLI arguments or configuration
-- [ ] Resource cleanup (memory, network sockets) is proper
-- [ ] No obvious panics or integer overflow risks
-- [ ] Performance-critical paths are optimized (profile if unsure)
+### Rust Standards
 
-### SonarQube Integration
+**Toolchain:**
+- Rust edition: 2024 (see `rust-toolchain.toml`)
+- Minimum supported: Latest stable -2 versions
+- Features: `portable_simd` (nightly for SIMD acceleration)
 
-This project uses SonarQube for code quality. Before submitting:
-- Check `sonar-project.properties` for quality gate thresholds
-- Use VSCode SonarLint plugin for real-time feedback
-- Address critical and high-severity issues
-- Maintain or improve project quality scores
+**Code Quality:**
+```bash
+# Format (MUST pass before commit)
+cargo fmt --check
+
+# Lint (MUST pass with zero warnings)
+cargo clippy -- -D warnings
+
+# Audit dependencies (check for CVEs)
+cargo audit
+
+# Check all targets
+cargo check --workspace --all-targets
+```
+
+**Performance:**
+- **Stack over heap:** Use stack allocation where possible
+- **Zero-copy:** Minimize memory copies in hot paths
+- **SIMD:** Use portable_simd for point transformations (see `src/ouster.rs`)
+- **Arena allocators:** Consider for frame buffers
+- **Profile on target:** Use Tracy profiler on actual hardware (Maivin/Raivin)
+
+**Async Runtime:**
+- Tokio with `rt-multi-thread` feature
+- Separate tasks for UDP receiver, frame processor, publisher
+- Non-blocking I/O for network and sensor communication
+
 
 ---
 
-## Testing Requirements
+## Testing Standards
 
-### Coverage Standards
+### Coverage Requirements
 
-- **Minimum coverage**: 70% (enforced by CI)
-- **Critical paths**: 90%+ coverage for packet parsing, clustering, publishing
-- **Edge cases**: Explicit tests for boundary conditions
-- **Error paths**: Validate error handling and recovery
+- **Minimum:** 70% line coverage (enforced in CI/CD)
+- **Critical paths:** 90%+ coverage (packet parsing, point transforms, clustering)
+- **Edge cases:** Explicit tests (null, bounds, concurrency)
+- **Error paths:** Validate error handling and recovery
 
-### Test Types
-
-**Unit Tests:**
-- Test individual functions in isolation
-- Mock external dependencies (sensors, network)
-- Fast execution (< 1 second per test suite)
-- Focus on algorithmic correctness (clustering logic, transformations)
-
-**Integration Tests:**
-- Test component interactions (UDP → frame → publish pipeline)
-- Use mock packet streams (avoid requiring physical sensors in CI)
-- Validate Zenoh publishing and ROS2 message compatibility
-- Test configuration and initialization
-
-**Edge Case Tests:**
-- Empty point clouds
-- Boundary values (min/max ranges, cluster thresholds)
-- Malformed UDP packets
-- Network disconnections and reconnection
-- Sensor mode changes mid-stream
+**Current Status:** ~5% coverage (2 tests in cluster.rs). **Target: 70% minimum.**
 
 ### Test Organization
 
-**Rust Pattern:**
-```rust
-// Unit tests at end of implementation file
-// src/cluster.rs
-pub fn cluster_points(points: &Points, threshold: f32) -> Vec<Cluster> {
-    // implementation
-}
+**Unit Tests:**
+- Co-located in `#[cfg(test)] mod tests` at end of implementation files
+- Test naming: `test_<function>_<scenario>`
+- Fast execution (< 1s per test suite)
+- No external dependencies (mock sensors, Zenoh)
 
+**Integration Tests:**
+- Separate `tests/` directory (to be created)
+- Test sensor communication (mocked UDP)
+- Test Zenoh publishing pipeline
+- Test ROS2 message format compliance
+- End-to-end workflows
+
+**Benchmark Tests:**
+- `benches/` directory for Criterion.rs benchmarks
+- Performance regression detection
+- Hot path optimization validation
+
+### Test Examples
+
+**Unit Test Pattern:**
+```rust
+// src/ouster.rs
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_cluster_empty_points() {
-        let points = Points::new();
-        let clusters = cluster_points(&points, 0.5);
-        assert!(clusters.is_empty());
+    fn test_parse_lidar_packet_rng15_rfl8_nir8() {
+        let packet = create_test_packet();
+        let result = parse_packet(&packet);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().points.len(), 64);
     }
-    
+
     #[test]
-    fn test_cluster_threshold_boundary() {
-        // Test edge cases around threshold values
+    fn test_point_transform_simd_vs_scalar() {
+        let input = vec![/* test data */];
+        let simd_result = transform_points_simd(&input);
+        let scalar_result = transform_points_scalar(&input);
+        assert_approx_eq!(simd_result, scalar_result, 1e-6);
     }
 }
 ```
 
-```
-# Integration tests in separate directory
-tests/
-├── integration_test.rs
-└── common/
-    └── mod.rs
+**Integration Test Pattern:**
+```rust
+// tests/integration.rs
+#[tokio::test]
+async fn test_zenoh_publish_point_cloud() {
+    let session = create_test_session().await;
+    let publisher = create_lidar_publisher(&session);
+    
+    let frame = create_test_frame();
+    publisher.publish_point_cloud(&frame).await.unwrap();
+    
+    // Verify message received
+    let received = subscriber.recv().await.unwrap();
+    assert_eq!(received.payload.len(), expected_size);
+}
 ```
 
 ### Running Tests
 
 ```bash
-# Run all tests
+# All unit tests
 cargo test --workspace
 
-# Run with output
-cargo test -- --nocapture
+# Specific module
+cargo test --lib ouster::tests
 
-# Run specific test
-cargo test test_cluster
+# Integration tests (when created)
+cargo test --test integration
 
-# Run with all features
-cargo test --all-features
+# With coverage
+cargo llvm-cov --html --output-dir coverage
 
-# Check test coverage (requires cargo-tarpaulin)
-cargo tarpaulin --out Html --output-dir coverage/
+# Benchmarks (when created)
+cargo bench
+
+# All checks (format + lint + test)
+cargo fmt --check && cargo clippy -- -D warnings && cargo test
 ```
+
 
 ---
 
-## Documentation Expectations
+## License Policy (ZERO TOLERANCE)
 
-### Code Documentation
+**Project License:** Apache-2.0
 
-**When to document:**
-- Public APIs, functions, and structs (ALWAYS)
-- Complex algorithms (clustering, transformations)
-- Performance considerations or optimization rationale
-- Thread safety and concurrency requirements
-- Hardware-specific code or platform dependencies
+**✅ Allowed Dependencies:**
+- MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause
+- ISC, 0BSD, Unlicense, Zlib, BSL-1.0 (Boost)
 
-**Rustdoc Style:**
-```rust
-/// Processes a LiDAR point cloud frame and applies DBSCAN clustering.
-///
-/// Clusters are formed by grouping points within `threshold` distance of each other.
-/// Uses spatial hashing for O(n log n) performance on typical point clouds.
-///
-/// # Arguments
-///
-/// * `points` - Raw point cloud data from the sensor (XYZ coordinates)
-/// * `threshold` - Distance threshold for clustering in meters
-///
-/// # Returns
-///
-/// Vector of clustered point groups, sorted by cluster size (largest first)
-///
-/// # Examples
-///
-/// ```
-/// let points = parse_lidar_frame(&packet_buffer)?;
-/// let clusters = cluster_points(&points, 0.5);
-/// for cluster in clusters {
-///     println!("Cluster has {} points", cluster.len());
-/// }
-/// ```
-///
-/// # Performance
-///
-/// Typical performance on Maivin platform:
-/// - 1024x10 frame (10k points): ~2ms
-/// - 2048x10 frame (20k points): ~5ms
-pub fn cluster_points(points: &Points, threshold: f32) -> Vec<Cluster> {
-    // Implementation
-}
+**⚠️ Conditional (External deps ONLY):**
+- MPL-2.0, EPL-2.0 (Mozilla/Eclipse - library dependencies only)
+- **LGPL FORBIDDEN in Rust** (static linking conflicts with Apache-2.0)
+
+**❌ BLOCKED (Never Use):**
+- GPL (any version), AGPL (any version)
+- SSPL, Commons Clause, proprietary without approval
+
+**Verification:**
+```bash
+# Check all dependencies for license compliance
+cargo install cargo-license
+cargo license --json | jq '.[] | select(.license | contains("GPL"))'
+
+# SBOM generation (when CI configured)
+make sbom  # Generates CycloneDX SBOM, validates licenses
 ```
 
-### Documentation Updates
+**Before Adding Dependencies:**
+1. Check crates.io for license
+2. Verify no GPL in dependency tree
+3. Document in commit message: "Adds dependency X (MIT license) for Y"
+4. CI/CD will block GPL violations automatically
 
-When modifying code, update corresponding documentation:
-- `README.md` if CLI flags or features change
-- Rustdoc comments if function signatures or semantics change
-- `CONTRIBUTING.md` if development workflow changes
-- CLI help text in `args.rs` for new options
-
----
-
-## License Policy
-
-**CRITICAL**: Au-Zone has strict license policy for all dependencies.
-
-### Allowed Licenses
-
-✅ **Permissive licenses (APPROVED)**:
-- MIT
-- Apache-2.0
-- BSD-2-Clause, BSD-3-Clause
-- ISC
-- Unlicense
-
-### Strictly Disallowed
-
-❌ **NEVER USE THESE LICENSES**:
-- GPL (any version)
-- AGPL (any version)
-- SSPL (Server Side Public License)
-- Creative Commons with NC (Non-Commercial) or ND (No Derivatives)
-
-### Verification Process
-
-**Before adding dependencies:**
-1. Check `Cargo.toml` license field: `cargo tree -e normal --prefix none --format "{p} {l}"`
-2. Verify no GPL/AGPL in dependency tree
-3. Use `cargo-deny` for automated license checking (if configured)
-4. Document third-party licenses in `NOTICE` file
-
-**If you need a library with incompatible license:**
-- Search for alternatives with permissive licenses (crates.io has good filtering)
-- Consider implementing functionality yourself
-- Escalate to technical leadership for approval (rare exceptions)
+**Current Dependencies:** All Rust crates are MIT/Apache-2.0 dual-licensed (standard Rust ecosystem).
 
 ---
 
 ## Security Practices
 
+### Input Validation
+
+**Network Inputs (UDP packets from sensor):**
+- Validate packet format and size before parsing
+- Bound checks on all array accesses
+- Reject malformed packets early
+- Rate limiting for packet processing
+
+**Configuration Inputs:**
+- Validate sensor IP addresses (RFC 1918 private ranges expected)
+- Sanitize topic names (no special characters)
+- Bounds on numeric parameters (cluster threshold, timeout values)
+
+### Secrets Management
+
+**NO secrets in this project:**
+- No API keys or passwords
+- Sensor communication uses local network (no auth)
+- Zenoh uses unauthenticated mode (local deployment)
+
+**If adding external services:**
+- Use environment variables for configuration
+- Document in `env.sh.template` (not `env.sh`)
+- Add `env.sh` to `.gitignore` (already done)
+- Use short-lived tokens (<48h) if authentication added
+
+### Dependency Security
+
+```bash
+# Check for known vulnerabilities
+cargo audit
+
+# Update dependencies carefully
+cargo update  # Updates within Cargo.toml ranges
+cargo outdated  # Check for newer versions
+
+# Run before commits
+cargo clippy -- -D warnings -W clippy::all
+```
+
 ### Vulnerability Reporting
 
-For security issues, follow `SECURITY.md` process:
-- Email: `support@au-zone.com` with subject "Security Vulnerability"
-- Expected acknowledgment: 48 hours
-- Expected assessment: 7 days
-
-### Secure Coding Guidelines
-
-**Input Validation (Critical for LiDAR data):**
-- Validate UDP packet sizes before parsing
-- Check array indices to prevent out-of-bounds access
-- Enforce reasonable limits on point cloud sizes
-- Sanitize sensor IP addresses and network configuration
-
-**Network Security:**
-- Validate source IP for UDP packets (prevent spoofing)
-- Rate-limit incoming packets to prevent DoS
-- Use Zenoh's security features for production deployments
-- No hardcoded credentials or API keys
-
-**Common Vulnerabilities to Avoid:**
-- **Buffer Overflows**: Use safe Rust slicing; check packet lengths
-- **Integer Overflow**: Use checked arithmetic for size calculations
-- **Denial of Service**: Implement backpressure and rate limiting
-- **Path Traversal**: Validate file paths for recordings/playback
-
-### Dependencies
-
-- Keep dependencies up to date: `cargo update`
-- Monitor for security advisories: `cargo audit`
-- Review new dependencies before adding
-- Prefer well-maintained crates with active communities
+**For security issues:**
+- Email: support@au-zone.com with subject "Security Vulnerability - LiDAR Publisher"
+- See [SECURITY.md](SECURITY.md) for full process
+- Expected response: 48 hours acknowledgment, 7 days assessment
 
 ---
 
-## Performance & Edge Considerations
+## Documentation Standards
+
+### Code Documentation
+
+**Required Documentation:**
+- All public APIs: `///` doc comments with examples
+- Complex algorithms: Inline comments explaining "why" not "what"
+- Performance-critical sections: Note optimizations and tradeoffs
+- SIMD code: Document scalar fallback and vectorization strategy
+- Unsafe code: Justify safety invariants
+
+**Example:**
+```rust
+/// Transforms raw LiDAR measurements to 3D Cartesian coordinates.
+///
+/// Uses SIMD acceleration when available (portable_simd feature) for 4x
+/// throughput improvement on ARM Cortex-A cores.
+///
+/// # Arguments
+/// * `measurements` - Range, azimuth, and altitude for each point
+/// * `intrinsics` - Sensor beam calibration parameters
+///
+/// # Returns
+/// Vec of (x, y, z) coordinates in sensor frame (meters)
+///
+/// # Performance
+/// - SIMD: ~2.5ms per frame (1024 points @ 10Hz)
+/// - Scalar: ~9ms per frame (fallback on non-SIMD platforms)
+///
+/// # Examples
+/// ```
+/// let points = transform_to_cartesian(&measurements, &intrinsics);
+/// assert_eq!(points.len(), measurements.len());
+/// ```
+pub fn transform_to_cartesian(
+    measurements: &[Measurement],
+    intrinsics: &BeamIntrinsics,
+) -> Vec<Point3D> {
+    // Implementation...
+}
+```
+
+### Project Documentation
+
+**Mandatory Files (already exist):**
+- README.md - Features, quick start, architecture overview
+- ARCHITECTURE.md - **TO BE CREATED** (Phase 1.2)
+- CONTRIBUTING.md - Development setup, contribution process
+- SECURITY.md - Vulnerability reporting
+- CHANGELOG.md - **TO BE CREATED** (Phase 1.4)
+- LICENSE - Apache-2.0 full text
+- NOTICE - Third-party attributions
+
+**API Documentation:**
+- Generate with `cargo doc --no-deps --open`
+- Publish to doc.edgefirst.ai (not docs.rs)
+- 100% coverage for public APIs
 
 ---
 
-## Performance & Edge Considerations
+## Project-Specific Guidelines
+
+### Technology Stack
+
+**Language & Toolchain:**
+- Rust edition: 2024 (see `rust-toolchain.toml`)
+- MSRV: Latest stable (tested down to stable-2)
+- Features:
+  - `portable_simd` (nightly) - SIMD acceleration for point transforms
+  - `rerun` (optional) - Real-time 3D visualization
+  - Tracy profiling support
+
+**Build System:**
+- Cargo workspace (single crate currently)
+- Cross-compilation: `cross` tool for ARM targets
+- Target platforms:
+  - `x86_64-unknown-linux-gnu` (development)
+  - `aarch64-unknown-linux-gnu` (Maivin, Raivin, generic ARM64)
+
+**Key Dependencies:**
+- **tokio** (1.x) - Async runtime with multi-thread feature
+- **zenoh** (1.6.2) - High-performance pub/sub messaging
+- **cdr** - ROS2 CDR serialization
+- **edgefirst-schemas** (1.3.1) - ROS2 message definitions
+- **portable-simd** (nightly) - SIMD abstractions
+
+**Target Platforms:**
+- **Maivin** - Vision module (NXP i.MX 8M Plus, EdgeFirst Perception)
+- **Raivin** - Vision + radar module (NXP i.MX 8M Plus, SmartMicro DRVEGRD-169 radar)
+- **Generic ARM64** - Jetson, Raspberry Pi, embedded Linux
+
+### Architecture
+
+**Pattern:** Event-driven async pipeline with multi-threading
+
+**Components:**
+1. **UDP Receiver** - Async packet capture from Ouster sensor (7502/7503 ports)
+2. **Frame Builder** - Assembles packets into complete frames
+3. **Point Cloud Processor** - Applies 3D transformations (SIMD-accelerated)
+4. **Clustering Engine** - Optional DBSCAN spatial clustering
+5. **Zenoh Publisher** - Distributes sensor_msgs/PointCloud2, sensor_msgs/Image
+6. **Transform Publisher** - Broadcasts geometry_msgs/TransformStamped for TF
+
+**Data Flow:**
+```
+Ouster Sensor (UDP 7502/7503)
+    ↓
+UDP Receiver (tokio::net::UdpSocket)
+    ↓
+Frame Builder (FrameReader::read_frame)
+    ↓
+Point Processor (transform_to_cartesian with SIMD)
+    ↓
+[Optional] Clustering (DBSCAN algorithm)
+    ↓
+Zenoh Publisher (CDR-serialized ROS2 messages)
+    ↓
+Perception Middleware / ROS2 Nodes
+```
+
+**Threading Model:**
+- Main thread: Argument parsing, initialization
+- Tokio runtime: UDP receiver, frame assembly (async)
+- Processor thread: Point transformations, clustering (dedicated thread)
+- Zenoh thread pool: Message publishing (Zenoh internal)
+
+**Error Handling:**
+- Result<T, E> types throughout
+- Custom error type: `ouster::Error`
+- Graceful degradation: Log errors, continue processing next frame
+- Network resilience: Reconnect on sensor disconnect
+
+### Module Structure
+
+```
+src/
+├── main.rs          (568 lines) - Application entry, Zenoh session, publishing
+├── ouster.rs        (729 lines) - Ouster protocol, packet parsing, point transforms
+├── cluster.rs       (444 lines) - DBSCAN clustering algorithm
+├── args.rs          (133 lines) - CLI argument parsing with clap
+├── rerun.rs         (321 lines) - Optional Rerun visualization integration
+├── common.rs        (81 lines)  - Shared utilities and constants
+└── lib.rs           (69 lines)  - Library exports for testing
+
+tests/               (to be created)
+└── integration/     - Sensor communication, Zenoh publishing tests
+
+benches/             (to be created)
+└── point_transform.rs - Criterion benchmarks for hot paths
+```
+
+**Module Responsibilities:**
+
+**ouster.rs** - Ouster LiDAR Protocol
+- `BeamIntrinsics` - Sensor calibration parameters
+- `LidarDataFormat` - Packet format parsing (RNG15_RFL8_NIR8)
+- `FrameReader` - UDP packet reception and frame assembly
+- `transform_to_cartesian()` - 3D point cloud generation (SIMD-accelerated)
+- `generate_range_image()` - Depth image from range measurements
+- `generate_reflectivity_image()` - Grayscale image from reflectivity
+
+**cluster.rs** - Spatial Clustering
+- `cluster_points()` - DBSCAN clustering algorithm
+- Density-based spatial clustering for object segmentation
+- Configurable epsilon (distance threshold) and min points
+
+**main.rs** - Application Orchestration
+- Zenoh session initialization with QoS configuration
+- ROS2 CDR message serialization
+- Topic publishing: `/lidar/points`, `/lidar/depth`, `/lidar/reflect`, `/lidar/clusters`
+- TF static frame broadcasting: `rt/tf_static`
+- Async frame processing pipeline
+
+**args.rs** - CLI Configuration
+- `Args` struct with clap derive macros
+- Sensor IP, lidar mode, timestamp mode configuration
+- Clustering parameters, topic names
+- Validation and default values
+
+### Build and Deployment
+
+**Local Development:**
+```bash
+# Build for development (with debug symbols)
+cargo build
+
+# Build optimized release
+cargo build --release
+
+# Run with default settings
+./target/release/lidarpub --target 192.168.1.100
+
+# Enable clustering
+./target/release/lidarpub --target 192.168.1.100 --cluster
+
+# With Rerun visualization (requires feature)
+cargo run --features rerun --bin lidar-rerun -- --target 192.168.1.100
+```
+
+**Cross-Compilation for ARM64:**
+```bash
+# Install cross tool
+cargo install cross
+
+# Build for Maivin/Raivin (ARM64)
+cross build --release --target aarch64-unknown-linux-gnu
+
+# Binary location
+ls target/aarch64-unknown-linux-gnu/release/lidarpub
+```
+
+**Code Quality Checks:**
+```bash
+# Format code
+cargo fmt
+
+# Lint (zero warnings required)
+cargo clippy -- -D warnings
+
+# Security audit
+cargo audit
+
+# All checks (run before commit)
+cargo fmt && cargo clippy -- -D warnings && cargo test
+```
+
+**Tracy Profiling:**
+```bash
+# Build with Tracy support
+cargo build --release --features tracy
+
+# Run and connect Tracy profiler
+./target/release/lidarpub --target 192.168.1.100
+
+# Tracy will capture frame timing, allocations, network I/O
+```
 
 ### Performance Targets
 
-- **Frame Processing Latency**: < 10ms per frame (critical path)
-- **Clustering Latency**: < 2ms per frame
-- **Memory Footprint**: < 512MB for typical operation
-- **CPU Usage**: < 15% single core on Maivin platform
-- **Network Throughput**: Handle 10-20Hz LiDAR streams without drops
+**Target Platform Performance:**
+- Frame processing: <10ms @ 10Hz (1024x10 mode) on edge hardware
+- Point cloud clustering: <2ms per frame
+- Memory footprint: <50MB resident
 
-### Critical Performance Paths
+**Latency Breakdown:**
+- UDP packet reception: <0.5ms
+- Frame assembly: <1ms
+- Point transformation (SIMD): ~2.5ms (1024 points)
+- Clustering (DBSCAN): ~2ms (when enabled)
+- Zenoh publishing: <1ms
 
-- UDP packet parsing → frame assembly → point transform → publish
-- Clustering must be O(n log n) or better; review with benchmarks before merging large changes
-- Zero-copy data paths where possible (use slices, avoid cloning large buffers)
-- SIMD operations for point transformations on supported platforms
+**Throughput:**
+- 10Hz operation @ 1024x10 mode (10,240 points/sec)
+- Up to 20Hz @ 512x10 mode (10,240 points/sec)
+- Sustained operation without frame drops
 
-### Optimization Guidelines
+**Memory:**
+- Stack-allocated buffers for frame assembly
+- Zero-copy message passing where possible
+- Minimal heap allocations in hot path
+- Reuse point cloud Vec across frames
 
-- **Memory**: Reuse buffers across frames; pre-allocate with `Vec::with_capacity`
-- **CPU**: Profile hot loops with `cargo flamegraph` or Tracy profiler
-- **Async**: Don't block Tokio threads; use `spawn_blocking` for CPU-intensive work
-- **Features**: Ensure optional features (`rerun`, `profiling`) are gated with `#[cfg(feature = ...)]`
+### Hardware Specifics
 
-### Hardware Platform Notes
+**Ouster OS1-64 LiDAR:**
+- Firmware: 2.5.3 (tested)
+- Packet format: RNG15_RFL8_NIR8 (15-bit range, 8-bit reflectivity, 8-bit NIR)
+- Resolution modes: 512x10, 1024x10, 2048x10 (columns × Hz)
+- UDP ports: 7502 (data), 7503 (IMU)
+- Network: Gigabit Ethernet (static IP recommended: 192.168.1.x)
+- HTTP API: Sensor configuration, metadata, calibration
+- Timestamp modes: Internal OSC, Sync pulse, PTP
 
-**EdgeFirst Modules:**
-- **Maivin** - Vision-only module (4K/8MP, Renesas RZ/V2H, EdgeFirst Perception Engine)
-- **Raivin** - Maivin + integrated 4D radar with sensor fusion for enhanced spatial perception in harsh environments (dust, low light, adverse weather)
-- Both modules: IP67-rated, -40°C to +65°C operation, designed for rugged off-road and industrial use
-- NPU/GPU acceleration available for point cloud processing
-- SIMD support for ARM NEON instructions
-- Consider power constraints (< 5W average)
-- Test on target hardware before claiming performance improvements
+**Maivin Platform:**
+- Processor: NXP i.MX 8M Plus
+- Network: Gigabit Ethernet
+- OS: Embedded Linux
 
-**Platform Resources:**
-- [EdgeFirst Modules](https://www.edgefirst.ai/edgefirstmodules)
-- Standard configurations, development kits, and custom options available
+**Raivin Platform:**
+- Processor: NXP i.MX 8M Plus
+- Radar: SmartMicro DRVEGRD-169
+- Network: Gigabit Ethernet
+- OS: Embedded Linux
 
-**Benchmarking:**
-- Use `criterion` for micro-benchmarks (future addition)
-- Include benchmark results in PRs for performance-sensitive changes
-- Document test platform (CPU, memory, OS) with benchmark results
+### Zenoh Best Practices
 
----
-
-## Error Handling Strategy
-
-### Error Categories
-
-**Recoverable Errors (log warning, retry):**
-- Sensor network timeout or packet loss
-- Temporary Zenoh connection issues
-- Malformed packets (log and skip to next frame)
-
-**Irrecoverable Errors (log error, exit cleanly):**
-- Invalid CLI arguments or configuration
-- Cannot bind to UDP port
-- Critical resource allocation failures
-
-### Error Handling Pattern
-
+**QoS Configuration:**
 ```rust
-// Define custom error type in library module (e.g., ouster.rs)
-pub enum Error {
-    IoError(std::io::Error),
-    SystemTimeError(std::time::SystemTimeError),
-    ShapeError(ndarray::ShapeError),
-    UnsupportedDataFormat(String),
-    UnexpectedEndOfSlice(usize),
-    UnknownPacketType(u16),
-}
+// Point cloud publishing (high priority, drop on congestion)
+let pub_config = zenoh::config::Config::default();
+pub_config.priority = Priority::DataHigh;
+pub_config.congestion_control = CongestionControl::Drop;
 
-impl std::error::Error for Error {}
-
-// Implement From traits for interop with underlying libraries
-impl From<std::io::Error> for Error {
-    fn from(err: std::io::Error) -> Error {
-        Error::IoError(err)
-    }
-}
-
-impl From<ndarray::ShapeError> for Error {
-    fn from(err: ndarray::ShapeError) -> Error {
-        Error::ShapeError(err)
-    }
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> std::fmt::Result {
-        match self {
-            Error::IoError(err) => write!(f, "io error: {}", err),
-            Error::UnsupportedDataFormat(format) => {
-                write!(f, "unsupported lidar data format: {}", format)
-            }
-            // ... other variants
-        }
-    }
-}
-
-// Use in function signatures
-pub fn process_lidar_stream(config: &Config) -> Result<(), Error> {
-    let socket = bind_udp_socket(&config.bind_addr)?; // auto-converts via From trait
-    // ... processing logic
-    Ok(())
-}
+// TF static frames (background priority, block on congestion)
+let tf_config = zenoh::config::Config::default();
+tf_config.priority = Priority::Background;
+tf_config.congestion_control = CongestionControl::Block;
 ```
 
-**Use custom error types** with `From` trait implementations to enable the `?` operator for automatic error conversion.
+**Topic Naming:**
+- Sensor data: `/{sensor_name}/{message_type}` (e.g., `/lidar/points`)
+- Transforms: `rt/tf_static` (ROS2 convention)
+- Use CLI argument `--lidar-topic` to customize prefix
+
+**Message Serialization:**
+- Use `cdr` crate for ROS2 Common Data Representation
+- Schemas from `edgefirst-schemas` crate (sensor_msgs, geometry_msgs)
+- Serialize to `Vec<u8>` before Zenoh put()
+
+**Error Handling:**
+- Log Zenoh errors, continue processing
+- Reconnect on session failure
+- Graceful degradation if subscriber count drops
 
 ---
 
-## Testing Guidance
+## Testing Conventions
 
-### Unit Tests
+**Unit Tests:**
+- Co-located at end of source files: `#[cfg(test)] mod tests`
+- Test naming: `test_<function>_<scenario>`
+- Example: `test_parse_packet_rng15_rfl8_nir8()`
+- Mock sensor data with known expected outputs
 
-Focus on edge cases:
-- **Empty frames**: Clustering with zero points
-- **Dense clusters**: Large number of closely-spaced points
-- **Threshold boundaries**: Points exactly at cluster distance threshold
-- **Numeric edge cases**: Min/max float values, NaN handling
+**Integration Tests:**
+- `tests/` directory (to be created)
+- Test real Zenoh publishing (local session)
+- Validate ROS2 message format compliance
+- End-to-end: UDP → parse → transform → publish
 
-### Integration Tests
+**Benchmark Tests:**
+- `benches/` directory (to be created)
+- Criterion.rs framework for micro-benchmarks
+- Hot path functions: `transform_to_cartesian()`, `cluster_points()`
+- Performance regression detection
 
-- Mock packet streams (avoid requiring live hardware in CI)
-- Test full pipeline: packet → frame → cluster → publish
-- Validate Zenoh message formats match ROS2 schemas (sensor_msgs::PointCloud2, sensor_msgs::Image)
-- Verify CDR serialization produces ROS2-compatible binary output
-- Test graceful shutdown and cleanup
+**Test Fixtures:**
+- `tests/fixtures/` for sample LiDAR packets
+- Real capture from Ouster sensor (small files)
+- Edge cases: empty frames, malformed packets, max range
 
-### Benchmarks (Future)
-
-- Packet → frame throughput
-- Clustering performance vs. point count
-- Memory allocation patterns over time
-
----
-
-## Suggested AI Tasks
-
-Assistants may:
-- Propose micro-optimizations with benchmarks
-- Generate additional rustdoc examples
-- Suggest safe concurrency patterns for packet ingestion
-- Draft hardware-specific tuning notes (under review before merge)
-- Add edge case tests with property-based testing
-- Improve error messages and diagnostics
+**Coverage Target:** 70% minimum, 90%+ for critical paths (packet parsing, point transforms, clustering)
 
 ---
 
-## Non-Goals for AI
+## AI Assistant Practices
 
-- Introducing heavy dependencies unless justified by profiling
-- Adding unsafe code without clear, measurable benefit
-- Refactoring purely for stylistic changes without performance/readability gains
-- Changing cluster algorithms without benchmark comparisons
-- Breaking CLI compatibility without migration guide
+**Verify Before Using:**
+- ✅ API exists in current Rust version and crate versions
+- ✅ License compatible (check Cargo.toml and crates.io)
+- ✅ Code matches project patterns (async, Result types, SIMD where applicable)
+- ✅ Tests included for new functionality
+- ✅ Documentation comments for public APIs
 
----
+**Common Pitfalls to Avoid:**
+- ❌ Hallucinated Rust APIs (verify on docs.rs before suggesting)
+- ❌ GPL/AGPL dependencies (Rust crates are usually MIT/Apache-2.0 dual-licensed)
+- ❌ Using `cd` commands (stay in project root)
+- ❌ Blocking I/O in async context (use tokio::fs, tokio::net)
+- ❌ Panic in production code (use Result types)
+- ❌ Hardcoded IP addresses (use CLI arguments)
+- ❌ Over-engineering (keep it simple, profile before optimizing)
 
-## Future Enhancements (Hints)
+**Review Checklist:**
+- [ ] Code compiles: `cargo check`
+- [ ] No warnings: `cargo clippy -- -D warnings`
+- [ ] Formatted: `cargo fmt --check`
+- [ ] Tests pass: `cargo test`
+- [ ] Documentation complete for public APIs
+- [ ] No secrets or hardcoded config
+- [ ] Matches existing code patterns
 
-- **Additional Ouster packet formats**: Support RNG19_RFL8_SIG16_NIR16, LEGACY, and other profiles
-- **Newer firmware support**: Ouster firmware 3.x compatibility
-- **Multi-vendor support**: Velodyne (VLP-16, VLS-128), Livox (Mid-70, Avia), and others
-- Multi-sensor time synchronization module
-- Streaming compression for low-bandwidth links
-- Telemetry export to EdgeFirst Studio (metrics + events)
-- GPU/NPU acceleration for transforms on Maivin/Raivin modules
-- Point cloud recording and playback for testing
-
----
-
-## Getting Help
-
-**For development questions:**
-- Check `CONTRIBUTING.md` for setup instructions
-- Review existing code for patterns
-- Search GitHub Issues for similar problems
-- Open a discussion for architectural questions
-
-**For security concerns:**
-- Email `support@au-zone.com` with subject "Security Vulnerability"
-- Do not disclose vulnerabilities publicly
-
-**For license questions:**
-- Review [License Policy](#license-policy) section above
-- Check `LICENSE` file and dependency licenses
-- Contact technical leadership if unclear
+**You are the author** - AI is a tool. Review all generated code thoroughly, test on target hardware when possible.
 
 ---
 
-## Workflow Example
+## Quick Reference
 
-**Implementing a new feature:**
-
-```bash
-# 1. Create branch from develop
-git checkout develop
-git pull origin develop
-git checkout -b feature/LIDAR-123-add-velodyne-support
-
-# 2. Implement feature with tests
-# - Write unit tests first (TDD)
-# - Implement functionality
-# - Add integration tests
-# - Update documentation
-
-# 3. Verify quality
-cargo fmt           # Auto-format code
-cargo clippy        # Run linter
-cargo test          # Run all tests
-cargo build         # Ensure it builds
-
-# 4. Commit with proper message
-git add .
-git commit -m "LIDAR-123: Add Velodyne VLP-16 sensor support
-
-- Implemented packet parser for VLP-16 format
-- Added sensor detection and auto-configuration
-- Comprehensive unit and integration tests
-- Updated CLI arguments and documentation"
-
-# 5. Push and create PR
-git push -u origin feature/LIDAR-123-add-velodyne-support
-# Create PR via Bitbucket/GitHub UI
-
-# 6. Address review feedback
-# - Make requested changes
-# - Push additional commits
-# - Respond to comments
-
-# 7. Merge after approvals
-# Maintainer merges via PR interface
-```
+**Branch:** `feature/EDGEAI-###-description`
+**Commit:** `EDGEAI-###: Brief description`
+**PR:** 2 approvals (main), 1 (develop), all CI checks pass
+**Licenses:** ✅ MIT/Apache/BSD | ❌ GPL/AGPL
+**Tests:** 70% min, 90%+ critical paths
+**Coverage:** `cargo llvm-cov --html`
+**Security:** support@au-zone.com
+**Platforms:** Maivin (NXP i.MX 8M Plus), Raivin (Maivin + SmartMicro DRVEGRD-169 radar), generic ARM64
+**Sensor:** Ouster OS1-64 (firmware 2.5.3, RNG15_RFL8_NIR8)
 
 ---
 
-## Working with AI Assistants
+**SPS Documentation:** See Au-Zone Software Process Specification repository
+**EdgeFirst Docs:** https://doc.edgefirst.ai/perception/lidar
+**v2.0** | 2025-11-22 | sebastien@au-zone.com
 
-### Best Practices
-
-**Provide Context:**
-- Share relevant files, error messages, requirements
-- Reference existing patterns in codebase
-- Mention performance constraints and target platforms
-
-**Verify Outputs:**
-- Review generated code critically before committing
-- Check that APIs actually exist (no hallucinated functions)
-- Ensure suggestions match Rust 2024 edition best practices
-- Run tests and benchmarks to verify correctness
-
-**Iterate:**
-- Refine solutions through follow-up questions
-- Ask for alternative approaches
-- Request explanations for complex generated code
-
-### Common AI Pitfalls to Avoid
-
-- **Hallucinated APIs**: Verify Zenoh/Rerun APIs exist in current versions
-- **Outdated patterns**: Check suggestions match Rust 2024 idioms
-- **Over-engineering**: Prefer simple solutions over complex ones
-- **Missing edge cases**: Explicitly test boundary conditions
-- **License violations**: AI may suggest code with incompatible licenses
-
----
-
-*Maintain this file only if it adds clarity for AI assistance. Remove if it becomes outdated.*
-
+*This document helps AI assistants contribute effectively to EdgeFirst LiDAR Publisher while maintaining quality, performance, and Au-Zone standards.*

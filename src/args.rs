@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2025 Au-Zone Technologies. All Rights Reserved.
+
 use clap::{Parser, builder::PossibleValuesParser};
 use serde_json::json;
 use tracing::level_filters::LevelFilter;

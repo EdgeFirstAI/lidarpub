@@ -1,0 +1,139 @@
+# GitHub Actions workflow for release orchestration
+#
+# This workflow is triggered on version tags (v*.*.*, e.g., v1.3.1) and orchestrates
+# the complete release process: testing, building, SBOM generation, changelog extraction,
+# and GitHub release creation with binary artifacts.
+#
+# Action Versions (verified November 2025):
+# - actions/checkout@v4 (latest)
+# - actions/download-artifact@v4 (latest)
+# - softprops/action-gh-release@v2 (latest)
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
+
+jobs:
+  # Call test workflow to ensure quality
+  test:
+    uses: ./.github/workflows/test.yml
+
+  # Call build workflow to create artifacts
+  build:
+    needs: test
+    uses: ./.github/workflows/build.yml
+
+  # Call SBOM workflow for compliance
+  sbom:
+    needs: test
+    uses: ./.github/workflows/sbom.yml
+
+  # Create GitHub release
+  release:
+    name: Create GitHub Release
+    needs: [test, build, sbom]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Release version: $VERSION"
+          
+          # Verify tag matches Cargo.toml version
+          TAG_VERSION="${{ github.ref_name }}"
+          TAG_VERSION="${TAG_VERSION#v}"
+          if [ "$VERSION" != "$TAG_VERSION" ]; then
+            echo "ERROR: Tag version ($TAG_VERSION) does not match Cargo.toml version ($VERSION)"
+            exit 1
+          fi
+
+      - name: Extract changelog for this version
+        id: changelog
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          
+          # Extract changelog section for this version
+          if grep -q "\[$VERSION\]" CHANGELOG.md; then
+            # Extract from version header to next version header or end
+            CHANGELOG=$(awk "/\[$VERSION\]/,/^## \[/" CHANGELOG.md | sed '$d' | tail -n +2)
+          else
+            CHANGELOG="See CHANGELOG.md for details"
+          fi
+          
+          # Save to file for multiline support
+          echo "$CHANGELOG" > changelog.txt
+          
+          # Also output for debugging
+          echo "Changelog for $VERSION:"
+          cat changelog.txt
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Download SBOM artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom
+          path: sbom/
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release/
+          
+          # Move binaries to release directory
+          find artifacts/lidarpub-* -type f -exec mv {} release/ \;
+          
+          # Copy SBOM
+          cp sbom/sbom-rust.json release/sbom-${{ steps.version.outputs.version }}.json
+          cp sbom/licenses.tsv release/licenses-${{ steps.version.outputs.version }}.tsv
+          
+          # Create checksums
+          cd release/
+          sha256sum * > SHA256SUMS.txt
+          cd ..
+          
+          ls -lh release/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: EdgeFirst LiDAR Publisher ${{ steps.version.outputs.version }}
+          body_path: changelog.txt
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-alpha') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-rc') }}
+          files: release/*
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Summary
+        run: |
+          echo "## Release Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** ${{ steps.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Tag:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          ls -lh release/ >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Checksums" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          cat release/SHA256SUMS.txt >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY

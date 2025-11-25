@@ -15,7 +15,7 @@ Please read our [Code of Conduct](CODE_OF_CONDUCT.md) before contributing.
 
 ## Before You Start
 
-1. Check existing [issues](https://bitbucket.org/au-zone/lidarpub/issues) and [pull requests](https://bitbucket.org/au-zone/lidarpub/pulls)
+1. Check existing [issues](https://github.com/EdgeFirstAI/lidarpub/issues) and [pull requests](https://github.com/EdgeFirstAI/lidarpub/pulls)
 2. For significant changes, open an issue for discussion first
 3. Review our roadmap to understand project direction
 4. Consider how changes might affect EdgeFirst Studio integration
@@ -34,7 +34,7 @@ Please read our [Code of Conduct](CODE_OF_CONDUCT.md) before contributing.
 
 ```bash
 # Clone the repository
-git clone https://bitbucket.org/au-zone/lidarpub.git
+git clone https://github.com/EdgeFirstAI/lidarpub.git
 cd lidarpub
 
 # Build the project
@@ -113,10 +113,10 @@ cargo test --all-features
 ### 1. Fork and Clone
 
 ```bash
-# Fork the repository on Bitbucket, then:
-git clone https://bitbucket.org/YOUR_USERNAME/lidarpub.git
+# Fork the repository on GitHub, then:
+git clone https://github.com/YOUR_USERNAME/lidarpub.git
 cd lidarpub
-git remote add upstream https://bitbucket.org/au-zone/lidarpub.git
+git remote add upstream https://github.com/EdgeFirstAI/lidarpub.git
 ```
 
 ### 2. Create Feature Branch
@@ -207,7 +207,7 @@ Types: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `chore`
 git push origin feature/your-feature-name
 ```
 
-Then create a pull request on Bitbucket with:
+Then create a pull request on GitHub with:
 - Clear title and description
 - Reference related issues (e.g., "Closes #123")
 - Description of changes and motivation
@@ -329,8 +329,8 @@ Maintainers follow this release process:
 
 ## Getting Help
 
-- **Questions**: Use [GitHub Discussions](https://bitbucket.org/au-zone/lidarpub/discussions)
-- **Bugs**: Open an [issue](https://bitbucket.org/au-zone/lidarpub/issues)
+- **Questions**: Use [GitHub Discussions](https://github.com/EdgeFirstAI/lidarpub/discussions)
+- **Bugs**: Open an [issue](https://github.com/EdgeFirstAI/lidarpub/issues)
 - **Chat**: Join our community (link TBD)
 - **Commercial Support**: Contact support@au-zone.com
 
