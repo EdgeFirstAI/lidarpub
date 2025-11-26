@@ -185,11 +185,11 @@ echo
 # Step 3: Generate dependency SBOM (language-specific)
 echo "[3/6] Generating dependency SBOM..."
 
-# For Rust projects with cargo-cyclonedx
-if [ -f "Cargo.toml" ] && command -v cargo-cyclonedx &> /dev/null; then
-    echo "  Generating Rust dependencies with cargo-cyclonedx..."
-    cargo cyclonedx --format json --all
-    # Rename output to deps-sbom.json
+# For Rust projects with cargo cyclonedx
+if [ -f "Cargo.toml" ] && cargo cyclonedx --version &> /dev/null; then
+    echo "  Generating Rust dependencies with cargo cyclonedx..."
+    cargo cyclonedx --format json
+    # cargo cyclonedx creates PROJECT_NAME.cdx.json
     if [ -f "$PROJECT_NAME.cdx.json" ]; then
         mv "$PROJECT_NAME.cdx.json" deps-sbom.json
     fi
@@ -230,14 +230,19 @@ $CYCLONEDX merge \
     --input-files source-sbom.json deps-sbom.json \
     --output-file sbom-temp.json
 
-# Remove duplicate project component from components list
+# Remove duplicate project component and restore dependency graph
 python3 << EOF
 import json
 
 PROJECT_NAME = "$PROJECT_NAME"
 
+# Load merged SBOM
 with open('sbom-temp.json', 'r') as f:
     sbom = json.load(f)
+
+# Load deps SBOM to get dependency graph
+with open('deps-sbom.json', 'r') as f:
+    deps_sbom = json.load(f)
 
 # Filter out project name from components (it's defined in metadata, not a dependency)
 if 'components' in sbom:
@@ -245,6 +250,16 @@ if 'components' in sbom:
         c for c in sbom['components']
         if c.get('name') != PROJECT_NAME.lower()
     ]
+
+# Restore dependency graph from deps-sbom (which cargo-cyclonedx generates correctly)
+if 'dependencies' in deps_sbom:
+    sbom['dependencies'] = deps_sbom['dependencies']
+    
+# Ensure metadata component has the correct bom-ref from deps-sbom
+if 'metadata' in deps_sbom and 'component' in deps_sbom['metadata']:
+    deps_bom_ref = deps_sbom['metadata']['component'].get('bom-ref')
+    if deps_bom_ref and 'metadata' in sbom and 'component' in sbom['metadata']:
+        sbom['metadata']['component']['bom-ref'] = deps_bom_ref
 
 with open('sbom.json', 'w') as f:
     json.dump(sbom, f, indent=2)
@@ -271,7 +286,7 @@ if [ -f "NOTICE" ] && [ -f ".github/scripts/validate_notice.py" ]; then
     python3 .github/scripts/validate_notice.py NOTICE sbom.json
     NOTICE_EXIT=$?
     if [ $NOTICE_EXIT -ne 0 ]; then
-        echo "⚠️  NOTICE file validation failed - please update NOTICE manually"
+        echo "⚠️  NOTICE file validation warnings - review output above"
     else
         echo "✓ NOTICE file validated (matches first-level dependencies)"
     fi

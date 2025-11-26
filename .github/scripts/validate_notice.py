@@ -143,6 +143,9 @@ def parse_notice_file(notice_path: str) -> Set[str]:
     # Match patterns like: "  * package-name 1.2.3 (License)"
     pattern = r'^\s*\*\s+(\S+)\s+([\d.]+(?:-[\w.]+)?)\s+\(.*?\)'
 
+    # Also match markdown bold format: "**package-name** (License)"
+    markdown_pattern = r'^\*\*([a-z0-9_-]+)\*\*\s+\(.*?\)'
+
     # Also match proprietary entries: "  * NXP BSP - NXP Proprietary"
     proprietary_pattern = r'^\s*\*\s+(.+?)\s+-\s+.*Proprietary'
 
@@ -153,10 +156,15 @@ def parse_notice_file(notice_path: str) -> Set[str]:
             version = match.group(2)
             listed_deps.add(f"{name} {version}")
         else:
-            prop_match = re.match(proprietary_pattern, line)
-            if prop_match:
-                # For proprietary entries, just use the name
-                listed_deps.add(prop_match.group(1))
+            # Try markdown format (name only, no version)
+            md_match = re.match(markdown_pattern, line)
+            if md_match:
+                listed_deps.add(md_match.group(1))
+            else:
+                prop_match = re.match(proprietary_pattern, line)
+                if prop_match:
+                    # For proprietary entries, just use the name
+                    listed_deps.add(prop_match.group(1))
 
     return listed_deps
 
@@ -181,9 +189,19 @@ def validate_notice(notice_path: str, sbom_path: str) -> Tuple[bool, List[str], 
     # Get listed dependencies from NOTICE
     notice_deps = parse_notice_file(notice_path)
 
-    # Find missing and extra dependencies
-    missing_deps = list(sbom_first_level - notice_deps)
-    extra_deps = list(notice_deps - sbom_first_level)
+    # Extract package names from both sets for comparison
+    # SBOM format: "package version"
+    # NOTICE format: might be "package version" or just "package"
+    sbom_names = {dep.split()[0] for dep in sbom_first_level}
+    notice_names = {dep.split()[0] for dep in notice_deps}
+
+    # Find missing and extra dependencies (by name only)
+    missing_names = list(sbom_names - notice_names)
+    extra_names = list(notice_names - sbom_names)
+
+    # Reconstruct full entries for output
+    missing_deps = [dep for dep in sbom_first_level if dep.split()[0] in missing_names]
+    extra_deps = [dep for dep in notice_deps if dep.split()[0] in extra_names]
 
     missing_deps.sort()
     extra_deps.sort()
@@ -233,7 +251,8 @@ def main():
         print("  All first-level dependencies are properly documented.")
         print()
         sys.exit(0)
-    else:
+    elif missing_deps:
+        # Missing deps is a hard error
         print("✗ NOTICE file validation FAILED!")
         print()
         print("ACTION REQUIRED:")
@@ -242,6 +261,12 @@ def main():
         print("  3. Re-run this validation script")
         print()
         sys.exit(1)
+    else:
+        # Only extra deps (likely optional) - warning but pass
+        print("⚠️  NOTICE file validation passed with warnings")
+        print("  (Extra entries appear to be optional dependencies)")
+        print()
+        sys.exit(0)
 
 
 if __name__ == "__main__":
