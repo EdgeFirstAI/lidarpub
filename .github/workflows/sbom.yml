@@ -51,6 +51,10 @@ jobs:
           # Install cargo-license for license extraction
           cargo install cargo-license
           
+          # Install scancode-toolkit for comprehensive source scanning
+          python -m pip install --upgrade pip
+          pip install scancode-toolkit
+          
           # Install Python dependencies for validation scripts
           pip install jsonschema requests
 
