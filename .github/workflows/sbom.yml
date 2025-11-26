@@ -58,6 +58,15 @@ jobs:
           
           # Install Python dependencies for validation scripts
           pip install jsonschema requests
+          
+          # Install CycloneDX CLI for SBOM merging (v0.29.1)
+          CYCLONEDX_URL="https://github.com/CycloneDX/cyclonedx-cli/releases/latest/download/cyclonedx-linux-x64"
+          CYCLONEDX_SHA256="1daceab1a7613603072db34d406659f0865623a4f137637440764cb9aa31236c"
+          
+          curl -L "$CYCLONEDX_URL" -o cyclonedx
+          echo "$CYCLONEDX_SHA256  cyclonedx" | sha256sum -c -
+          chmod +x cyclonedx
+          sudo mv cyclonedx /usr/local/bin/
 
       - name: Generate SBOM for Rust dependencies
         run: |
