@@ -57,10 +57,18 @@ echo
 
 # Step 1: Generate source code SBOM with scancode
 echo "[1/6] Generating source code SBOM with scancode..."
-if [ ! -f "venv/bin/scancode" ]; then
+
+# Check for scancode in venv first, then fall back to system
+if [ -f "venv/bin/scancode" ]; then
+    SCANCODE="venv/bin/scancode"
+    echo "  Using scancode from venv"
+elif command -v scancode &> /dev/null; then
+    SCANCODE="scancode"
+    echo "  Using system scancode"
+else
     echo "Error: scancode not found. Please install:"
-    echo "  python3 -m venv venv"
-    echo "  venv/bin/pip install scancode-toolkit"
+    echo "  Option 1 (recommended): python3 -m venv venv && venv/bin/pip install scancode-toolkit"
+    echo "  Option 2 (system): pip install scancode-toolkit"
     exit 1
 fi
 
@@ -70,7 +78,7 @@ for dir in $SOURCE_DIRS; do
     if [ -d "$dir" ]; then
         echo "  Scanning $dir/..."
         OUTPUT_FILE="source-sbom-$(basename $dir).json"
-        venv/bin/scancode -clpieu \
+        $SCANCODE -clpieu \
             --cyclonedx "$OUTPUT_FILE" \
             --only-findings \
             --timeout 300 \
@@ -84,7 +92,7 @@ for file in $MANIFEST_FILES; do
     if [ -f "$file" ]; then
         echo "  Scanning $file..."
         OUTPUT_FILE="source-sbom-$(basename $file .txt | tr '.' '-').json"
-        venv/bin/scancode -clpieu \
+        $SCANCODE -clpieu \
             --cyclonedx "$OUTPUT_FILE" \
             --only-findings \
             --timeout 300 \
