@@ -47,7 +47,7 @@ echo
 
 # Extract version from Cargo.toml
 if [ -f "$VERSION_FILE" ]; then
-    VERSION=$(grep '^version = ' "$VERSION_FILE" | head -1 | sed 's/version = \"\\(.*\\)\"/\\1/')
+    VERSION=$(grep '^version = ' "$VERSION_FILE" | head -1 | sed 's/version = "\(.*\)"/\1/')
     echo "Detected version: $VERSION"
 else
     VERSION="unknown"
