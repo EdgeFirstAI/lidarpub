@@ -56,7 +56,7 @@ jobs:
 
       - name: Generate SBOM for Rust dependencies
         run: |
-          cargo cyclonedx --format json --output-cdx sbom-rust.json
+          cargo cyclonedx --format json > sbom-rust.json
           
           # Also generate human-readable license list
           cargo license --json > licenses.json
