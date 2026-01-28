@@ -74,10 +74,10 @@ impl Add for Coord {
     }
 }
 
-use cdr::{CdrLe, Infinite};
 use edgefirst_schemas::{
     builtin_interfaces::Time,
     sensor_msgs::{PointCloud2, PointField},
+    serde_cdr,
     std_msgs::Header,
 };
 use kanal::Receiver;
@@ -236,7 +236,7 @@ fn format_points_clustered(
     n_points: usize,
     timestamp: Time,
     frame_id: String,
-) -> Result<(ZBytes, Encoding), cdr::Error> {
+) -> Result<(ZBytes, Encoding), serde_cdr::Error> {
     const N: usize = 4;
 
     let fields = vec![
@@ -344,7 +344,7 @@ fn format_points_clustered(
         is_dense: true,
     };
 
-    let msg = ZBytes::from(cdr::serialize::<_, _, CdrLe>(&msg, Infinite)?);
+    let msg = ZBytes::from(serde_cdr::serialize(&msg)?);
     let enc = Encoding::APPLICATION_CDR.with_schema("sensor_msgs/msg/PointCloud2");
 
     Ok((msg, enc))

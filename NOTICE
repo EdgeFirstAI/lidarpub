@@ -25,18 +25,14 @@ This project incorporates the following open source libraries. All dependencies 
 
 ### Core Dependencies
 
-**cdr** (MIT OR Apache-2.0)  
-Common Data Representation (CDR) serialization for ROS2 compatibility  
-https://crates.io/crates/cdr
-
 **clap** (MIT OR Apache-2.0)  
 Command-line argument parsing  
 https://crates.io/crates/clap
 
 **edgefirst-schemas** (Apache-2.0)  
-ROS2 message type definitions (sensor_msgs, geometry_msgs)  
+ROS2 message type definitions (sensor_msgs, geometry_msgs) with CDR serialization  
 https://github.com/EdgeFirstAI/schemas  
-v1.4.1 - Au-Zone Technologies
+v1.5.2 - Au-Zone Technologies
 
 **env_logger** (MIT OR Apache-2.0)  
 Logging implementation for the log facade  

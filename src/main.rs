@@ -8,13 +8,13 @@ mod cluster;
 mod common;
 
 use args::Args;
-use cdr::{CdrLe, Infinite};
 use clap::Parser as _;
 use cluster::cluster_thread;
 use edgefirst_schemas::{
     builtin_interfaces::Time,
     geometry_msgs::{Quaternion, Transform, TransformStamped, Vector3},
     sensor_msgs::{Image, PointCloud2, PointField},
+    serde_cdr,
     std_msgs::Header,
 };
 use kanal::Receiver;
@@ -344,7 +344,7 @@ fn format_points(
     n_points: usize,
     timestamp: Time,
     frame_id: String,
-) -> Result<(ZBytes, Encoding), cdr::Error> {
+) -> Result<(ZBytes, Encoding), serde_cdr::Error> {
     const N: usize = 4;
 
     let fields = vec![
@@ -437,7 +437,7 @@ fn format_points(
         is_dense: true,
     };
 
-    let msg = ZBytes::from(cdr::serialize::<_, _, CdrLe>(&msg, Infinite)?);
+    let msg = ZBytes::from(serde_cdr::serialize(&msg)?);
     let enc = Encoding::APPLICATION_CDR.with_schema("sensor_msgs/msg/PointCloud2");
 
     Ok((msg, enc))
@@ -449,7 +449,7 @@ fn format_depth(
     crop: &(usize, usize),
     timestamp: Time,
     frame_id: String,
-) -> Result<(ZBytes, Encoding), cdr::Error> {
+) -> Result<(ZBytes, Encoding), serde_cdr::Error> {
     const N: usize = 8;
 
     let depth = depth
@@ -481,7 +481,7 @@ fn format_depth(
         data,
     };
 
-    let msg = ZBytes::from(cdr::serialize::<_, _, CdrLe>(&msg, Infinite).unwrap());
+    let msg = ZBytes::from(serde_cdr::serialize(&msg)?);
     let enc = Encoding::APPLICATION_CDR.with_schema("sensor_msgs/msg/Image");
 
     Ok((msg, enc))
@@ -493,7 +493,7 @@ fn format_reflect(
     crop: &(usize, usize),
     timestamp: Time,
     frame_id: String,
-) -> Result<(ZBytes, Encoding), cdr::Error> {
+) -> Result<(ZBytes, Encoding), serde_cdr::Error> {
     let reflect = reflect
         .slice(ndarray::s![.., crop.0..crop.1])
         .as_standard_layout()
@@ -513,7 +513,7 @@ fn format_reflect(
         data: reflect.as_slice().unwrap().to_vec(),
     };
 
-    let msg = ZBytes::from(cdr::serialize::<_, _, CdrLe>(&msg, Infinite).unwrap());
+    let msg = ZBytes::from(serde_cdr::serialize(&msg)?);
     let enc = Encoding::APPLICATION_CDR.with_schema("sensor_msgs/msg/Image");
 
     Ok((msg, enc))
@@ -552,7 +552,7 @@ async fn tf_static_loop(session: Session, args: Args) {
         },
     };
 
-    let msg = ZBytes::from(cdr::serialize::<_, _, CdrLe>(&msg, Infinite).unwrap());
+    let msg = ZBytes::from(serde_cdr::serialize(&msg).unwrap());
     let enc = Encoding::APPLICATION_CDR.with_schema("geometry_msgs/msg/TransformStamped");
 
     let interval = Duration::from_secs(1);

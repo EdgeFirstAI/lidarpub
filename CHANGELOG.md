@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-01-28
+
+### Added
+- TESTING.md documentation with CI overview and manual hardware testing procedures
+
+### Changed
+- Migrated CDR serialization to use `edgefirst_schemas::serde_cdr` API instead of direct `cdr` crate usage
+- Updated edgefirst-schemas to 1.5.2
+- Removed direct `cdr` dependency (now transitive through edgefirst-schemas)
+- Updated build.yml to use native GitHub runners (ubuntu-22.04, ubuntu-22.04-arm) instead of cross-compilation
+- Simplified test.yml with separated format/clippy jobs and streamlined coverage collection
+- Updated release.yml to use lewagon/wait-on-check-action for cleaner build/release separation
+
 ## [1.4.0] - 2025-11-25
 
 ### Added

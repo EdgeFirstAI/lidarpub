@@ -1,87 +1,78 @@
-# GitHub Actions workflow for building release artifacts and documentation
+# GitHub Actions workflow for building release artifacts
 #
-# This workflow builds release binaries for x86_64 and aarch64, generates
-# API documentation, and uploads artifacts.
+# This workflow builds binaries for x86_64 and ARM64 platforms using native runners.
 #
-# Action Versions (verified November 2025):
-# - actions/checkout@v4 (latest)
-# - actions-rust-lang/setup-rust-toolchain@v1 (latest)
-# - actions/upload-artifact@v4 (latest)
-# - peaceiris/actions-gh-pages@v4 (latest)
+# Action Versions (verified January 2026):
+# - actions/checkout@v4
+# - dtolnay/rust-toolchain@nightly
+# - actions/cache@v4
+# - actions/upload-artifact@v4
 
 name: Build
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [main, develop]
   pull_request:
-    branches: [ main, develop ]
+    branches: [main, develop]
   workflow_call:
-    outputs:
-      version:
-        description: "Project version"
-        value: ${{ jobs.build.outputs.version }}
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-    name: Build (${{ matrix.target }})
-    runs-on: ubuntu-22.04
-    outputs:
-      version: ${{ steps.version.outputs.version }}
+  build-packages:
+    name: Build (${{ matrix.platform.name }})
+    runs-on: ${{ matrix.platform.runner }}
     strategy:
       matrix:
-        target:
-          - x86_64-unknown-linux-gnu
-          - aarch64-unknown-linux-gnu
+        platform:
+          - name: x86_64
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - name: aarch64
+            runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
       fail-fast: false
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
         with:
-          fetch-depth: 0
+          path: ~/.cargo/registry/index
+          key: ${{ runner.os }}-${{ matrix.platform.name }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ matrix.platform.name }}-cargo-index-
 
-      - name: Extract version from Cargo.toml
-        id: version
-        run: |
-          VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Building version: $VERSION"
-
-      - name: Set up Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Cache cargo build
+        uses: actions/cache@v4
         with:
-          toolchain: nightly
-          target: ${{ matrix.target }}
+          path: target
+          key: ${{ runner.os }}-${{ matrix.platform.name }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ matrix.platform.name }}-cargo-build-
 
-      - name: Install cross-compilation tools
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Strip binary
+        run: strip target/release/lidarpub
+
+      - name: Create package
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-          cargo install cross
+          mkdir -p packages
+          cp target/release/lidarpub packages/lidarpub-${{ matrix.platform.name }}
 
-      - name: Build release binary (x86_64)
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Build release binary (aarch64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: cross build --release --target ${{ matrix.target }}
-
-      - name: Package binary
-        run: |
-          mkdir -p dist
-          cp target/${{ matrix.target }}/release/lidarpub \
-             dist/edgefirst-lidarpub-${{ steps.version.outputs.version }}-${{ matrix.target }}
-          chmod +x dist/edgefirst-lidarpub-*
-
-      - name: Upload artifact
+      - name: Upload package artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: lidarpub-${{ matrix.target }}
-          path: dist/edgefirst-lidarpub-*
-          retention-days: 30
+          name: packages-${{ matrix.platform.name }}
+          path: packages/
+          retention-days: 90
 
   documentation:
     name: Generate Documentation
@@ -90,10 +81,8 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          toolchain: nightly
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@nightly
 
       - name: Generate API documentation
         run: cargo doc --no-deps --document-private-items --workspace

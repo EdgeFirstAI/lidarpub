@@ -59,9 +59,9 @@ jobs:
           # Install Python dependencies for validation scripts
           pip install jsonschema requests
           
-          # Install CycloneDX CLI for SBOM merging (v0.29.1)
+          # Install CycloneDX CLI for SBOM merging
           CYCLONEDX_URL="https://github.com/CycloneDX/cyclonedx-cli/releases/latest/download/cyclonedx-linux-x64"
-          CYCLONEDX_SHA256="1daceab1a7613603072db34d406659f0865623a4f137637440764cb9aa31236c"
+          CYCLONEDX_SHA256="6c5ed6321ee3bb3c268b6d19477dbcd5509a757f118bed4b6508fe9fbbdc2a5b"
           
           curl -L "$CYCLONEDX_URL" -o cyclonedx
           echo "$CYCLONEDX_SHA256  cyclonedx" | sha256sum -c -
@@ -70,7 +70,8 @@ jobs:
 
       - name: Generate SBOM for Rust dependencies
         run: |
-          cargo cyclonedx --format json > sbom-rust.json
+          cargo cyclonedx --format json
+          mv lidarpub.cdx.json sbom-rust.json
           
           # Also generate human-readable license list
           cargo license --json > licenses.json
@@ -100,12 +101,15 @@ jobs:
 
       - name: Check for GPL violations
         run: |
-          if cargo license --json | grep -i "GPL"; then
-            echo "ERROR: GPL license detected in dependency tree!"
-            cargo license --json | grep -i "GPL"
+          # Check for GPL-only licenses (packages that ONLY offer GPL, not OR alternatives)
+          # Packages with "Apache-2.0 OR LGPL-2.1-or-later OR MIT" are fine - we use Apache/MIT
+          GPL_ONLY=$(cargo license --json | jq -r '.[] | select(.license | (test("GPL") and (test(" OR ") | not))) | "\(.name): \(.license)"')
+          if [ -n "$GPL_ONLY" ]; then
+            echo "ERROR: GPL-only license detected in dependency tree!"
+            echo "$GPL_ONLY"
             exit 1
           fi
-          echo "No GPL violations found"
+          echo "No GPL-only violations found"
 
   security-audit:
     name: Security Audit
