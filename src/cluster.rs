@@ -84,8 +84,7 @@ use kanal::Receiver;
 use tracing::error;
 use zenoh::bytes::{Encoding, ZBytes};
 
-use crate::ouster::Points;
-use crate::PointFieldType;
+use crate::{PointFieldType, ouster::Points};
 
 // If the receiver is empty, waits for the next message, otherwise returns the
 // most recent message on this receiver. If the receiver is closed, returns None
