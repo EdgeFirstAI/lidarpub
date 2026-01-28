@@ -59,7 +59,7 @@ Integration testing requires an Ouster LiDAR sensor connected to the network.
 # Build release binary
 cargo build --release
 
-# The binary is at target/release/lidarpub
+# The binary is at target/release/edgefirst-lidarpub
 ```
 
 ### Verifying Sensor Connectivity
@@ -81,22 +81,22 @@ curl http://os-122122000149.local/api/v1/sensor/metadata | jq '.config_params'
 
 ```bash
 # Basic usage - sensor hostname/IP is a positional argument
-./target/release/lidarpub os-122122000149.local
+./target/release/edgefirst-lidarpub os-122122000149.local
 
 # Match the sensor's configured lidar mode
-./target/release/lidarpub os-122122000149.local --lidar-mode 512x20
+./target/release/edgefirst-lidarpub os-122122000149.local --lidar-mode 512x20
 
 # Enable point cloud clustering
-./target/release/lidarpub os-122122000149.local --clustering
+./target/release/edgefirst-lidarpub os-122122000149.local --clustering
 
 # Specify azimuth field of view (degrees)
-./target/release/lidarpub os-122122000149.local --azimuth 0 180
+./target/release/edgefirst-lidarpub os-122122000149.local --azimuth 0 180
 
 # Enable Tracy profiler for performance analysis
-./target/release/lidarpub os-122122000149.local --tracy
+./target/release/edgefirst-lidarpub os-122122000149.local --tracy
 
 # Connect to a specific Zenoh router
-./target/release/lidarpub os-122122000149.local --connect tcp/192.168.1.1:7447
+./target/release/edgefirst-lidarpub os-122122000149.local --connect tcp/192.168.1.1:7447
 ```
 
 ### Verifying Output
@@ -136,32 +136,32 @@ After initialization completes, frame processing begins and point clouds are pub
 
 ```bash
 # Verify the sensor responds and publisher initializes
-timeout 30 ./target/release/lidarpub os-122122000149.local --lidar-mode 512x20
+timeout 30 ./target/release/edgefirst-lidarpub os-122122000149.local --lidar-mode 512x20
 ```
 
 #### 2. Different LiDAR Modes
 
 ```bash
 # Test each supported mode (must match sensor configuration)
-./target/release/lidarpub <sensor> --lidar-mode 512x10
-./target/release/lidarpub <sensor> --lidar-mode 1024x10
-./target/release/lidarpub <sensor> --lidar-mode 2048x10
-./target/release/lidarpub <sensor> --lidar-mode 512x20
-./target/release/lidarpub <sensor> --lidar-mode 1024x20
+./target/release/edgefirst-lidarpub <sensor> --lidar-mode 512x10
+./target/release/edgefirst-lidarpub <sensor> --lidar-mode 1024x10
+./target/release/edgefirst-lidarpub <sensor> --lidar-mode 2048x10
+./target/release/edgefirst-lidarpub <sensor> --lidar-mode 512x20
+./target/release/edgefirst-lidarpub <sensor> --lidar-mode 1024x20
 ```
 
 #### 3. Clustering Performance
 
 ```bash
 # Test with clustering enabled (CPU intensive)
-./target/release/lidarpub <sensor> --clustering --clustering-eps 256 --clustering-minpts 4
+./target/release/edgefirst-lidarpub <sensor> --clustering --clustering-eps 256 --clustering-minpts 4
 ```
 
 #### 4. Frame Transformation
 
 ```bash
 # Test with custom TF transform (translation + rotation)
-./target/release/lidarpub <sensor> --tf-vec 0.1 0 0.5 --tf-quat 0 0 0.707 0.707
+./target/release/edgefirst-lidarpub <sensor> --tf-vec 0.1 0 0.5 --tf-quat 0 0 0.707 0.707
 ```
 
 ## Troubleshooting
@@ -206,13 +206,13 @@ timeout 30 ./target/release/lidarpub os-122122000149.local --lidar-mode 512x20
 2. **Reduce resolution if CPU-bound:**
    ```bash
    # Use lower resolution mode
-   ./target/release/lidarpub <sensor> --lidar-mode 512x10
+   ./target/release/edgefirst-lidarpub <sensor> --lidar-mode 512x10
    ```
 
 3. **Disable clustering if not needed:**
    ```bash
    # Run without --clustering flag
-   ./target/release/lidarpub <sensor>
+   ./target/release/edgefirst-lidarpub <sensor>
    ```
 
 ### Zenoh Communication Issues
@@ -224,7 +224,7 @@ timeout 30 ./target/release/lidarpub os-122122000149.local --lidar-mode 512x20
 
 2. **Disable multicast if network doesn't support it:**
    ```bash
-   ./target/release/lidarpub <sensor> --no-multicast-scouting --connect tcp/<router>:7447
+   ./target/release/edgefirst-lidarpub <sensor> --no-multicast-scouting --connect tcp/<router>:7447
    ```
 
 ## Unit Tests

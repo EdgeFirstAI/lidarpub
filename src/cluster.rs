@@ -81,10 +81,10 @@ use edgefirst_schemas::{
     std_msgs::Header,
 };
 use kanal::Receiver;
-use lidarpub::ouster::Points;
 use tracing::error;
 use zenoh::bytes::{Encoding, ZBytes};
 
+use crate::ouster::Points;
 use crate::PointFieldType;
 
 // If the receiver is empty, waits for the next message, otherwise returns the

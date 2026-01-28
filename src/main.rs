@@ -6,6 +6,7 @@
 mod args;
 mod cluster;
 mod common;
+mod ouster;
 
 use args::Args;
 use clap::Parser as _;
@@ -18,11 +19,11 @@ use edgefirst_schemas::{
     std_msgs::Header,
 };
 use kanal::Receiver;
-use lidarpub::ouster::{
+use ndarray::Array2;
+use ouster::{
     BeamIntrinsics, Config, FrameBuilder, FrameReader, LidarDataFormat, Parameters, Points,
     SensorInfo,
 };
-use ndarray::Array2;
 use std::{
     io::{IsTerminal as _, Write as _},
     net::TcpStream,

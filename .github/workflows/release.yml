@@ -136,21 +136,21 @@ jobs:
           VERSION=${{ needs.prepare-release.outputs.version }}
 
           # Copy x86_64 binary
-          if [ -f artifacts/packages-x86_64/lidarpub-x86_64 ]; then
-            cp artifacts/packages-x86_64/lidarpub-x86_64 \
-               release-assets/lidarpub-linux-x86_64
+          if [ -f artifacts/packages-x86_64/edgefirst-lidarpub-x86_64 ]; then
+            cp artifacts/packages-x86_64/edgefirst-lidarpub-x86_64 \
+               release-assets/edgefirst-lidarpub-linux-x86_64
           fi
 
           # Copy ARM64 binary
-          if [ -f artifacts/packages-aarch64/lidarpub-aarch64 ]; then
-            cp artifacts/packages-aarch64/lidarpub-aarch64 \
-               release-assets/lidarpub-linux-aarch64
+          if [ -f artifacts/packages-aarch64/edgefirst-lidarpub-aarch64 ]; then
+            cp artifacts/packages-aarch64/edgefirst-lidarpub-aarch64 \
+               release-assets/edgefirst-lidarpub-linux-aarch64
           fi
 
           # Copy SBOM (filename is sbom-rust.json from cargo-cyclonedx)
           if [ -f artifacts/sbom/sbom-rust.json ]; then
             cp artifacts/sbom/sbom-rust.json \
-               release-assets/lidarpub-v${VERSION}-sbom.json
+               release-assets/edgefirst-lidarpub-v${VERSION}-sbom.json
           fi
 
           echo "Release assets prepared:"
@@ -169,14 +169,14 @@ jobs:
 
             | Platform | Binary |
             |----------|--------|
-            | Linux x86_64 | `lidarpub-linux-x86_64` |
-            | Linux ARM64 | `lidarpub-linux-aarch64` |
+            | Linux x86_64 | `edgefirst-lidarpub-linux-x86_64` |
+            | Linux ARM64 | `edgefirst-lidarpub-linux-aarch64` |
 
             ```bash
             # Download and install (ARM64 example for Maivin/Raivin)
-            wget https://github.com/EdgeFirstAI/lidarpub/releases/download/v${{ needs.prepare-release.outputs.version }}/lidarpub-linux-aarch64
-            chmod +x lidarpub-linux-aarch64
-            sudo mv lidarpub-linux-aarch64 /usr/local/bin/lidarpub
+            wget https://github.com/EdgeFirstAI/lidarpub/releases/download/v${{ needs.prepare-release.outputs.version }}/edgefirst-lidarpub-linux-aarch64
+            chmod +x edgefirst-lidarpub-linux-aarch64
+            sudo mv edgefirst-lidarpub-linux-aarch64 /usr/local/bin/edgefirst-lidarpub
             ```
 
             ## What's Changed

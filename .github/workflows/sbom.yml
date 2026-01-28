@@ -71,7 +71,7 @@ jobs:
       - name: Generate SBOM for Rust dependencies
         run: |
           cargo cyclonedx --format json
-          mv lidarpub.cdx.json sbom-rust.json
+          mv edgefirst-lidarpub.cdx.json sbom-rust.json
           
           # Also generate human-readable license list
           cargo license --json > licenses.json

@@ -60,12 +60,12 @@ jobs:
         run: cargo build --release
 
       - name: Strip binary
-        run: strip target/release/lidarpub
+        run: strip target/release/edgefirst-lidarpub
 
       - name: Create package
         run: |
           mkdir -p packages
-          cp target/release/lidarpub packages/lidarpub-${{ matrix.platform.name }}
+          cp target/release/edgefirst-lidarpub packages/edgefirst-lidarpub-${{ matrix.platform.name }}
 
       - name: Upload package artifacts
         uses: actions/upload-artifact@v4

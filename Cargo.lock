@@ -2769,6 +2769,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "18aade80d5e09429040243ce1143ddc08a92d7a22820ac512610410a4dd5214f"
 
 [[package]]
+name = "edgefirst-lidarpub"
+version = "1.4.2"
+dependencies = [
+ "clap",
+ "edgefirst-schemas",
+ "env_logger",
+ "etherparse",
+ "kanal",
+ "libc",
+ "log",
+ "ndarray 0.17.2",
+ "pcap-parser",
+ "rerun",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-journald",
+ "tracing-log",
+ "tracing-subscriber",
+ "tracing-tracy",
+ "tracy-client",
+ "ureq 3.1.4",
+ "zenoh",
+]
+
+[[package]]
 name = "edgefirst-schemas"
 version = "1.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4746,33 +4773,6 @@ dependencies = [
  "bitflags 2.10.0",
  "libc",
  "redox_syscall 0.7.0",
-]
-
-[[package]]
-name = "lidarpub"
-version = "1.4.1"
-dependencies = [
- "clap",
- "edgefirst-schemas",
- "env_logger",
- "etherparse",
- "kanal",
- "libc",
- "log",
- "ndarray 0.17.2",
- "pcap-parser",
- "rerun",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-journald",
- "tracing-log",
- "tracing-subscriber",
- "tracing-tracy",
- "tracy-client",
- "ureq 3.1.4",
- "zenoh",
 ]
 
 [[package]]
