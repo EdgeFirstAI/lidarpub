@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2025 Au-Zone Technologies. All Rights Reserved.
 
+// Allow these for API stability - methods intentionally take &self even though
+// types are Copy for potential future non-Copy changes, and some methods are
+// available for future use or testing purposes.
+#![allow(clippy::wrong_self_convention)]
+#![allow(dead_code)]
+
 use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -68,6 +74,7 @@ pub struct Parameters {
 }
 
 #[derive(Debug)]
+#[allow(clippy::enum_variant_names)]
 pub enum Error {
     IoError(std::io::Error),
     SystemTimeError(std::time::SystemTimeError),
