@@ -5,11 +5,11 @@ mod common;
 
 use clap::{Parser, builder::PossibleValuesParser};
 use common::TimestampMode;
-use kanal::{Receiver, Sender};
-use lidarpub::ouster::{
+use edgefirst_lidarpub::ouster::{
     BeamIntrinsics, Config, FrameBuilder, FrameReader, LidarDataFormat, Parameters, Points,
     SensorInfo,
 };
+use kanal::{Receiver, Sender};
 use log::error;
 use ndarray::Array2;
 use pcap_parser::{traits::PcapReaderIterator, *};
