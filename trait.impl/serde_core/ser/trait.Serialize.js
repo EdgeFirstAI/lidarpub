@@ -1,0 +1,9 @@
+(function() {
+    const implementors = Object.fromEntries([["edgefirst_lidarpub",[["impl <a class=\"trait\" href=\"https://docs.rs/serde_core/1.0.228/serde_core/ser/trait.Serialize.html\" title=\"trait serde_core::ser::Serialize\">Serialize</a> for <a class=\"struct\" href=\"edgefirst_lidarpub/ouster/struct.BeamIntrinsics.html\" title=\"struct edgefirst_lidarpub::ouster::BeamIntrinsics\">BeamIntrinsics</a>",0],["impl <a class=\"trait\" href=\"https://docs.rs/serde_core/1.0.228/serde_core/ser/trait.Serialize.html\" title=\"trait serde_core::ser::Serialize\">Serialize</a> for <a class=\"struct\" href=\"edgefirst_lidarpub/ouster/struct.Config.html\" title=\"struct edgefirst_lidarpub::ouster::Config\">Config</a>",0],["impl <a class=\"trait\" href=\"https://docs.rs/serde_core/1.0.228/serde_core/ser/trait.Serialize.html\" title=\"trait serde_core::ser::Serialize\">Serialize</a> for <a class=\"struct\" href=\"edgefirst_lidarpub/ouster/struct.LidarDataFormat.html\" title=\"struct edgefirst_lidarpub::ouster::LidarDataFormat\">LidarDataFormat</a>",0],["impl <a class=\"trait\" href=\"https://docs.rs/serde_core/1.0.228/serde_core/ser/trait.Serialize.html\" title=\"trait serde_core::ser::Serialize\">Serialize</a> for <a class=\"struct\" href=\"edgefirst_lidarpub/ouster/struct.Parameters.html\" title=\"struct edgefirst_lidarpub::ouster::Parameters\">Parameters</a>",0],["impl <a class=\"trait\" href=\"https://docs.rs/serde_core/1.0.228/serde_core/ser/trait.Serialize.html\" title=\"trait serde_core::ser::Serialize\">Serialize</a> for <a class=\"struct\" href=\"edgefirst_lidarpub/ouster/struct.SensorInfo.html\" title=\"struct edgefirst_lidarpub::ouster::SensorInfo\">SensorInfo</a>",0]]]]);
+    if (window.register_implementors) {
+        window.register_implementors(implementors);
+    } else {
+        window.pending_implementors = implementors;
+    }
+})()
+//{"start":59,"fragment_lengths":[1639]}

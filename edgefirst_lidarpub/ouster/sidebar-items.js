@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["AlertStatus","Error","ShotLimiting","ShutdownStatus"],"fn":["timestamp"],"struct":["BeamIntrinsics","ColumnHeader","ColumnHeaderSlice","Config","DataBlock","FrameBuilder","FrameReader","Header","HeaderSlice","LidarDataFormat","Parameters","Points","SensorInfo"]};
