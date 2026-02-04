@@ -6,31 +6,50 @@ use serde_json::json;
 use tracing::level_filters::LevelFilter;
 use zenoh::config::{Config, WhatAmI};
 
-use crate::common::TimestampMode;
+use crate::{common::TimestampMode, lidar::SensorType};
 
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
 pub struct Args {
+    /// Sensor type (ouster or robosense)
+    #[arg(long, env, default_value = "ouster", value_enum)]
+    pub sensor_type: SensorType,
+
     /// Connect to target device or pcap file.  If target is a valid pcap file,
     /// it will be used otherwise it will be tried as a hostname or IP address.
     #[arg(env)]
     pub target: String,
 
-    /// Azimuth field of view start and stop angles in degrees.  
+    // --- Ouster-specific options ---
+    /// Azimuth field of view start and stop angles in degrees.
     /// The 0 degree point is the rear connector of the LiDAR.
+    /// (Ouster only)
     #[arg(long, env, num_args = 2, value_names = ["START", "STOP"], value_delimiter=' ', default_value = "0 360")]
     pub azimuth: Vec<u32>,
 
     /// LiDAR column and refresh rate configuration.  The format is "COLxHZ".
-    #[arg(long, env, default_value = "1024x10", 
+    /// (Ouster only)
+    #[arg(long, env, default_value = "1024x10",
           value_parser = PossibleValuesParser::new(["512x10", "1024x10", "2048x10", "512x20", "1024x20",]))]
     pub lidar_mode: String,
 
     /// LiDAR timestamp mode.  If using the PTP1588 timestamp mode the LiDAR
     /// must be connected to a PTP1588 enabled network, the Maivin can provide
     /// this time through the ptp4l service.
+    /// (Ouster only)
     #[arg(long, env, default_value = "internal")]
     pub timestamp_mode: TimestampMode,
+
+    // --- Robosense-specific options ---
+    /// MSOP (Main data Stream Output Protocol) port for Robosense sensors.
+    /// (Robosense only)
+    #[arg(long, env, default_value = "6699")]
+    pub msop_port: u16,
+
+    /// DIFOP (Device Information Output Protocol) port for Robosense sensors.
+    /// (Robosense only)
+    #[arg(long, env, default_value = "7788")]
+    pub difop_port: u16,
 
     /// Frame transformation vector from the base_link
     #[arg(

@@ -1,20 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2025 Au-Zone Technologies. All Rights Reserved.
 
+//! Ouster LiDAR driver implementation.
+//!
+//! Supports OS0, OS1, OS2, and OSDome series sensors with the RNG15_RFL8_NIR8
+//! UDP profile.
+
 // Allow these for API stability - methods intentionally take &self even though
 // types are Copy for potential future non-Copy changes, and some methods are
 // available for future use or testing purposes.
 #![allow(clippy::wrong_self_convention)]
 #![allow(dead_code)]
 
+use crate::{
+    buffer::DoubleBuffer,
+    lidar::{
+        Error, FrameMetadata, LidarDriver, LidarDriverBuffered, LidarFrame, Points as LidarPoints,
+        timestamp,
+    },
+};
 use ndarray::Array2;
 use serde::{Deserialize, Serialize};
-use std::{
-    f32::consts::PI,
-    fmt,
-    simd::{LaneCount, Simd, SupportedLaneCount},
-};
+use std::{f32::consts::PI, fmt};
 use tracing::{info_span, instrument, warn};
+
+#[cfg(feature = "portable_simd")]
+use std::simd::Simd;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
@@ -71,58 +82,6 @@ pub struct Parameters {
     pub sensor_info: SensorInfo,
     pub lidar_data_format: LidarDataFormat,
     pub beam_intrinsics: BeamIntrinsics,
-}
-
-#[derive(Debug)]
-#[allow(clippy::enum_variant_names)]
-pub enum Error {
-    IoError(std::io::Error),
-    SystemTimeError(std::time::SystemTimeError),
-    ShapeError(ndarray::ShapeError),
-    UnsupportedDataFormat(String),
-    UnexpectedEndOfSlice(usize),
-    UnknownPacketType(u16),
-    TooManyColumns(usize),
-    InsufficientColumns(usize),
-    UnsupportedRows(usize),
-}
-
-impl std::error::Error for Error {}
-
-impl From<std::io::Error> for Error {
-    fn from(err: std::io::Error) -> Error {
-        Error::IoError(err)
-    }
-}
-
-impl From<std::time::SystemTimeError> for Error {
-    fn from(err: std::time::SystemTimeError) -> Error {
-        Error::SystemTimeError(err)
-    }
-}
-
-impl From<ndarray::ShapeError> for Error {
-    fn from(err: ndarray::ShapeError) -> Error {
-        Error::ShapeError(err)
-    }
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> std::fmt::Result {
-        match self {
-            Error::IoError(err) => write!(f, "io error: {}", err),
-            Error::SystemTimeError(err) => write!(f, "system time error: {}", err),
-            Error::ShapeError(err) => write!(f, "shape error: {}", err),
-            Error::UnsupportedDataFormat(format) => {
-                write!(f, "unsupported lidar data format: {}", format)
-            }
-            Error::UnexpectedEndOfSlice(len) => write!(f, "unexpected end of slice: {} bytes", len),
-            Error::UnknownPacketType(typ) => write!(f, "unknown packet type: {}", typ),
-            Error::TooManyColumns(cols) => write!(f, "too many columns: {}", cols),
-            Error::InsufficientColumns(cols) => write!(f, "insufficient columns: {}", cols),
-            Error::UnsupportedRows(rows) => write!(f, "unsupported number of rows: {}", rows),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -229,7 +188,7 @@ pub struct HeaderSlice<'a> {
 impl<'a> HeaderSlice<'a> {
     pub fn from_slice(slice: &'a [u8]) -> Result<HeaderSlice<'a>, Error> {
         if slice.len() < Header::LEN {
-            return Err(Error::UnexpectedEndOfSlice(slice.len()));
+            return Err(Error::UnexpectedEnd(slice.len()));
         }
 
         let packet_type = u16::from_le_bytes([slice[0], slice[1]]);
@@ -345,7 +304,7 @@ pub struct ColumnHeaderSlice<'a> {
 impl<'a> ColumnHeaderSlice<'a> {
     pub fn from_slice(slice: &'a [u8]) -> Result<ColumnHeaderSlice<'a>, Error> {
         if slice.len() < ColumnHeader::LEN {
-            return Err(Error::UnexpectedEndOfSlice(slice.len()));
+            return Err(Error::UnexpectedEnd(slice.len()));
         }
 
         Ok(ColumnHeaderSlice { slice })
@@ -385,7 +344,7 @@ impl<'a> ColumnHeaderSlice<'a> {
 
         if self.slice.len() < offset + DataBlock::LEN {
             let delta = offset + DataBlock::LEN - self.slice.len();
-            return Err(Error::UnexpectedEndOfSlice(delta));
+            return Err(Error::UnexpectedEnd(delta));
         }
 
         Ok(DataBlock {
@@ -413,16 +372,19 @@ impl DataBlock {
     pub const LEN: usize = 4;
 }
 
+/// Internal point storage for Ouster frame building
+///
+/// Uses SoA layout for SIMD-friendly processing.
 #[derive(Debug, Clone)]
-pub struct Points {
-    pub x: Vec<f32>,
-    pub y: Vec<f32>,
-    pub z: Vec<f32>,
-    pub l: Vec<u8>,
+struct Points {
+    x: Vec<f32>,
+    y: Vec<f32>,
+    z: Vec<f32>,
+    l: Vec<u8>,
 }
 
 impl Points {
-    pub fn new(len: usize) -> Self {
+    fn new(len: usize) -> Self {
         Points {
             x: vec![0f32; len],
             y: vec![0f32; len],
@@ -445,7 +407,7 @@ pub struct FrameReader {
 impl FrameReader {
     pub fn new(lidar_data_format: &LidarDataFormat) -> Result<FrameReader, Error> {
         if lidar_data_format.udp_profile_lidar != "RNG15_RFL8_NIR8" {
-            return Err(Error::UnsupportedDataFormat(
+            return Err(Error::UnsupportedFormat(
                 lidar_data_format.udp_profile_lidar.clone(),
             ));
         }
@@ -465,9 +427,9 @@ impl FrameReader {
         })
     }
 
-    pub fn update<F>(&mut self, slice: &[u8], complete: F) -> Result<(), Error>
+    pub fn update<F>(&mut self, slice: &[u8], mut complete: F) -> Result<(), Error>
     where
-        F: Fn(u64, u16, Array2<u16>, Array2<u8>),
+        F: FnMut(u64, u16, Array2<u16>, Array2<u8>),
     {
         let header = HeaderSlice::from_slice(slice)?;
 
@@ -511,7 +473,7 @@ impl FrameReader {
 pub struct FrameBuilder {
     pub rows: usize,
     pub cols: usize,
-    pub points: Points,
+    points: Points,
     pub n_points: usize,
     pub depth: Array2<u16>,
     pub reflect: Array2<u8>,
@@ -628,6 +590,17 @@ impl FrameBuilder {
         self.update_points();
     }
 
+    /// Update and write directly into a PointBuffer
+    pub fn update_into_buffer(
+        &mut self,
+        depth: &Array2<u16>,
+        reflect: &Array2<u8>,
+        buffer: &mut crate::buffer::PointBuffer,
+    ) {
+        self.update_images(depth, reflect);
+        self.update_points_into_buffer(buffer);
+    }
+
     #[instrument(skip_all, fields(rows = self.rows, cols = self.cols))]
     fn update_images(&mut self, depth: &Array2<u16>, reflect: &Array2<u8>) {
         let rows = self.rows;
@@ -672,40 +645,108 @@ impl FrameBuilder {
             }
         }
 
-        self.calculate_points::<4>(index);
+        self.calculate_points(index);
         self.n_points = index;
     }
 
+    /// Update points directly into a PointBuffer, computing range for each
+    /// point
+    #[instrument(skip_all, fields(rows = self.rows, cols = self.cols))]
+    fn update_points_into_buffer(&mut self, buffer: &mut crate::buffer::PointBuffer) {
+        let col_base = self.column_window[0] as i16;
+        let mut index = 0;
+
+        // Clear the buffer first
+        buffer.clear();
+
+        for row in 0..self.rows {
+            let col_offset = (col_base - self.pixel_shift_by_row[row]).max(0) as usize;
+
+            for col in self.crop.0..self.crop.1 {
+                self.range[index] = self.depth[[row, col]] as f32;
+                self.points.l[index] = self.reflect[[row, col]];
+
+                self.x_range_cache[index] = self.x_range[[row, col + col_offset]];
+                self.y_range_cache[index] = self.y_range[[row, col + col_offset]];
+
+                self.x_delta_cache[index] = self.x_delta[col + col_offset];
+                self.y_delta_cache[index] = self.y_delta[col + col_offset];
+
+                self.altitude[index] = self.altitude_angles[row];
+
+                index += 1;
+            }
+        }
+
+        // Calculate XYZ coordinates
+        self.calculate_points(index);
+        self.n_points = index;
+
+        // Copy into buffer with pre-computed range (in meters)
+        for i in 0..index {
+            let x = self.points.x[i];
+            let y = self.points.y[i];
+            let z = self.points.z[i];
+            let intensity = self.points.l[i];
+            // Compute actual distance in meters from XYZ
+            // Note: self.range[i] is in internal units, we compute true range
+            let range_m = (x * x + y * y + z * z).sqrt();
+            buffer.push(x, y, z, intensity, range_m);
+        }
+    }
+
+    /// Get direct access to internal points for legacy compatibility
+    pub fn points_x(&self) -> &[f32] {
+        &self.points.x[..self.n_points]
+    }
+
+    pub fn points_y(&self) -> &[f32] {
+        &self.points.y[..self.n_points]
+    }
+
+    pub fn points_z(&self) -> &[f32] {
+        &self.points.z[..self.n_points]
+    }
+
+    pub fn points_intensity(&self) -> &[u8] {
+        &self.points.l[..self.n_points]
+    }
+
+    /// Calculate XYZ coordinates from range data using SIMD (portable_simd
+    /// feature).
+    ///
+    /// Uses 4-wide SIMD lanes for processing.
+    #[cfg(feature = "portable_simd")]
     #[inline(never)]
-    fn calculate_points<const N: usize>(&mut self, len: usize)
-    where
-        LaneCount<N>: SupportedLaneCount,
-    {
-        let beam_to_lidar = Simd::<f32, N>::splat(self.beam_to_lidar[[2, 3]]);
-        let scale = Simd::<f32, N>::splat(0.001);
+    fn calculate_points(&mut self, len: usize) {
+        const LANES: usize = 4;
 
-        for index in (0..len).step_by(N) {
-            let r = Simd::<f32, N>::from_slice(&self.range[index..]);
+        let beam_to_lidar = Simd::<f32, LANES>::splat(self.beam_to_lidar[[2, 3]]);
+        let scale = Simd::<f32, LANES>::splat(0.001);
 
-            let x_range = Simd::<f32, N>::from_slice(&self.x_range_cache[index..]);
-            let x_delta = Simd::<f32, N>::from_slice(&self.x_delta_cache[index..]);
+        for index in (0..len).step_by(LANES) {
+            let r = Simd::<f32, LANES>::from_slice(&self.range[index..]);
+
+            let x_range = Simd::<f32, LANES>::from_slice(&self.x_range_cache[index..]);
+            let x_delta = Simd::<f32, LANES>::from_slice(&self.x_delta_cache[index..]);
             let x = r * x_range + x_delta;
             let x = x * scale;
             x.copy_to_slice(&mut self.points.x[index..]);
 
-            let y_range = Simd::<f32, N>::from_slice(&self.y_range_cache[index..]);
-            let y_delta = Simd::<f32, N>::from_slice(&self.y_delta_cache[index..]);
+            let y_range = Simd::<f32, LANES>::from_slice(&self.y_range_cache[index..]);
+            let y_delta = Simd::<f32, LANES>::from_slice(&self.y_delta_cache[index..]);
             let y = r * y_range + y_delta;
             let y = y * scale;
             y.copy_to_slice(&mut self.points.y[index..]);
 
-            let altitude = Simd::<f32, N>::from_slice(&self.altitude[index..]);
+            let altitude = Simd::<f32, LANES>::from_slice(&self.altitude[index..]);
             let z = r * altitude + beam_to_lidar;
             let z = z * scale;
             z.copy_to_slice(&mut self.points.z[index..]);
         }
 
-        for index in len - len % N..len {
+        // Handle remaining elements that don't fill a full SIMD lane
+        for index in len - len % LANES..len {
             let r = self.range[index];
             self.points.x[index] =
                 (r * self.x_range_cache[index] + self.x_delta_cache[index]) * 0.001;
@@ -714,26 +755,168 @@ impl FrameBuilder {
             self.points.z[index] = (r * self.altitude[index] + self.beam_to_lidar[[2, 3]]) * 0.001;
         }
     }
+
+    /// Calculate XYZ coordinates from range data using scalar code (fallback).
+    #[cfg(not(feature = "portable_simd"))]
+    #[inline(never)]
+    fn calculate_points(&mut self, len: usize) {
+        let beam_to_lidar_z = self.beam_to_lidar[[2, 3]];
+
+        for index in 0..len {
+            let r = self.range[index];
+            self.points.x[index] =
+                (r * self.x_range_cache[index] + self.x_delta_cache[index]) * 0.001;
+            self.points.y[index] =
+                (r * self.y_range_cache[index] + self.y_delta_cache[index]) * 0.001;
+            self.points.z[index] = (r * self.altitude[index] + beam_to_lidar_z) * 0.001;
+        }
+    }
 }
 
-#[cfg(target_os = "linux")]
-fn timestamp() -> Result<u64, Error> {
-    let mut tp = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    let err = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, &mut tp) };
-    if err != 0 {
-        return Err(std::io::Error::last_os_error().into());
+/// Ouster LiDAR driver implementing the common LidarDriver trait
+///
+/// This driver wraps the FrameReader and FrameBuilder to provide
+/// a unified interface for processing Ouster UDP packets.
+pub struct OusterDriver {
+    /// Frame reader for packet parsing
+    frame_reader: FrameReader,
+    /// Frame builder for point cloud computation
+    frame_builder: FrameBuilder,
+    /// Double buffer for zero-allocation operation
+    double_buffer: DoubleBuffer,
+    /// Pending frame data (depth, reflect) waiting to be processed
+    pending_frame: Option<(u64, u16, Array2<u16>, Array2<u8>)>,
+}
+
+impl OusterDriver {
+    /// Create a new Ouster driver from sensor parameters
+    pub fn new(params: &Parameters) -> Result<Self, Error> {
+        let frame_reader = FrameReader::new(&params.lidar_data_format)?;
+        let frame_builder = FrameBuilder::new(params);
+
+        let rows = frame_builder.rows;
+        let cols = frame_builder.cols;
+        let capacity = rows * cols;
+
+        Ok(Self {
+            frame_reader,
+            frame_builder,
+            double_buffer: DoubleBuffer::new(capacity),
+            pending_frame: None,
+        })
     }
 
-    Ok(tp.tv_sec as u64 * 1_000_000_000 + tp.tv_nsec as u64)
+    /// Get the number of rows in the frame
+    pub fn rows(&self) -> usize {
+        self.frame_builder.rows
+    }
+
+    /// Get the number of columns in the frame
+    pub fn cols(&self) -> usize {
+        self.frame_builder.cols
+    }
+
+    /// Get the crop boundaries
+    pub fn crop(&self) -> (usize, usize) {
+        self.frame_builder.crop
+    }
+
+    /// Get access to the range buffer (for clustering, legacy)
+    pub fn range(&self) -> &[f32] {
+        &self.frame_builder.range
+    }
+
+    /// Get the number of valid points in the last frame
+    pub fn n_points(&self) -> usize {
+        self.frame_builder.n_points
+    }
+
+    /// Get direct access to point X coordinates
+    pub fn points_x(&self) -> &[f32] {
+        self.frame_builder.points_x()
+    }
+
+    /// Get direct access to point Y coordinates
+    pub fn points_y(&self) -> &[f32] {
+        self.frame_builder.points_y()
+    }
+
+    /// Get direct access to point Z coordinates
+    pub fn points_z(&self) -> &[f32] {
+        self.frame_builder.points_z()
+    }
+
+    /// Get direct access to point intensities
+    pub fn points_intensity(&self) -> &[u8] {
+        self.frame_builder.points_intensity()
+    }
 }
 
-#[cfg(not(target_os = "linux"))]
-fn timestamp() -> Result<u64, Error> {
-    // Fallback to a simple monotonic clock for non-Linux platforms
-    let now = std::time::SystemTime::now();
-    let duration = now.duration_since(std::time::UNIX_EPOCH)?;
-    Ok(duration.as_nanos() as u64)
+impl LidarDriver for OusterDriver {
+    fn process_packet(&mut self, data: &[u8]) -> Result<Option<LidarFrame>, Error> {
+        // Use the existing FrameReader to parse packets
+        self.frame_reader
+            .update(data, |timestamp, frame_id, depth, reflect| {
+                self.pending_frame = Some((timestamp, frame_id, depth, reflect));
+            })?;
+
+        // Check if we have a complete frame
+        if let Some((timestamp, frame_id, depth, reflect)) = self.pending_frame.take() {
+            // Process the frame through FrameBuilder
+            self.frame_builder.update(&depth, &reflect);
+
+            // Convert to common Points type
+            let points = LidarPoints {
+                x: self.frame_builder.points_x().to_vec(),
+                y: self.frame_builder.points_y().to_vec(),
+                z: self.frame_builder.points_z().to_vec(),
+                intensity: self.frame_builder.points_intensity().to_vec(),
+            };
+
+            Ok(Some(LidarFrame {
+                timestamp,
+                frame_id: frame_id as u32,
+                points,
+                n_points: self.frame_builder.n_points,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl LidarDriverBuffered for OusterDriver {
+    fn process_packet_buffered(&mut self, data: &[u8]) -> Result<Option<FrameMetadata>, Error> {
+        // Use the existing FrameReader to parse packets
+        self.frame_reader
+            .update(data, |timestamp, frame_id, depth, reflect| {
+                self.pending_frame = Some((timestamp, frame_id, depth, reflect));
+            })?;
+
+        // Check if we have a complete frame
+        if let Some((timestamp, frame_id, depth, reflect)) = self.pending_frame.take() {
+            // Process the frame directly into the filling buffer
+            let filling = self.double_buffer.filling_mut();
+            self.frame_builder
+                .update_into_buffer(&depth, &reflect, filling);
+
+            let metadata = FrameMetadata {
+                timestamp,
+                frame_id: frame_id as u32,
+                n_points: self.frame_builder.n_points,
+            };
+
+            Ok(Some(metadata))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn buffer(&self) -> &DoubleBuffer {
+        &self.double_buffer
+    }
+
+    fn buffer_mut(&mut self) -> &mut DoubleBuffer {
+        &mut self.double_buffer
+    }
 }

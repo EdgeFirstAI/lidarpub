@@ -11,11 +11,14 @@ name = "edgefirst-lidarpub"
 path = "src/main.rs"
 
 [[example]]
-name = "lidar_rerun"
+name = "lidar_viewer"
 required-features = ["rerun"]
 
 [features]
 default = ["tracy"]
+# Enable portable_simd for non-aarch64 targets when using nightly Rust.
+# On aarch64, native NEON intrinsics are always used regardless of this feature.
+portable_simd = []
 rerun = ["dep:rerun", "dep:etherparse", "dep:pcap-parser"]
 tracy = ["tracing-tracy/enable", "tracy-client/enable"]
 profiling = [
@@ -26,7 +29,7 @@ profiling = [
 ]
 
 [dependencies]
-clap = { version = "4.5.55", features = ["derive", "env"] }
+clap = { version = "4.5.57", features = ["derive", "env"] }
 edgefirst-schemas = "1.5.2"
 env_logger = "0.11.8"
 etherparse = { version = "0.19.0", optional = true }
@@ -35,7 +38,7 @@ libc = "0.2.180"
 log = "0.4.29"
 ndarray = "0.17.2"
 pcap-parser = { version = "0.17.0", optional = true }
-rerun = { version = "0.28.2", optional = true, features = ["clap"] }
+rerun = { version = "0.29.0", optional = true, features = ["clap"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 tokio = { version = "1.49.0", features = [
@@ -73,3 +76,7 @@ debug = false
 inherits = "release"
 strip = false
 debug = true
+
+[[bench]]
+name = "format_points_bench"
+harness = false

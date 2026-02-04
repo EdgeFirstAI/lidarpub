@@ -1,12 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2025 Au-Zone Technologies. All Rights Reserved.
 
-#![feature(portable_simd)]
+//! Point cloud formatting uses architecture-specific SIMD optimizations:
+//! - aarch64: Native NEON intrinsics (stable Rust)
+//! - x86_64/other with `portable_simd` feature: std::simd (nightly Rust)
+//! - Fallback: Scalar implementation (stable Rust)
+
+#![cfg_attr(
+    all(feature = "portable_simd", not(target_arch = "aarch64")),
+    feature(portable_simd)
+)]
 
 mod args;
+mod buffer;
 mod cluster;
 mod common;
+mod formats;
+mod lidar;
 mod ouster;
+mod robosense;
 
 use args::Args;
 use clap::Parser as _;
@@ -14,25 +26,24 @@ use cluster::cluster_thread;
 use edgefirst_schemas::{
     builtin_interfaces::Time,
     geometry_msgs::{Quaternion, Transform, TransformStamped, Vector3},
-    sensor_msgs::{Image, PointCloud2, PointField},
+    sensor_msgs::PointCloud2,
     serde_cdr,
     std_msgs::Header,
 };
-use kanal::Receiver;
-use ndarray::Array2;
-use ouster::{
-    BeamIntrinsics, Config, FrameBuilder, FrameReader, LidarDataFormat, Parameters, Points,
-    SensorInfo,
-};
+use formats::{format_points_13byte, standard_xyz_intensity_fields};
+use lidar::{LidarDriver, LidarFrame, Points, SensorType};
+use ouster::{BeamIntrinsics, Config, LidarDataFormat, Parameters, SensorInfo};
+use robosense::RobosenseDriver;
 use std::{
     io::{IsTerminal as _, Write as _},
     net::TcpStream,
-    simd::{Simd, ToBytes as _},
+    sync::{Arc, Mutex},
     thread::sleep,
     time::{Duration, Instant, SystemTime},
 };
+
 use tokio::net::UdpSocket;
-use tracing::{Instrument, debug, error, info, info_span, trace};
+use tracing::{debug, error, info, trace};
 use tracing_subscriber::{Layer as _, Registry, layer::SubscriberExt as _};
 use tracy_client::frame_mark;
 use zenoh::{
@@ -45,19 +56,6 @@ use zenoh::{
 #[global_allocator]
 static GLOBAL: tracy_client::ProfiledAllocator<std::alloc::System> =
     tracy_client::ProfiledAllocator::new(std::alloc::System, 100);
-
-#[derive(Debug)]
-#[allow(dead_code)]
-pub enum PointFieldType {
-    INT8 = 1,
-    UINT8 = 2,
-    INT16 = 3,
-    UINT16 = 4,
-    INT32 = 5,
-    UINT32 = 6,
-    FLOAT32 = 7,
-    FLOAT64 = 8,
-}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -90,6 +88,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tokio::spawn(tf_static_loop(session.clone(), args.clone()));
 
+    match args.sensor_type {
+        SensorType::Ouster => run_ouster(session, args).await,
+        SensorType::Robosense => run_robosense(session, args).await,
+    }
+}
+
+/// Run the Ouster LiDAR sensor
+async fn run_ouster(session: Session, args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let local = {
         let stream = TcpStream::connect(format!("{}:80", &args.target))?;
         stream.local_addr()?.ip()
@@ -164,7 +170,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     debug!("{:?}", params);
-    let mut frame_reader = FrameReader::new(&params.lidar_data_format)?;
+
+    // Create OusterDriver
+    let driver = ouster::OusterDriver::new(&params)?;
+    let rows = driver.rows();
+    let cols = driver.cols();
 
     // On Linux [::] will bind to IPv4 and IPv6 but not on Windows so we bind
     // according to the local address IP version.
@@ -173,48 +183,83 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         false => format!("[::]:{}", config.udp_port_lidar),
     };
 
-    common::set_process_priority();
-    let sock = UdpSocket::bind(bind_addr).await?;
-    let sock = common::set_socket_bufsize(sock.into_std()?, 16 * 1024 * 1024);
-    let sock = UdpSocket::from_std(sock)?;
+    run_lidar_loop(session, args, driver, &bind_addr, rows, cols).await
+}
 
-    let mut buf = [0u8; 16 * 1024];
-    let (tx, rx) = kanal::bounded(128);
+/// Run the Robosense E1R LiDAR sensor
+async fn run_robosense(session: Session, args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    let driver = Arc::new(Mutex::new(RobosenseDriver::new()));
 
-    std::thread::Builder::new()
-        .name("processor".to_string())
-        .spawn(move || {
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(frame_processor(session, args, params, rx));
-        })?;
-
-    loop {
-        let len = match sock.recv_from(&mut buf).await {
-            Ok((len, _)) => len,
+    // Start DIFOP listener for device information
+    let difop_driver = driver.clone();
+    let difop_port = args.difop_port;
+    tokio::spawn(async move {
+        let bind_addr = format!("0.0.0.0:{}", difop_port);
+        let sock = match UdpSocket::bind(&bind_addr).await {
+            Ok(s) => s,
             Err(e) => {
-                error!("udp_read recv error: {:?}", e);
-                continue;
+                error!("Failed to bind DIFOP socket on {}: {:?}", bind_addr, e);
+                return;
             }
         };
+        info!("Listening for DIFOP packets on port {}", difop_port);
 
-        frame_reader.update(&buf[..len], |timestamp, frame_id, depth, reflect| match tx
-            .send((timestamp, frame_id, depth, reflect))
-        {
-            Ok(_) => {}
-            Err(e) => error!("frame send error: {:?}", e),
-        })?;
+        let mut buf = [0u8; 512];
+        loop {
+            match sock.recv(&mut buf).await {
+                Ok(len) => {
+                    if let Ok(mut driver) = difop_driver.lock() {
+                        if let Err(e) = driver.process_difop(&buf[..len]) {
+                            debug!("DIFOP parse error: {:?}", e);
+                        } else {
+                            let info = driver.device_info();
+                            trace!(
+                                serial = %info.serial_string(),
+                                version = %info.version_string(),
+                                "DIFOP received"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("DIFOP recv error: {:?}", e);
+                }
+            }
+        }
+    });
+
+    // E1R doesn't have a fixed row/col structure like Ouster
+    // Use approximate values for clustering (not typically used with E1R)
+    let rows = 1;
+    let cols = 30_000; // ~26k points per frame
+
+    let bind_addr = format!("0.0.0.0:{}", args.msop_port);
+    info!("Listening for MSOP packets on port {}", args.msop_port);
+
+    // Wrap the driver in a struct that can be used with run_lidar_loop
+    let driver = RobosenseDriverWrapper(driver);
+
+    run_lidar_loop(session, args, driver, &bind_addr, rows, cols).await
+}
+
+/// Wrapper to allow shared RobosenseDriver with DIFOP thread
+struct RobosenseDriverWrapper(Arc<Mutex<RobosenseDriver>>);
+
+impl LidarDriver for RobosenseDriverWrapper {
+    fn process_packet(&mut self, data: &[u8]) -> Result<Option<LidarFrame>, lidar::Error> {
+        self.0.lock().unwrap().process_packet(data)
     }
 }
 
-async fn frame_processor(
+/// Generic lidar processing loop
+async fn run_lidar_loop<D: LidarDriver>(
     session: Session,
     args: Args,
-    params: Parameters,
-    rx: Receiver<(u64, u16, Array2<u16>, Array2<u8>)>,
-) {
+    mut driver: D,
+    bind_addr: &str,
+    rows: usize,
+    cols: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
     let points_publisher = session
         .declare_publisher(format!("{}/points", args.lidar_topic))
         .priority(Priority::DataHigh)
@@ -229,22 +274,7 @@ async fn frame_processor(
         .await
         .unwrap();
 
-    let depth_publisher = session
-        .declare_publisher(format!("{}/depth", args.lidar_topic))
-        .priority(Priority::DataHigh)
-        .congestion_control(CongestionControl::Drop)
-        .await
-        .unwrap();
-
-    let reflect_publisher = session
-        .declare_publisher(format!("{}/reflect", args.lidar_topic))
-        .priority(Priority::DataHigh)
-        .congestion_control(CongestionControl::Drop)
-        .await
-        .unwrap();
-
-    let mut builder = FrameBuilder::new(&params);
-
+    // Set up clustering if enabled
     let (tx_cluster, rx_cluster) = kanal::bounded(8);
     if args.clustering {
         let args_ = args.clone();
@@ -258,87 +288,86 @@ async fn frame_processor(
                     .block_on(cluster_thread(
                         rx_cluster,
                         cluster_publisher,
-                        builder.rows,
-                        builder.crop.1 - builder.crop.0,
+                        rows,
+                        cols,
                         args_,
                     ));
             }) {
-            Ok(_) => {}
+            Ok(_) => info!("Clustering thread started"),
             Err(e) => error!("Could not start clustering thread: {:?}", e),
         };
     }
 
+    common::set_process_priority();
+    let sock = UdpSocket::bind(bind_addr).await?;
+    let sock = common::set_socket_bufsize(sock.into_std()?, 16 * 1024 * 1024);
+    let sock = UdpSocket::from_std(sock)?;
+
+    let mut buf = [0u8; 16 * 1024];
+
+    info!("Starting LiDAR processing loop");
+
     loop {
-        let (timestamp, frame_id, depth, reflect) = rx.recv().unwrap();
-
-        let span = info_span!("frame");
-        async {
-            builder.update(&depth, &reflect);
-
-            trace!(
-                timestamp = timestamp,
-                frame_id = frame_id,
-                n_points = builder.n_points,
-                "publishing frame"
-            );
-
-            let timestamp = Time::from_nanos(timestamp);
-            if args.clustering {
-                let _ = tx_cluster.send((
-                    builder.range[0..builder.n_points].to_vec(),
-                    builder.points.clone(),
-                    timestamp.clone(),
-                ));
+        let len = match sock.recv(&mut buf).await {
+            Ok(len) => len,
+            Err(e) => {
+                error!("UDP recv error: {:?}", e);
+                continue;
             }
+        };
 
-            let (msg, enc) = format_points(
-                &builder.points,
-                builder.n_points,
-                timestamp.clone(),
-                args.frame_id.clone(),
-            )
-            .unwrap();
-            match points_publisher.put(msg).encoding(enc).await {
-                Ok(_) => {}
-                Err(e) => error!("publish points error: {:?}", e),
+        match driver.process_packet(&buf[..len]) {
+            Ok(Some(frame)) => {
+                trace!(
+                    timestamp = frame.timestamp,
+                    frame_id = frame.frame_id,
+                    n_points = frame.n_points,
+                    "publishing frame"
+                );
+
+                let timestamp = Time::from_nanos(frame.timestamp);
+
+                // Send to clustering if enabled
+                if args.clustering {
+                    // For clustering we need range data - compute from XYZ
+                    let ranges: Vec<f32> = (0..frame.n_points)
+                        .map(|i| {
+                            let x = frame.points.x[i];
+                            let y = frame.points.y[i];
+                            let z = frame.points.z[i];
+                            (x * x + y * y + z * z).sqrt()
+                        })
+                        .collect();
+                    let _ = tx_cluster.send((ranges, frame.points.clone(), timestamp.clone()));
+                }
+
+                // Format and publish point cloud
+                let (msg, enc) = format_points(
+                    &frame.points,
+                    frame.n_points,
+                    timestamp,
+                    args.frame_id.clone(),
+                )?;
+
+                if let Err(e) = points_publisher.put(msg).encoding(enc).await {
+                    error!("publish points error: {:?}", e);
+                }
+
+                args.tracy.then(frame_mark);
             }
-
-            let (msg, enc) = format_depth(
-                &builder.depth,
-                &builder.crop,
-                timestamp.clone(),
-                args.frame_id.clone(),
-            )
-            .unwrap();
-            match depth_publisher.put(msg).encoding(enc).await {
-                Ok(_) => {}
-                Err(e) => error!("depth publish error: {:?}", e),
+            Ok(None) => {
+                // More packets needed to complete frame
             }
-
-            let (msg, enc) = format_reflect(
-                &builder.reflect,
-                &builder.crop,
-                timestamp,
-                args.frame_id.clone(),
-            )
-            .unwrap();
-            match reflect_publisher.put(msg).encoding(enc).await {
-                Ok(_) => {}
-                Err(e) => error!("reflect publish error: {:?}", e),
+            Err(e) => {
+                debug!("Packet processing error: {:?}", e);
             }
-
-            // match tokio::try_join!(points_span, depth_span, reflect_span)
-            // {     Ok(_) => trace!("{} message sent",
-            // args.lidar_topic),     Err(e) => error!("{}
-            // message error: {:?}", args.lidar_topic, e), }
         }
-        .instrument(span)
-        .await;
-
-        args.tracy.then(frame_mark);
     }
 }
 
+/// Format point cloud data into a PointCloud2 message.
+///
+/// Uses the shared SIMD formatters from the formats module.
 #[inline(never)]
 fn format_points(
     points: &Points,
@@ -346,82 +375,10 @@ fn format_points(
     timestamp: Time,
     frame_id: String,
 ) -> Result<(ZBytes, Encoding), serde_cdr::Error> {
-    const N: usize = 4;
+    let fields = standard_xyz_intensity_fields();
 
-    let fields = vec![
-        PointField {
-            name: String::from("x"),
-            offset: 0,
-            datatype: PointFieldType::FLOAT32 as u8,
-            count: 1,
-        },
-        PointField {
-            name: String::from("y"),
-            offset: 4,
-            datatype: PointFieldType::FLOAT32 as u8,
-            count: 1,
-        },
-        PointField {
-            name: String::from("z"),
-            offset: 8,
-            datatype: PointFieldType::FLOAT32 as u8,
-            count: 1,
-        },
-        PointField {
-            name: String::from("reflect"),
-            offset: 12,
-            datatype: PointFieldType::UINT8 as u8,
-            count: 1,
-        },
-    ];
-
-    let mut data = vec![0u8; 13 * n_points];
-
-    for index in (0..n_points).step_by(N) {
-        let x = Simd::<f32, N>::from_slice(&points.x[index..index + N]);
-        let x = x.to_le_bytes();
-        let y = Simd::<f32, N>::from_slice(&points.y[index..index + N]);
-        let y = y.to_le_bytes();
-        let z = Simd::<f32, N>::from_slice(&points.z[index..index + N]);
-        let z = z.to_le_bytes();
-
-        let out = index * 13;
-        data[out..out + 4].copy_from_slice(&x[..4]);
-        data[out + 4..out + 8].copy_from_slice(&y[..4]);
-        data[out + 8..out + 12].copy_from_slice(&z[..4]);
-        data[out + 12] = points.l[index];
-
-        let out = (index + 1) * 13;
-        data[out..out + 4].copy_from_slice(&x[4..8]);
-        data[out + 4..out + 8].copy_from_slice(&y[4..8]);
-        data[out + 8..out + 12].copy_from_slice(&z[4..8]);
-        data[out + 12] = points.l[index];
-
-        let out = (index + 2) * 13;
-        data[out..out + 4].copy_from_slice(&x[8..12]);
-        data[out + 4..out + 8].copy_from_slice(&y[8..12]);
-        data[out + 8..out + 12].copy_from_slice(&z[8..12]);
-        data[out + 12] = points.l[index];
-
-        let out = (index + 3) * 13;
-        data[out..out + 4].copy_from_slice(&x[12..16]);
-        data[out + 4..out + 8].copy_from_slice(&y[12..16]);
-        data[out + 8..out + 12].copy_from_slice(&z[12..16]);
-        data[out + 12] = points.l[index];
-    }
-
-    for index in n_points - n_points % N..n_points {
-        let x = points.x[index].to_le_bytes();
-        let y = points.y[index].to_le_bytes();
-        let z = points.z[index].to_le_bytes();
-        let l = points.l[index];
-
-        let out = index * 13;
-        data[out..out + 4].copy_from_slice(&x);
-        data[out + 4..out + 8].copy_from_slice(&y);
-        data[out + 8..out + 12].copy_from_slice(&z);
-        data[out + 12] = l;
-    }
+    // Use the shared SIMD formatter
+    let data = format_points_13byte(&points.x, &points.y, &points.z, &points.intensity, n_points);
 
     let msg = PointCloud2 {
         header: Header {
@@ -440,82 +397,6 @@ fn format_points(
 
     let msg = ZBytes::from(serde_cdr::serialize(&msg)?);
     let enc = Encoding::APPLICATION_CDR.with_schema("sensor_msgs/msg/PointCloud2");
-
-    Ok((msg, enc))
-}
-
-#[inline(never)]
-fn format_depth(
-    depth: &Array2<u16>,
-    crop: &(usize, usize),
-    timestamp: Time,
-    frame_id: String,
-) -> Result<(ZBytes, Encoding), serde_cdr::Error> {
-    const N: usize = 8;
-
-    let depth = depth
-        .slice(ndarray::s![.., crop.0..crop.1])
-        .as_standard_layout()
-        .to_owned();
-    let (height, width) = depth.dim();
-    let depth = depth.as_slice().unwrap();
-    let mut data = vec![0u8; height * width * 2];
-
-    for index in (0..height * width).step_by(N) {
-        let x = Simd::<u16, N>::from_slice(&depth[index..]);
-        let x = x.to_le_bytes();
-
-        let out = index * 2;
-        x.copy_to_slice(&mut data[out..out + 16]);
-    }
-
-    let msg = Image {
-        header: Header {
-            stamp: timestamp,
-            frame_id,
-        },
-        height: height as u32,
-        width: width as u32,
-        encoding: "mono16".to_owned(),
-        is_bigendian: 0,
-        step: width as u32 * 2,
-        data,
-    };
-
-    let msg = ZBytes::from(serde_cdr::serialize(&msg)?);
-    let enc = Encoding::APPLICATION_CDR.with_schema("sensor_msgs/msg/Image");
-
-    Ok((msg, enc))
-}
-
-#[inline(never)]
-fn format_reflect(
-    reflect: &Array2<u8>,
-    crop: &(usize, usize),
-    timestamp: Time,
-    frame_id: String,
-) -> Result<(ZBytes, Encoding), serde_cdr::Error> {
-    let reflect = reflect
-        .slice(ndarray::s![.., crop.0..crop.1])
-        .as_standard_layout()
-        .to_owned();
-    let (height, width) = reflect.dim();
-
-    let msg = Image {
-        header: Header {
-            stamp: timestamp,
-            frame_id,
-        },
-        height: height as u32,
-        width: width as u32,
-        encoding: "mono8".to_owned(),
-        is_bigendian: 0,
-        step: width as u32,
-        data: reflect.as_slice().unwrap().to_vec(),
-    };
-
-    let msg = ZBytes::from(serde_cdr::serialize(&msg)?);
-    let enc = Encoding::APPLICATION_CDR.with_schema("sensor_msgs/msg/Image");
 
     Ok((msg, enc))
 }
