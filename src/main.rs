@@ -31,9 +31,9 @@ use edgefirst_schemas::{
     std_msgs::Header,
 };
 use formats::{format_points_13byte, standard_xyz_intensity_fields};
-use lidar::{LidarDriver, LidarFrame, Points, SensorType};
-use ouster::{BeamIntrinsics, Config, LidarDataFormat, Parameters, SensorInfo};
-use robosense::RobosenseDriver;
+use lidar::{LidarDriver, LidarFrame, SensorType};
+use ouster::{BeamIntrinsics, Config, LidarDataFormat, OusterLidarFrame, Parameters, SensorInfo};
+use robosense::{RobosenseDriver, RobosenseLidarFrame};
 use std::{
     io::{IsTerminal as _, Write as _},
     net::TcpStream,
@@ -43,7 +43,7 @@ use std::{
 };
 
 use tokio::net::UdpSocket;
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 use tracing_subscriber::{Layer as _, Registry, layer::SubscriberExt as _};
 use tracy_client::frame_mark;
 use zenoh::{
@@ -176,6 +176,10 @@ async fn run_ouster(session: Session, args: Args) -> Result<(), Box<dyn std::err
     let rows = driver.rows();
     let cols = driver.cols();
 
+    // Create client-owned frame with appropriate capacity
+    let capacity = rows * cols;
+    let frame = OusterLidarFrame::with_capacity(capacity);
+
     // On Linux [::] will bind to IPv4 and IPv6 but not on Windows so we bind
     // according to the local address IP version.
     let bind_addr = match local.is_ipv4() {
@@ -183,7 +187,7 @@ async fn run_ouster(session: Session, args: Args) -> Result<(), Box<dyn std::err
         false => format!("[::]:{}", config.udp_port_lidar),
     };
 
-    run_lidar_loop(session, args, driver, &bind_addr, rows, cols).await
+    run_lidar_loop(session, args, driver, frame, &bind_addr, rows, cols).await
 }
 
 /// Run the Robosense E1R LiDAR sensor
@@ -193,12 +197,19 @@ async fn run_robosense(session: Session, args: Args) -> Result<(), Box<dyn std::
     // Start DIFOP listener for device information
     let difop_driver = driver.clone();
     let difop_port = args.difop_port;
+
+    // Use oneshot channel to confirm DIFOP startup (PR #7 fix)
+    let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+
     tokio::spawn(async move {
         let bind_addr = format!("0.0.0.0:{}", difop_port);
         let sock = match UdpSocket::bind(&bind_addr).await {
-            Ok(s) => s,
+            Ok(s) => {
+                let _ = startup_tx.send(Ok(()));
+                s
+            }
             Err(e) => {
-                error!("Failed to bind DIFOP socket on {}: {:?}", bind_addr, e);
+                let _ = startup_tx.send(Err(e));
                 return;
             }
         };
@@ -228,6 +239,13 @@ async fn run_robosense(session: Session, args: Args) -> Result<(), Box<dyn std::
         }
     });
 
+    // Wait for DIFOP startup confirmation (PR #7 fix)
+    match startup_rx.await {
+        Ok(Ok(())) => info!("DIFOP listener started on port {}", difop_port),
+        Ok(Err(e)) => warn!("DIFOP bind failed: {} (continuing without DIFOP)", e),
+        Err(_) => warn!("DIFOP startup channel dropped"),
+    }
+
     // E1R doesn't have a fixed row/col structure like Ouster
     // Use approximate values for clustering (not typically used with E1R)
     let rows = 1;
@@ -236,26 +254,41 @@ async fn run_robosense(session: Session, args: Args) -> Result<(), Box<dyn std::
     let bind_addr = format!("0.0.0.0:{}", args.msop_port);
     info!("Listening for MSOP packets on port {}", args.msop_port);
 
+    // Create client-owned frame
+    let frame = RobosenseLidarFrame::new();
+
     // Wrap the driver in a struct that can be used with run_lidar_loop
     let driver = RobosenseDriverWrapper(driver);
 
-    run_lidar_loop(session, args, driver, &bind_addr, rows, cols).await
+    run_lidar_loop(session, args, driver, frame, &bind_addr, rows, cols).await
 }
 
 /// Wrapper to allow shared RobosenseDriver with DIFOP thread
 struct RobosenseDriverWrapper(Arc<Mutex<RobosenseDriver>>);
 
 impl LidarDriver for RobosenseDriverWrapper {
-    fn process_packet(&mut self, data: &[u8]) -> Result<Option<LidarFrame>, lidar::Error> {
-        self.0.lock().unwrap().process_packet(data)
+    fn process<F: lidar::LidarFrameWriter>(
+        &mut self,
+        frame: &mut F,
+        data: &[u8],
+    ) -> Result<bool, lidar::Error> {
+        // Handle mutex poison gracefully (PR #9 fix)
+        match self.0.lock() {
+            Ok(mut driver) => driver.process(frame, data),
+            Err(poisoned) => {
+                warn!("Driver mutex poisoned, recovering");
+                poisoned.into_inner().process(frame, data)
+            }
+        }
     }
 }
 
 /// Generic lidar processing loop
-async fn run_lidar_loop<D: LidarDriver>(
+async fn run_lidar_loop<D: LidarDriver, F: lidar::LidarFrameWriter + LidarFrame>(
     session: Session,
     args: Args,
     mut driver: D,
+    mut frame: F,
     bind_addr: &str,
     rows: usize,
     cols: usize,
@@ -316,38 +349,38 @@ async fn run_lidar_loop<D: LidarDriver>(
             }
         };
 
-        match driver.process_packet(&buf[..len]) {
-            Ok(Some(frame)) => {
+        // Process packet into client-owned frame
+        match driver.process(&mut frame, &buf[..len]) {
+            Ok(true) => {
+                // Frame is complete - process it
+                let n_points = frame.len();
+                let timestamp_ns = frame.timestamp();
+                let frame_id = frame.frame_id();
+
                 trace!(
-                    timestamp = frame.timestamp,
-                    frame_id = frame.frame_id,
-                    n_points = frame.n_points,
+                    timestamp = timestamp_ns,
+                    frame_id = frame_id,
+                    n_points = n_points,
                     "publishing frame"
                 );
 
-                let timestamp = Time::from_nanos(frame.timestamp);
+                let timestamp = Time::from_nanos(timestamp_ns);
 
                 // Send to clustering if enabled
                 if args.clustering {
-                    // For clustering we need range data - compute from XYZ
-                    let ranges: Vec<f32> = (0..frame.n_points)
-                        .map(|i| {
-                            let x = frame.points.x[i];
-                            let y = frame.points.y[i];
-                            let z = frame.points.z[i];
-                            (x * x + y * y + z * z).sqrt()
-                        })
-                        .collect();
-                    let _ = tx_cluster.send((ranges, frame.points.clone(), timestamp.clone()));
+                    // Use pre-computed range directly - NO sqrt needed! (PR #2 fix)
+                    let ranges: Vec<f32> = frame.range().to_vec();
+                    let points = lidar::Points {
+                        x: frame.x().to_vec(),
+                        y: frame.y().to_vec(),
+                        z: frame.z().to_vec(),
+                        intensity: frame.intensity().to_vec(),
+                    };
+                    let _ = tx_cluster.send((ranges, points, timestamp.clone()));
                 }
 
                 // Format and publish point cloud
-                let (msg, enc) = format_points(
-                    &frame.points,
-                    frame.n_points,
-                    timestamp,
-                    args.frame_id.clone(),
-                )?;
+                let (msg, enc) = format_points(&frame, timestamp, args.frame_id.clone())?;
 
                 if let Err(e) = points_publisher.put(msg).encoding(enc).await {
                     error!("publish points error: {:?}", e);
@@ -355,7 +388,7 @@ async fn run_lidar_loop<D: LidarDriver>(
 
                 args.tracy.then(frame_mark);
             }
-            Ok(None) => {
+            Ok(false) => {
                 // More packets needed to complete frame
             }
             Err(e) => {
@@ -369,16 +402,16 @@ async fn run_lidar_loop<D: LidarDriver>(
 ///
 /// Uses the shared SIMD formatters from the formats module.
 #[inline(never)]
-fn format_points(
-    points: &Points,
-    n_points: usize,
+fn format_points<F: LidarFrame>(
+    frame: &F,
     timestamp: Time,
     frame_id: String,
 ) -> Result<(ZBytes, Encoding), serde_cdr::Error> {
     let fields = standard_xyz_intensity_fields();
+    let n_points = frame.len();
 
     // Use the shared SIMD formatter
-    let data = format_points_13byte(&points.x, &points.y, &points.z, &points.intensity, n_points);
+    let data = format_points_13byte(frame.x(), frame.y(), frame.z(), frame.intensity(), n_points);
 
     let msg = PointCloud2 {
         header: Header {

@@ -7,12 +7,13 @@
 //!
 //! # Architecture
 //!
-//! The library uses a zero-allocation architecture for steady-state operation:
+//! The library uses a **client-owned frame** pattern for zero-allocation
+//! operation:
 //!
 //! ```text
 //! ┌─────────────────┐     ┌───────────────┐     ┌─────────────────┐
-//! │  PacketSource   │ ──► │  LidarDriver  │ ──► │  DoubleBuffer   │
-//! │  (UDP/pcap/test)│     │  (Ouster/RS)  │     │  (zero-alloc)   │
+//! │  PacketSource   │ ──► │  LidarDriver  │ ──► │  LidarFrame     │
+//! │  (UDP/pcap/test)│     │  (Ouster/RS)  │     │  (client-owned) │
 //! └─────────────────┘     └───────────────┘     └─────────────────┘
 //!                                                       │
 //!                                                       ▼
@@ -22,9 +23,17 @@
 //!                               └─────────────────────────────────────┘
 //! ```
 //!
+//! The client owns all frame objects and provides mutable references to the
+//! driver:
+//! 1. Client creates frames: `OusterLidarFrame::with_capacity(N)`
+//! 2. Client provides mutable reference: `driver.process(&mut frame, data)`
+//! 3. Driver writes points and metadata into the frame
+//! 4. When complete (returns `Ok(true)`), client owns the filled frame
+//! 5. Client can swap to another frame for the next fill cycle
+//!
 //! # Modules
 //!
-//! - [`buffer`]: Pre-allocated point buffers and double-buffer swap mechanism
+//! - [`buffer`]: Pre-allocated point buffers (legacy support)
 //! - [`formats`]: SIMD-optimized point cloud formatting
 //! - [`lidar`]: Common types, traits, and error handling
 //! - [`ouster`]: Ouster OS0/OS1/OS2/OSDome driver
@@ -36,18 +45,23 @@
 //!
 //! ```ignore
 //! use edgefirst_lidarpub::{
-//!     lidar::{LidarDriver, LidarDriverBuffered},
-//!     robosense::RobosenseDriver,
+//!     lidar::{LidarDriver, LidarFrame},
+//!     robosense::{RobosenseDriver, RobosenseLidarFrame},
 //! };
 //!
 //! let mut driver = RobosenseDriver::new();
+//! let mut frame = RobosenseLidarFrame::new();
 //!
 //! // Process packets
 //! loop {
 //!     let len = socket.recv(&mut buf)?;
-//!     if let Some(metadata) = driver.process_packet_buffered(&buf[..len])? {
-//!         let completed = driver.swap_buffer();
-//!         // Use completed.x(), completed.y(), etc.
+//!     if driver.process(&mut frame, &buf[..len])? {
+//!         // Frame complete - access point data directly
+//!         let x = frame.x();
+//!         let y = frame.y();
+//!         let z = frame.z();
+//!         let intensity = frame.intensity();
+//!         let range = frame.range();  // Pre-computed, no sqrt needed!
 //!     }
 //! }
 //! ```
@@ -65,7 +79,7 @@ pub mod robosense;
 // Re-exports for convenience
 pub use buffer::{DoubleBuffer, PointBuffer};
 pub use formats::PointFieldType;
-pub use lidar::{
-    Error, FrameMetadata, LidarDriver, LidarDriverBuffered, LidarFrame, Points, SensorType,
-};
+pub use lidar::{Error, LidarDriver, LidarFrame, LidarFrameWriter, Points, SensorType};
+pub use ouster::OusterLidarFrame;
 pub use packet_source::PacketSource;
+pub use robosense::RobosenseLidarFrame;

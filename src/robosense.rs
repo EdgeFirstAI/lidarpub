@@ -20,12 +20,7 @@
 //! - Device info: serial number, firmware version, network config, time sync
 //!   status
 
-use crate::{
-    buffer::DoubleBuffer,
-    lidar::{
-        Error, FrameMetadata, LidarDriver, LidarDriverBuffered, LidarFrame, Points, timestamp,
-    },
-};
+use crate::lidar::{Error, LidarDriver, LidarFrame, LidarFrameWriter, timestamp};
 
 /// MSOP packet sync bytes: 0x55, 0xaa, 0x5a, 0xa5
 const MSOP_SYNC: [u8; 4] = [0x55, 0xaa, 0x5a, 0xa5];
@@ -141,18 +136,129 @@ impl DeviceInfo {
     }
 }
 
+/// Robosense-specific LidarFrame implementation.
+///
+/// Stores point cloud data in Structure-of-Arrays layout for efficient SIMD
+/// processing. The client owns this frame and provides it to the driver.
+pub struct RobosenseLidarFrame {
+    x: Vec<f32>,
+    y: Vec<f32>,
+    z: Vec<f32>,
+    intensity: Vec<u8>,
+    range: Vec<f32>,
+    len: usize,
+    timestamp: u64,
+    frame_id: u32,
+}
+
+impl RobosenseLidarFrame {
+    /// Create a new frame with specified capacity.
+    ///
+    /// Memory is allocated once at construction; no allocations occur during
+    /// normal operation.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            x: vec![0.0; capacity],
+            y: vec![0.0; capacity],
+            z: vec![0.0; capacity],
+            intensity: vec![0; capacity],
+            range: vec![0.0; capacity],
+            len: 0,
+            timestamp: 0,
+            frame_id: 0,
+        }
+    }
+
+    /// Create a new frame with default capacity for Robosense E1R (~30k
+    /// points).
+    pub fn new() -> Self {
+        Self::with_capacity(POINTS_PER_FRAME)
+    }
+}
+
+impl Default for RobosenseLidarFrame {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// SAFETY: RobosenseLidarFrame contains only primitive types in Vecs,
+// which are inherently Send.
+unsafe impl Send for RobosenseLidarFrame {}
+
+impl LidarFrame for RobosenseLidarFrame {
+    fn reset(&mut self) {
+        self.len = 0;
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn timestamp(&self) -> u64 {
+        self.timestamp
+    }
+
+    fn frame_id(&self) -> u32 {
+        self.frame_id
+    }
+
+    fn x(&self) -> &[f32] {
+        &self.x[..self.len]
+    }
+
+    fn y(&self) -> &[f32] {
+        &self.y[..self.len]
+    }
+
+    fn z(&self) -> &[f32] {
+        &self.z[..self.len]
+    }
+
+    fn intensity(&self) -> &[u8] {
+        &self.intensity[..self.len]
+    }
+
+    fn range(&self) -> &[f32] {
+        &self.range[..self.len]
+    }
+
+    fn capacity(&self) -> usize {
+        self.x.len()
+    }
+}
+
+impl LidarFrameWriter for RobosenseLidarFrame {
+    fn set_timestamp(&mut self, ts: u64) {
+        self.timestamp = ts;
+    }
+
+    fn set_frame_id(&mut self, id: u32) {
+        self.frame_id = id;
+    }
+
+    fn push(&mut self, x: f32, y: f32, z: f32, intensity: u8, range: f32) -> bool {
+        if self.len >= self.capacity() {
+            return false;
+        }
+        self.x[self.len] = x;
+        self.y[self.len] = y;
+        self.z[self.len] = z;
+        self.intensity[self.len] = intensity;
+        self.range[self.len] = range;
+        self.len += 1;
+        true
+    }
+
+    fn set_len(&mut self, len: usize) {
+        self.len = len.min(self.capacity());
+    }
+}
+
 /// Robosense E1R LiDAR driver
 pub struct RobosenseDriver {
     /// Current frame ID (increments each frame)
     frame_id: u32,
-    /// Timestamp of current frame
-    timestamp: u64,
-    /// Double buffer for zero-allocation operation
-    double_buffer: DoubleBuffer,
-    /// Legacy point cloud buffer (for backward compatibility)
-    points: Points,
-    /// Number of points accumulated in current frame
-    n_points: usize,
     /// Last packet count (for frame boundary detection)
     last_pkt_cnt: u16,
     /// Device information from DIFOP
@@ -166,10 +272,6 @@ impl RobosenseDriver {
     pub fn new() -> Self {
         Self {
             frame_id: 0,
-            timestamp: 0,
-            double_buffer: DoubleBuffer::new(POINTS_PER_FRAME),
-            points: Points::new(POINTS_PER_FRAME),
-            n_points: 0,
             last_pkt_cnt: u16::MAX,
             device_info: DeviceInfo::default(),
             first_packet: true,
@@ -257,8 +359,8 @@ impl RobosenseDriver {
         })
     }
 
-    /// Parse a single data block and add the point to the buffer
-    fn parse_block(&mut self, block: &[u8]) -> Result<(), Error> {
+    /// Parse a single data block and add the point to the frame
+    fn parse_block<F: LidarFrameWriter>(&self, frame: &mut F, block: &[u8]) -> Result<(), Error> {
         if block.len() < BLOCK_SIZE {
             return Err(Error::UnexpectedEnd(block.len()));
         }
@@ -288,120 +390,28 @@ impl RobosenseDriver {
         let intensity = block[10];
 
         // PointAttribute: byte 11 (1 = normal, 2 = noisy)
-        let _attribute = block[11];
+        // let _attribute = block[11];
 
         // Compute XYZ coordinates
         let x = radius * dir_x;
         let y = radius * dir_y;
         let z = radius * dir_z;
 
-        // Add point to double buffer (with pre-computed range)
-        self.double_buffer
-            .filling_mut()
-            .push(x, y, z, intensity, radius);
-
-        // Also add to legacy points buffer for backward compatibility
-        if self.n_points < self.points.x.len() {
-            self.points.x[self.n_points] = x;
-            self.points.y[self.n_points] = y;
-            self.points.z[self.n_points] = z;
-            self.points.intensity[self.n_points] = intensity;
-            self.n_points += 1;
-        }
+        // Single write directly to client's frame (no dual buffer!)
+        // Range is provided by sensor protocol (radius in meters)
+        frame.push(x, y, z, intensity, radius);
 
         Ok(())
     }
 
     /// Check if this packet indicates a new frame boundary
     fn is_frame_boundary(&self, pkt_cnt: u16) -> bool {
-        // Frame boundary when packet count wraps (goes from high to 0)
-        // or on first packet
-        self.first_packet || (pkt_cnt < self.last_pkt_cnt && self.last_pkt_cnt != u16::MAX)
-    }
-
-    /// Finalize the current frame and return it (legacy interface)
-    fn finalize_frame(&mut self) -> LidarFrame {
-        let frame = LidarFrame {
-            timestamp: self.timestamp,
-            frame_id: self.frame_id,
-            points: self.points.clone(),
-            n_points: self.n_points,
-        };
-
-        // Reset for next frame
-        self.frame_id = self.frame_id.wrapping_add(1);
-        self.n_points = 0;
-
-        // Note: We intentionally do NOT zero the point buffers.
-        // The n_points counter tracks valid data - no need to clear old values.
-
-        frame
-    }
-
-    /// Finalize frame for buffered interface (zero-allocation)
-    #[allow(dead_code)] // Used by LidarDriverBuffered implementation
-    fn finalize_frame_buffered(&mut self) -> FrameMetadata {
-        let n_points = self.double_buffer.filling().len();
-
-        let metadata = FrameMetadata {
-            timestamp: self.timestamp,
-            frame_id: self.frame_id,
-            n_points,
-        };
-
-        // Reset for next frame
-        self.frame_id = self.frame_id.wrapping_add(1);
-        self.n_points = 0;
-
-        metadata
-    }
-
-    /// Process a packet using the buffered interface (returns metadata only)
-    #[allow(dead_code)] // Used by LidarDriverBuffered implementation
-    fn process_packet_internal(&mut self, data: &[u8]) -> Result<Option<FrameMetadata>, Error> {
-        // Validate packet size
-        if data.len() < MSOP_PACKET_SIZE {
-            return Err(Error::InvalidPacket(format!(
-                "MSOP packet too small: {} bytes, expected {}",
-                data.len(),
-                MSOP_PACKET_SIZE
-            )));
+        // First packet always starts a new frame
+        if self.first_packet {
+            return true;
         }
-
-        // Parse header
-        let header = self.parse_header(data)?;
-
-        // Check for frame boundary
-        let frame_complete = self.is_frame_boundary(header.pkt_cnt);
-        let mut result = None;
-
-        if frame_complete && !self.first_packet && !self.double_buffer.filling().is_empty() {
-            // Complete the previous frame
-            result = Some(self.finalize_frame_buffered());
-            // Swap buffers for the completed frame
-            self.double_buffer.swap();
-        }
-
-        // Update timestamp on first packet of new frame
-        if frame_complete || self.first_packet {
-            // Use local timestamp if available, otherwise use packet timestamp
-            self.timestamp = timestamp().unwrap_or(header.timestamp_ns);
-        }
-
-        self.first_packet = false;
-        self.last_pkt_cnt = header.pkt_cnt;
-
-        // Parse all data blocks
-        let data_start = MSOP_HEADER_SIZE;
-        for i in 0..BLOCKS_PER_PACKET {
-            let block_start = data_start + i * BLOCK_SIZE;
-            let block_end = block_start + BLOCK_SIZE;
-            if block_end <= data.len() {
-                self.parse_block(&data[block_start..block_end])?;
-            }
-        }
-
-        Ok(result)
+        // Frame boundary when packet count wraps (high → low)
+        pkt_cnt < self.last_pkt_cnt
     }
 }
 
@@ -412,7 +422,7 @@ impl Default for RobosenseDriver {
 }
 
 impl LidarDriver for RobosenseDriver {
-    fn process_packet(&mut self, data: &[u8]) -> Result<Option<LidarFrame>, Error> {
+    fn process<F: LidarFrameWriter>(&mut self, frame: &mut F, data: &[u8]) -> Result<bool, Error> {
         // Validate packet size
         if data.len() < MSOP_PACKET_SIZE {
             return Err(Error::InvalidPacket(format!(
@@ -426,50 +436,42 @@ impl LidarDriver for RobosenseDriver {
         let header = self.parse_header(data)?;
 
         // Check for frame boundary
-        let frame_complete = self.is_frame_boundary(header.pkt_cnt);
-        let mut result = None;
+        let is_boundary = self.is_frame_boundary(header.pkt_cnt);
+        let frame_complete = is_boundary && !self.first_packet && !frame.is_empty();
 
-        if frame_complete && !self.first_packet && self.n_points > 0 {
-            // Complete the previous frame
-            result = Some(self.finalize_frame());
-            // Also swap the double buffer
-            self.double_buffer.swap();
+        // If frame is complete, return early so client can consume it
+        // Next call will start fresh frame
+        if frame_complete {
+            // Increment frame_id for next frame
+            self.frame_id = self.frame_id.wrapping_add(1);
+            self.last_pkt_cnt = header.pkt_cnt;
+            self.first_packet = false;
+            return Ok(true);
         }
 
-        // Update timestamp on first packet of new frame
-        if frame_complete || self.first_packet {
+        // Start new frame if at boundary
+        if is_boundary {
+            frame.reset();
             // Use local timestamp if available, otherwise use packet timestamp
-            self.timestamp = timestamp().unwrap_or(header.timestamp_ns);
+            let ts = timestamp().unwrap_or(header.timestamp_ns);
+            frame.set_timestamp(ts);
+            frame.set_frame_id(self.frame_id);
         }
 
         self.first_packet = false;
         self.last_pkt_cnt = header.pkt_cnt;
 
-        // Parse all data blocks
+        // Parse all data blocks directly into frame
         let data_start = MSOP_HEADER_SIZE;
         for i in 0..BLOCKS_PER_PACKET {
             let block_start = data_start + i * BLOCK_SIZE;
             let block_end = block_start + BLOCK_SIZE;
             if block_end <= data.len() {
-                self.parse_block(&data[block_start..block_end])?;
+                self.parse_block(frame, &data[block_start..block_end])?;
             }
         }
 
-        Ok(result)
-    }
-}
-
-impl LidarDriverBuffered for RobosenseDriver {
-    fn process_packet_buffered(&mut self, data: &[u8]) -> Result<Option<FrameMetadata>, Error> {
-        self.process_packet_internal(data)
-    }
-
-    fn buffer(&self) -> &DoubleBuffer {
-        &self.double_buffer
-    }
-
-    fn buffer_mut(&mut self) -> &mut DoubleBuffer {
-        &mut self.double_buffer
+        Ok(false)
     }
 }
 
@@ -489,12 +491,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_robosense_frame_basic() {
+        let mut frame = RobosenseLidarFrame::with_capacity(100);
+        assert_eq!(frame.len(), 0);
+        assert!(frame.is_empty());
+        assert_eq!(frame.capacity(), 100);
+
+        frame.push(1.0, 2.0, 3.0, 128, 3.74);
+        assert_eq!(frame.len(), 1);
+        assert!(!frame.is_empty());
+        assert_eq!(frame.x()[0], 1.0);
+        assert_eq!(frame.y()[0], 2.0);
+        assert_eq!(frame.z()[0], 3.0);
+        assert_eq!(frame.intensity()[0], 128);
+        assert_eq!(frame.range()[0], 3.74);
+
+        frame.reset();
+        assert!(frame.is_empty());
+        assert_eq!(frame.capacity(), 100);
+    }
+
+    #[test]
+    fn test_robosense_frame_capacity() {
+        let mut frame = RobosenseLidarFrame::with_capacity(2);
+        assert!(frame.push(1.0, 1.0, 1.0, 1, 1.0));
+        assert!(frame.push(2.0, 2.0, 2.0, 2, 2.0));
+        assert!(!frame.push(3.0, 3.0, 3.0, 3, 3.0)); // At capacity
+        assert_eq!(frame.len(), 2);
+    }
+
+    #[test]
+    fn test_robosense_frame_metadata() {
+        let mut frame = RobosenseLidarFrame::new();
+        frame.set_timestamp(12345678);
+        frame.set_frame_id(42);
+        assert_eq!(frame.timestamp(), 12345678);
+        assert_eq!(frame.frame_id(), 42);
+    }
+
+    #[test]
     fn test_driver_creation() {
         let driver = RobosenseDriver::new();
         assert_eq!(driver.frame_id, 0);
-        assert_eq!(driver.n_points, 0);
         assert!(driver.first_packet);
-        assert_eq!(driver.double_buffer.capacity(), POINTS_PER_FRAME);
     }
 
     #[test]
@@ -528,18 +567,20 @@ mod tests {
     #[test]
     fn test_invalid_packet_size() {
         let mut driver = RobosenseDriver::new();
+        let mut frame = RobosenseLidarFrame::new();
         let small_packet = vec![0u8; 100];
-        let result = driver.process_packet(&small_packet);
+        let result = driver.process(&mut frame, &small_packet);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_invalid_sync_bytes() {
         let mut driver = RobosenseDriver::new();
+        let mut frame = RobosenseLidarFrame::new();
         let mut packet = vec![0u8; MSOP_PACKET_SIZE];
         // Wrong sync bytes
         packet[0..4].copy_from_slice(&[0x00, 0x00, 0x00, 0x00]);
-        let result = driver.process_packet(&packet);
+        let result = driver.process(&mut frame, &packet);
         assert!(result.is_err());
     }
 
@@ -574,9 +615,65 @@ mod tests {
     }
 
     #[test]
-    fn test_double_buffer_integration() {
+    fn test_frame_boundary_first_packet() {
         let driver = RobosenseDriver::new();
-        assert_eq!(driver.buffer().filling().len(), 0);
-        assert_eq!(driver.buffer().ready().len(), 0);
+        // First packet is always a boundary
+        assert!(driver.is_frame_boundary(0));
+        assert!(driver.is_frame_boundary(100));
+    }
+
+    #[test]
+    fn test_frame_boundary_wrap() {
+        let mut driver = RobosenseDriver::new();
+        driver.first_packet = false;
+        driver.last_pkt_cnt = 630;
+
+        // pkt_cnt wraps from 630 to 0 → frame boundary
+        assert!(driver.is_frame_boundary(0));
+        // pkt_cnt wraps from 630 to 10 → frame boundary
+        assert!(driver.is_frame_boundary(10));
+        // Normal increment → not boundary
+        assert!(!driver.is_frame_boundary(631));
+    }
+
+    #[test]
+    fn test_multi_packet_frame_assembly() {
+        let mut driver = RobosenseDriver::new();
+        let mut frame = RobosenseLidarFrame::with_capacity(50_000);
+
+        // Create valid MSOP packets with incrementing packet counts
+        fn make_msop_packet(pkt_cnt: u16) -> Vec<u8> {
+            let mut packet = vec![0u8; MSOP_PACKET_SIZE];
+            // Sync bytes
+            packet[0..4].copy_from_slice(&MSOP_SYNC);
+            // Packet count (big-endian)
+            packet[4..6].copy_from_slice(&pkt_cnt.to_be_bytes());
+            // Timestamp (minimal valid)
+            packet[10..20].fill(0);
+            // Temperature
+            packet[31] = 105; // 25°C (105 - 80)
+            packet
+        }
+
+        // Process first packet (pkt_cnt=0)
+        let packet0 = make_msop_packet(0);
+        let result = driver.process(&mut frame, &packet0);
+        assert!(result.is_ok());
+        assert!(!result.unwrap()); // Not complete yet
+
+        // Process second packet (pkt_cnt=1)
+        let packet1 = make_msop_packet(1);
+        let result = driver.process(&mut frame, &packet1);
+        assert!(result.is_ok());
+        assert!(!result.unwrap()); // Not complete yet
+
+        // Process packet that wraps (pkt_cnt=0 again) - this signals frame complete
+        // But first we need to add some points to the frame for it to be non-empty
+        frame.push(1.0, 2.0, 3.0, 100, 2.0);
+
+        let packet_wrap = make_msop_packet(0);
+        let result = driver.process(&mut frame, &packet_wrap);
+        assert!(result.is_ok());
+        assert!(result.unwrap()); // Frame complete!
     }
 }

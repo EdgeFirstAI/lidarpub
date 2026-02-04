@@ -20,8 +20,8 @@
 
 use clap::Parser;
 use edgefirst_lidarpub::{
-    lidar::{LidarDriver, Points, SensorType},
-    robosense::RobosenseDriver,
+    lidar::{LidarDriver, LidarFrame, SensorType},
+    robosense::{RobosenseDriver, RobosenseLidarFrame},
 };
 use std::net::UdpSocket;
 
@@ -65,6 +65,8 @@ fn run_robosense(
     rec: rerun::RecordingStream,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut driver = RobosenseDriver::new();
+    // Client-owned frame with appropriate capacity
+    let mut frame = RobosenseLidarFrame::new();
 
     let bind_addr = format!("0.0.0.0:{}", args.msop_port);
     println!("Listening for MSOP packets on {}", bind_addr);
@@ -77,15 +79,18 @@ fn run_robosense(
     let mut frame_count = 0u64;
 
     loop {
+        // NOTE: Blocking recv - this is intentional for this simple example.
+        // For production, consider async I/O or a separate receiver thread.
         let len = sock.recv(&mut buf)?;
 
-        match driver.process_packet(&buf[..len]) {
-            Ok(Some(frame)) => {
+        match driver.process(&mut frame, &buf[..len]) {
+            Ok(true) => {
+                // Frame complete - process it
                 frame_count += 1;
 
-                // Convert points to Rerun format
-                let points = points_to_rerun(&frame.points, frame.n_points);
-                let colors = intensities_to_colors(&frame.points, frame.n_points);
+                // Convert points to Rerun format using LidarFrame trait methods
+                let points = frame_to_rerun(&frame);
+                let colors = intensities_to_colors(&frame);
 
                 rec.log(
                     "lidar/points",
@@ -95,11 +100,13 @@ fn run_robosense(
                 if frame_count.is_multiple_of(10) {
                     println!(
                         "Frame {}: {} points, timestamp {}",
-                        frame_count, frame.n_points, frame.timestamp
+                        frame_count,
+                        frame.len(),
+                        frame.timestamp()
                     );
                 }
             }
-            Ok(None) => {
+            Ok(false) => {
                 // More packets needed
             }
             Err(e) => {
@@ -109,19 +116,19 @@ fn run_robosense(
     }
 }
 
-/// Convert Points to Rerun point format
-fn points_to_rerun(points: &Points, n_points: usize) -> Vec<[f32; 3]> {
-    (0..n_points)
-        .map(|i| [points.x[i], points.y[i], points.z[i]])
-        .collect()
+/// Convert LidarFrame to Rerun point format
+fn frame_to_rerun<F: LidarFrame>(frame: &F) -> Vec<[f32; 3]> {
+    let x = frame.x();
+    let y = frame.y();
+    let z = frame.z();
+    (0..frame.len()).map(|i| [x[i], y[i], z[i]]).collect()
 }
 
 /// Convert intensities to Rerun colors (grayscale based on intensity)
-fn intensities_to_colors(points: &Points, n_points: usize) -> Vec<rerun::Color> {
-    (0..n_points)
-        .map(|i| {
-            let intensity = points.intensity[i];
-            rerun::Color::from_rgb(intensity, intensity, intensity)
-        })
+fn intensities_to_colors<F: LidarFrame>(frame: &F) -> Vec<rerun::Color> {
+    frame
+        .intensity()
+        .iter()
+        .map(|&intensity| rerun::Color::from_rgb(intensity, intensity, intensity))
         .collect()
 }

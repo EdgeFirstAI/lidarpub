@@ -12,13 +12,7 @@
 #![allow(clippy::wrong_self_convention)]
 #![allow(dead_code)]
 
-use crate::{
-    buffer::DoubleBuffer,
-    lidar::{
-        Error, FrameMetadata, LidarDriver, LidarDriverBuffered, LidarFrame, Points as LidarPoints,
-        timestamp,
-    },
-};
+use crate::lidar::{Error, LidarDriver, LidarFrame, LidarFrameWriter, timestamp};
 use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 use std::{f32::consts::PI, fmt};
@@ -590,15 +584,15 @@ impl FrameBuilder {
         self.update_points();
     }
 
-    /// Update and write directly into a PointBuffer
-    pub fn update_into_buffer(
+    /// Update and write directly into a LidarFrameWriter
+    pub fn update_into_frame<F: LidarFrameWriter>(
         &mut self,
         depth: &Array2<u16>,
         reflect: &Array2<u8>,
-        buffer: &mut crate::buffer::PointBuffer,
+        frame: &mut F,
     ) {
         self.update_images(depth, reflect);
-        self.update_points_into_buffer(buffer);
+        self.update_points_into_frame(frame);
     }
 
     #[instrument(skip_all, fields(rows = self.rows, cols = self.cols))]
@@ -649,15 +643,12 @@ impl FrameBuilder {
         self.n_points = index;
     }
 
-    /// Update points directly into a PointBuffer, computing range for each
-    /// point
+    /// Update points directly into a LidarFrameWriter, using sensor-provided
+    /// range
     #[instrument(skip_all, fields(rows = self.rows, cols = self.cols))]
-    fn update_points_into_buffer(&mut self, buffer: &mut crate::buffer::PointBuffer) {
+    fn update_points_into_frame<F: LidarFrameWriter>(&mut self, frame: &mut F) {
         let col_base = self.column_window[0] as i16;
         let mut index = 0;
-
-        // Clear the buffer first
-        buffer.clear();
 
         for row in 0..self.rows {
             let col_offset = (col_base - self.pixel_shift_by_row[row]).max(0) as usize;
@@ -682,16 +673,21 @@ impl FrameBuilder {
         self.calculate_points(index);
         self.n_points = index;
 
-        // Copy into buffer with pre-computed range (in meters)
+        // Copy into frame with sensor-provided range (in meters)
+        // Range from Ouster is stored in self.range as internal units (mm * 8 -
+        // range_delta) To get actual range in meters: use the original depth
+        // value from sensor self.depth[row, col] is in mm (after range_delta
+        // adjustment), convert to meters
         for i in 0..index {
             let x = self.points.x[i];
             let y = self.points.y[i];
             let z = self.points.z[i];
             let intensity = self.points.l[i];
-            // Compute actual distance in meters from XYZ
-            // Note: self.range[i] is in internal units, we compute true range
-            let range_m = (x * x + y * y + z * z).sqrt();
-            buffer.push(x, y, z, intensity, range_m);
+            // self.range[i] is the adjusted depth value (in internal units)
+            // Convert to meters: self.range[i] * 0.001
+            // Note: This is the sensor-provided range, NOT computed from XYZ
+            let range_m = self.range[i] * 0.001;
+            frame.push(x, y, z, intensity, range_m);
         }
     }
 
@@ -773,6 +769,126 @@ impl FrameBuilder {
     }
 }
 
+/// Ouster-specific LidarFrame implementation.
+///
+/// Stores point cloud data in Structure-of-Arrays layout for efficient SIMD
+/// processing. The client owns this frame and provides it to the driver.
+pub struct OusterLidarFrame {
+    x: Vec<f32>,
+    y: Vec<f32>,
+    z: Vec<f32>,
+    intensity: Vec<u8>,
+    range: Vec<f32>,
+    len: usize,
+    timestamp: u64,
+    frame_id: u32,
+}
+
+impl OusterLidarFrame {
+    /// Create a new frame with specified capacity.
+    ///
+    /// Memory is allocated once at construction; no allocations occur during
+    /// normal operation.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            x: vec![0.0; capacity],
+            y: vec![0.0; capacity],
+            z: vec![0.0; capacity],
+            intensity: vec![0; capacity],
+            range: vec![0.0; capacity],
+            len: 0,
+            timestamp: 0,
+            frame_id: 0,
+        }
+    }
+
+    /// Create a new frame with default capacity for Ouster sensors.
+    ///
+    /// Default is 128 rows × 1024 columns = 131,072 points.
+    pub fn new() -> Self {
+        Self::with_capacity(128 * 1024)
+    }
+}
+
+impl Default for OusterLidarFrame {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// SAFETY: OusterLidarFrame contains only primitive types in Vecs,
+// which are inherently Send.
+unsafe impl Send for OusterLidarFrame {}
+
+impl LidarFrame for OusterLidarFrame {
+    fn reset(&mut self) {
+        self.len = 0;
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn timestamp(&self) -> u64 {
+        self.timestamp
+    }
+
+    fn frame_id(&self) -> u32 {
+        self.frame_id
+    }
+
+    fn x(&self) -> &[f32] {
+        &self.x[..self.len]
+    }
+
+    fn y(&self) -> &[f32] {
+        &self.y[..self.len]
+    }
+
+    fn z(&self) -> &[f32] {
+        &self.z[..self.len]
+    }
+
+    fn intensity(&self) -> &[u8] {
+        &self.intensity[..self.len]
+    }
+
+    fn range(&self) -> &[f32] {
+        &self.range[..self.len]
+    }
+
+    fn capacity(&self) -> usize {
+        self.x.len()
+    }
+}
+
+impl LidarFrameWriter for OusterLidarFrame {
+    fn set_timestamp(&mut self, ts: u64) {
+        self.timestamp = ts;
+    }
+
+    fn set_frame_id(&mut self, id: u32) {
+        self.frame_id = id;
+    }
+
+    fn push(&mut self, x: f32, y: f32, z: f32, intensity: u8, range: f32) -> bool {
+        if self.len >= self.capacity() {
+            return false;
+        }
+        self.x[self.len] = x;
+        self.y[self.len] = y;
+        self.z[self.len] = z;
+        self.intensity[self.len] = intensity;
+        self.range[self.len] = range;
+        self.len += 1;
+        true
+    }
+
+    fn set_len(&mut self, len: usize) {
+        self.len = len.min(self.capacity());
+    }
+}
+
 /// Ouster LiDAR driver implementing the common LidarDriver trait
 ///
 /// This driver wraps the FrameReader and FrameBuilder to provide
@@ -782,8 +898,6 @@ pub struct OusterDriver {
     frame_reader: FrameReader,
     /// Frame builder for point cloud computation
     frame_builder: FrameBuilder,
-    /// Double buffer for zero-allocation operation
-    double_buffer: DoubleBuffer,
     /// Pending frame data (depth, reflect) waiting to be processed
     pending_frame: Option<(u64, u16, Array2<u16>, Array2<u8>)>,
 }
@@ -794,14 +908,9 @@ impl OusterDriver {
         let frame_reader = FrameReader::new(&params.lidar_data_format)?;
         let frame_builder = FrameBuilder::new(params);
 
-        let rows = frame_builder.rows;
-        let cols = frame_builder.cols;
-        let capacity = rows * cols;
-
         Ok(Self {
             frame_reader,
             frame_builder,
-            double_buffer: DoubleBuffer::new(capacity),
             pending_frame: None,
         })
     }
@@ -853,70 +962,112 @@ impl OusterDriver {
 }
 
 impl LidarDriver for OusterDriver {
-    fn process_packet(&mut self, data: &[u8]) -> Result<Option<LidarFrame>, Error> {
+    fn process<F: LidarFrameWriter>(&mut self, frame: &mut F, data: &[u8]) -> Result<bool, Error> {
         // Use the existing FrameReader to parse packets
         self.frame_reader
             .update(data, |timestamp, frame_id, depth, reflect| {
+                // Warn if we're overwriting a pending frame (PR #4 fix)
+                if self.pending_frame.is_some() {
+                    warn!("Dropping unprocessed frame - processing too slow");
+                }
                 self.pending_frame = Some((timestamp, frame_id, depth, reflect));
             })?;
 
         // Check if we have a complete frame
         if let Some((timestamp, frame_id, depth, reflect)) = self.pending_frame.take() {
-            // Process the frame through FrameBuilder
-            self.frame_builder.update(&depth, &reflect);
+            // Reset frame for new data
+            frame.reset();
+            frame.set_timestamp(timestamp);
+            frame.set_frame_id(frame_id as u32);
 
-            // Convert to common Points type
-            let points = LidarPoints {
-                x: self.frame_builder.points_x().to_vec(),
-                y: self.frame_builder.points_y().to_vec(),
-                z: self.frame_builder.points_z().to_vec(),
-                intensity: self.frame_builder.points_intensity().to_vec(),
-            };
+            // Process the frame through FrameBuilder directly into the client's frame
+            self.frame_builder
+                .update_into_frame(&depth, &reflect, frame);
 
-            Ok(Some(LidarFrame {
-                timestamp,
-                frame_id: frame_id as u32,
-                points,
-                n_points: self.frame_builder.n_points,
-            }))
+            Ok(true)
         } else {
-            Ok(None)
+            Ok(false)
         }
     }
 }
 
-impl LidarDriverBuffered for OusterDriver {
-    fn process_packet_buffered(&mut self, data: &[u8]) -> Result<Option<FrameMetadata>, Error> {
-        // Use the existing FrameReader to parse packets
-        self.frame_reader
-            .update(data, |timestamp, frame_id, depth, reflect| {
-                self.pending_frame = Some((timestamp, frame_id, depth, reflect));
-            })?;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        // Check if we have a complete frame
-        if let Some((timestamp, frame_id, depth, reflect)) = self.pending_frame.take() {
-            // Process the frame directly into the filling buffer
-            let filling = self.double_buffer.filling_mut();
-            self.frame_builder
-                .update_into_buffer(&depth, &reflect, filling);
+    #[test]
+    fn test_ouster_frame_basic() {
+        let mut frame = OusterLidarFrame::with_capacity(100);
+        assert_eq!(frame.len(), 0);
+        assert!(frame.is_empty());
+        assert_eq!(frame.capacity(), 100);
 
-            let metadata = FrameMetadata {
-                timestamp,
-                frame_id: frame_id as u32,
-                n_points: self.frame_builder.n_points,
-            };
+        frame.push(1.0, 2.0, 3.0, 128, 3.74);
+        assert_eq!(frame.len(), 1);
+        assert!(!frame.is_empty());
+        assert_eq!(frame.x()[0], 1.0);
+        assert_eq!(frame.y()[0], 2.0);
+        assert_eq!(frame.z()[0], 3.0);
+        assert_eq!(frame.intensity()[0], 128);
+        assert_eq!(frame.range()[0], 3.74);
 
-            Ok(Some(metadata))
-        } else {
-            Ok(None)
-        }
+        frame.reset();
+        assert!(frame.is_empty());
+        assert_eq!(frame.capacity(), 100);
     }
 
-    fn buffer(&self) -> &DoubleBuffer {
-        &self.double_buffer
+    #[test]
+    fn test_ouster_frame_capacity() {
+        let mut frame = OusterLidarFrame::with_capacity(2);
+        assert!(frame.push(1.0, 1.0, 1.0, 1, 1.0));
+        assert!(frame.push(2.0, 2.0, 2.0, 2, 2.0));
+        assert!(!frame.push(3.0, 3.0, 3.0, 3, 3.0)); // At capacity
+        assert_eq!(frame.len(), 2);
     }
 
-    fn buffer_mut(&mut self) -> &mut DoubleBuffer {
-        &mut self.double_buffer
+    #[test]
+    fn test_ouster_frame_metadata() {
+        let mut frame = OusterLidarFrame::new();
+        frame.set_timestamp(12345678);
+        frame.set_frame_id(42);
+        assert_eq!(frame.timestamp(), 12345678);
+        assert_eq!(frame.frame_id(), 42);
+    }
+
+    #[test]
+    fn test_ouster_frame_default_capacity() {
+        let frame = OusterLidarFrame::new();
+        // Default is 128 × 1024 = 131,072
+        assert_eq!(frame.capacity(), 128 * 1024);
+    }
+
+    #[test]
+    fn test_shot_limiting_display() {
+        assert_eq!(format!("{}", ShotLimiting::Normal), "Normal");
+        assert_eq!(
+            format!("{}", ShotLimiting::Imminent(5)),
+            "Limiting in 5 seconds"
+        );
+        assert_eq!(
+            format!("{}", ShotLimiting::Limiting(50)),
+            "Limiting to approximately 50% range"
+        );
+    }
+
+    #[test]
+    fn test_shutdown_status_display() {
+        assert_eq!(format!("{}", ShutdownStatus::Normal), "Normal");
+        assert_eq!(
+            format!("{}", ShutdownStatus::Imminent(10)),
+            "Shutdown imminent in 10 seconds"
+        );
+    }
+
+    #[test]
+    fn test_alert_status_from_flags() {
+        assert_eq!(AlertStatus::from_flags(0x00), AlertStatus::Normal);
+        assert_eq!(AlertStatus::from_flags(0x80), AlertStatus::Active(0));
+        assert_eq!(AlertStatus::from_flags(0x85), AlertStatus::Active(5));
+        assert_eq!(AlertStatus::from_flags(0x45), AlertStatus::Overflow(5));
     }
 }
