@@ -350,7 +350,8 @@ impl RobosenseDriver {
         let timestamp_ns = seconds * 1_000_000_000 + microseconds as u64 * 1_000;
 
         // Temperature: byte 31, Temp = LidarTmp - 80
-        let temperature = data[31] as i8 - 80;
+        // Subtraction done in i16 to avoid overflow when data[31] > 127
+        let temperature = (i16::from(data[31]) - 80) as i8;
 
         Ok(MsopHeader {
             pkt_cnt,
@@ -399,7 +400,12 @@ impl RobosenseDriver {
 
         // Single write directly to client's frame (no dual buffer!)
         // Range is provided by sensor protocol (radius in meters)
-        frame.push(x, y, z, intensity, radius);
+        if !frame.push(x, y, z, intensity, radius) {
+            log::warn!(
+                "Frame buffer full (capacity={}), dropping point",
+                frame.capacity()
+            );
+        }
 
         Ok(())
     }

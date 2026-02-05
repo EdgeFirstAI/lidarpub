@@ -12,7 +12,6 @@
 )]
 
 mod args;
-mod buffer;
 mod cluster;
 mod common;
 mod formats;
@@ -272,11 +271,15 @@ impl LidarDriver for RobosenseDriverWrapper {
         frame: &mut F,
         data: &[u8],
     ) -> Result<bool, lidar::Error> {
-        // Handle mutex poison gracefully (PR #9 fix)
+        // Handle mutex poison gracefully - the DIFOP thread may have panicked
+        // but the driver state is likely still valid for packet processing
         match self.0.lock() {
             Ok(mut driver) => driver.process(frame, data),
             Err(poisoned) => {
-                warn!("Driver mutex poisoned, recovering");
+                warn!(
+                    "Driver mutex poisoned (DIFOP thread may have panicked), \
+                     recovering with potentially stale device info"
+                );
                 poisoned.into_inner().process(frame, data)
             }
         }

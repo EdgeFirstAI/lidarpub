@@ -33,7 +33,6 @@
 //!
 //! # Modules
 //!
-//! - [`buffer`]: Pre-allocated point buffers (legacy support)
 //! - [`formats`]: SIMD-optimized point cloud formatting
 //! - [`lidar`]: Common types, traits, and error handling
 //! - [`ouster`]: Ouster OS0/OS1/OS2/OSDome driver
@@ -68,18 +67,20 @@
 
 #![cfg_attr(feature = "portable_simd", feature(portable_simd))]
 
-pub mod buffer;
 pub mod common;
 pub mod formats;
 pub mod lidar;
 pub mod ouster;
 pub mod packet_source;
+#[cfg(feature = "pcap")]
+pub mod pcap_source;
 pub mod robosense;
 
 // Re-exports for convenience
-pub use buffer::{DoubleBuffer, PointBuffer};
 pub use formats::PointFieldType;
 pub use lidar::{Error, LidarDriver, LidarFrame, LidarFrameWriter, Points, SensorType};
 pub use ouster::OusterLidarFrame;
 pub use packet_source::PacketSource;
+#[cfg(feature = "pcap")]
+pub use pcap_source::PcapSource;
 pub use robosense::RobosenseLidarFrame;

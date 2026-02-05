@@ -19,7 +19,10 @@ default = ["tracy"]
 # Enable portable_simd for non-aarch64 targets when using nightly Rust.
 # On aarch64, native NEON intrinsics are always used regardless of this feature.
 portable_simd = []
-rerun = ["dep:rerun", "dep:etherparse", "dep:pcap-parser"]
+# Enable PCAP file support for testing without hardware
+pcap = ["dep:etherparse", "dep:pcap-parser"]
+# Rerun visualization (implies pcap for data replay)
+rerun = ["dep:rerun", "pcap"]
 tracy = ["tracing-tracy/enable", "tracy-client/enable"]
 profiling = [
     "tracing-tracy/sampling",

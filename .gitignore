@@ -1,7 +1,5 @@
 .vscode
 
-/testdata
-
 /target
 /venv
 /.debug
