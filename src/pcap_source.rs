@@ -25,7 +25,7 @@
 
 use crate::{lidar::Error, packet_source::PacketSource};
 use pcap_parser::traits::PcapReaderIterator;
-use std::{future::Future, path::Path, pin::Pin};
+use std::{collections::HashMap, future::Future, path::Path, pin::Pin};
 
 /// Extracted UDP packet with metadata.
 #[derive(Clone)]
@@ -84,55 +84,188 @@ impl PcapSource {
         Ok(Self { packets, index: 0 })
     }
 
-    /// Extract UDP packets from PCAP data.
+    /// Extract UDP packets from PCAP data with IP fragment reassembly.
     fn extract_packets(data: &[u8], port: Option<u16>) -> Result<Vec<ExtractedPacket>, Error> {
-        let mut packets = Vec::new();
+        // First, collect all raw Ethernet frames
+        let mut raw_frames = Vec::new();
 
         // Try PCAPNG first, then legacy PCAP
         if data.len() >= 4 && data[0..4] == [0x0a, 0x0d, 0x0d, 0x0a] {
-            // PCAPNG format (Section Header Block magic)
-            Self::extract_pcapng(data, port, &mut packets)?;
+            Self::collect_raw_frames_pcapng(data, &mut raw_frames)?;
         } else {
-            // Try legacy PCAP format
-            Self::extract_legacy_pcap(data, port, &mut packets)?;
+            Self::collect_raw_frames_legacy(data, &mut raw_frames)?;
+        }
+
+        // Reassemble IP fragments and extract UDP payloads
+        Self::reassemble_and_extract(&raw_frames, port)
+    }
+
+    /// Reassemble IP fragments and extract UDP payloads.
+    fn reassemble_and_extract(
+        frames: &[Vec<u8>],
+        port: Option<u16>,
+    ) -> Result<Vec<ExtractedPacket>, Error> {
+        use etherparse::{NetSlice, SlicedPacket};
+
+        // Key for fragment reassembly: (src_ip, dst_ip, protocol, identification)
+        type FragKey = ([u8; 4], [u8; 4], u8, u16);
+
+        // Fragment data: (offset, more_fragments, payload)
+        struct Fragment {
+            offset: u16,
+            more_fragments: bool,
+            data: Vec<u8>,
+            /// Full Ethernet frame for first fragment (offset 0)
+            first_frame: Option<Vec<u8>>,
+        }
+
+        let mut fragment_groups: HashMap<FragKey, Vec<Fragment>> = HashMap::new();
+        let mut packets = Vec::new();
+
+        for frame in frames {
+            let Ok(parsed) = SlicedPacket::from_ethernet(frame) else {
+                continue;
+            };
+
+            // Check if this is an IPv4 packet
+            let Some(NetSlice::Ipv4(ipv4_slice)) = parsed.net else {
+                continue;
+            };
+
+            let header = ipv4_slice.header();
+            let identification = header.identification();
+            let fragment_offset = header.fragments_offset().value();
+            let more_fragments = header.more_fragments();
+
+            // Non-fragmented packet (no MF flag and offset 0)
+            if !more_fragments && fragment_offset == 0 {
+                // Try to extract UDP directly
+                if let Some(extracted) = Self::extract_udp_payload(frame, port) {
+                    packets.push(extracted);
+                }
+                continue;
+            }
+
+            // This is a fragment - collect it
+            let key: FragKey = (
+                header.source(),
+                header.destination(),
+                header.protocol().0,
+                identification,
+            );
+
+            // Get the IP payload (data after IP header)
+            let ip_payload = ipv4_slice.payload().payload;
+
+            let frag = Fragment {
+                offset: fragment_offset,
+                more_fragments,
+                data: ip_payload.to_vec(),
+                first_frame: if fragment_offset == 0 {
+                    Some(frame.clone())
+                } else {
+                    None
+                },
+            };
+
+            fragment_groups.entry(key).or_default().push(frag);
+        }
+
+        // Reassemble fragment groups
+        for (_key, mut frags) in fragment_groups {
+            // Sort by offset
+            frags.sort_by_key(|f| f.offset);
+
+            // Check if we have the first fragment
+            let Some(first_frag) = frags.iter().find(|f| f.offset == 0) else {
+                continue;
+            };
+
+            let Some(first_frame) = &first_frag.first_frame else {
+                continue;
+            };
+
+            // Check if we have the last fragment (one without MF flag)
+            if !frags.iter().any(|f| !f.more_fragments) {
+                continue; // Incomplete - missing last fragment
+            }
+
+            // Reassemble the IP payload
+            let mut reassembled_payload = Vec::new();
+            let mut expected_offset = 0u16;
+
+            for frag in &frags {
+                if frag.offset != expected_offset {
+                    // Gap in fragments - incomplete
+                    break;
+                }
+                reassembled_payload.extend_from_slice(&frag.data);
+                // Fragment offset is in 8-byte units
+                expected_offset = frag.offset + (frag.data.len() as u16).div_ceil(8);
+            }
+
+            // Build reassembled packet: use first fragment's headers + reassembled payload
+            // Parse the first frame to get header lengths
+            let Ok(first_parsed) = SlicedPacket::from_ethernet(first_frame) else {
+                continue;
+            };
+
+            let Some(NetSlice::Ipv4(ipv4_slice)) = first_parsed.net else {
+                continue;
+            };
+
+            let eth_header_len = 14usize;
+            let ip_header_len = (ipv4_slice.header().ihl() as usize) * 4;
+
+            // Create reassembled frame: Ethernet + IP header + reassembled payload
+            let mut reassembled_frame =
+                Vec::with_capacity(eth_header_len + ip_header_len + reassembled_payload.len());
+
+            // Copy Ethernet header
+            reassembled_frame.extend_from_slice(&first_frame[..eth_header_len]);
+
+            // Copy and modify IP header
+            let ip_header_end = eth_header_len + ip_header_len;
+            reassembled_frame.extend_from_slice(&first_frame[eth_header_len..ip_header_end]);
+
+            // Update IP total length
+            let new_total_len = (ip_header_len + reassembled_payload.len()) as u16;
+            reassembled_frame[eth_header_len + 2] = (new_total_len >> 8) as u8;
+            reassembled_frame[eth_header_len + 3] = (new_total_len & 0xff) as u8;
+
+            // Clear fragment flags and offset
+            reassembled_frame[eth_header_len + 6] = 0;
+            reassembled_frame[eth_header_len + 7] = 0;
+
+            // Append reassembled payload
+            reassembled_frame.extend_from_slice(&reassembled_payload);
+
+            // Now extract UDP from reassembled frame
+            if let Some(extracted) = Self::extract_udp_payload(&reassembled_frame, port) {
+                packets.push(extracted);
+            }
         }
 
         Ok(packets)
     }
 
-    /// Extract packets from legacy PCAP format.
-    fn extract_legacy_pcap(
-        data: &[u8],
-        port: Option<u16>,
-        packets: &mut Vec<ExtractedPacket>,
-    ) -> Result<(), Error> {
+    /// Collect raw Ethernet frames from legacy PCAP.
+    fn collect_raw_frames_legacy(data: &[u8], frames: &mut Vec<Vec<u8>>) -> Result<(), Error> {
         use pcap_parser::*;
 
-        // Buffer size must be at least as large as the data to avoid Incomplete errors
         let mut reader = LegacyPcapReader::new(data.len(), data)
             .map_err(|e| Error::InvalidPacket(format!("Failed to create PCAP reader: {:?}", e)))?;
 
         loop {
             match reader.next() {
                 Ok((offset, block)) => {
-                    match block {
-                        PcapBlockOwned::Legacy(packet) => {
-                            if let Some(extracted) = Self::extract_udp_payload(packet.data, port) {
-                                packets.push(extracted);
-                            }
-                        }
-                        PcapBlockOwned::LegacyHeader(_) => {
-                            // Skip header
-                        }
-                        _ => {}
+                    if let PcapBlockOwned::Legacy(packet) = block {
+                        frames.push(packet.data.to_vec());
                     }
                     reader.consume(offset);
                 }
                 Err(PcapError::Eof) => break,
-                Err(PcapError::Incomplete(_)) => {
-                    // Need more data but we loaded everything, so just break
-                    break;
-                }
+                Err(PcapError::Incomplete(_)) => break,
                 Err(e) => {
                     return Err(Error::InvalidPacket(format!("PCAP parse error: {:?}", e)));
                 }
@@ -142,15 +275,10 @@ impl PcapSource {
         Ok(())
     }
 
-    /// Extract packets from PCAPNG format.
-    fn extract_pcapng(
-        data: &[u8],
-        port: Option<u16>,
-        packets: &mut Vec<ExtractedPacket>,
-    ) -> Result<(), Error> {
+    /// Collect raw Ethernet frames from PCAPNG.
+    fn collect_raw_frames_pcapng(data: &[u8], frames: &mut Vec<Vec<u8>>) -> Result<(), Error> {
         use pcap_parser::*;
 
-        // Buffer size must be at least as large as the data to avoid Incomplete errors
         let mut reader = PcapNGReader::new(data.len(), data).map_err(|e| {
             Error::InvalidPacket(format!("Failed to create PCAPNG reader: {:?}", e))
         })?;
@@ -160,26 +288,17 @@ impl PcapSource {
                 Ok((offset, block)) => {
                     match block {
                         PcapBlockOwned::NG(Block::EnhancedPacket(epb)) => {
-                            if let Some(extracted) = Self::extract_udp_payload(epb.data, port) {
-                                packets.push(extracted);
-                            }
+                            frames.push(epb.data.to_vec());
                         }
                         PcapBlockOwned::NG(Block::SimplePacket(spb)) => {
-                            if let Some(extracted) = Self::extract_udp_payload(spb.data, port) {
-                                packets.push(extracted);
-                            }
+                            frames.push(spb.data.to_vec());
                         }
-                        _ => {
-                            // Skip other block types (SHB, IDB, etc.)
-                        }
+                        _ => {}
                     }
                     reader.consume(offset);
                 }
                 Err(PcapError::Eof) => break,
-                Err(PcapError::Incomplete(_)) => {
-                    // Need more data but we loaded everything
-                    break;
-                }
+                Err(PcapError::Incomplete(_)) => break,
                 Err(e) => {
                     return Err(Error::InvalidPacket(format!("PCAPNG parse error: {:?}", e)));
                 }
