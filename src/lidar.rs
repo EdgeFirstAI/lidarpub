@@ -108,6 +108,15 @@ pub trait LidarFrameWriter: LidarFrame {
 
     /// Set the valid length of the frame.
     fn set_len(&mut self, len: usize);
+
+    /// Get mutable access to all buffers at once for SIMD writes.
+    ///
+    /// Returns (x, y, z, intensity, range) slices. This method allows
+    /// borrowing all buffers simultaneously, which is necessary for
+    /// efficient SIMD processing where we need to write to multiple
+    /// arrays in a single pass.
+    #[allow(clippy::type_complexity)]
+    fn buffers_mut(&mut self) -> (&mut [f32], &mut [f32], &mut [f32], &mut [u8], &mut [f32]);
 }
 
 /// Point cloud output structure (sensor-agnostic)

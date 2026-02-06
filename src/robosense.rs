@@ -253,6 +253,16 @@ impl LidarFrameWriter for RobosenseLidarFrame {
     fn set_len(&mut self, len: usize) {
         self.len = len.min(self.capacity());
     }
+
+    fn buffers_mut(&mut self) -> (&mut [f32], &mut [f32], &mut [f32], &mut [u8], &mut [f32]) {
+        (
+            &mut self.x,
+            &mut self.y,
+            &mut self.z,
+            &mut self.intensity,
+            &mut self.range,
+        )
+    }
 }
 
 /// Robosense E1R LiDAR driver

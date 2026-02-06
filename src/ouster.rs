@@ -16,7 +16,7 @@ use crate::lidar::{Error, LidarDriver, LidarFrame, LidarFrameWriter, timestamp};
 use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 use std::{f32::consts::PI, fmt};
-use tracing::{info_span, instrument, warn};
+use tracing::{instrument, warn};
 
 // SIMD imports: NEON on aarch64 (stable), portable_simd elsewhere (nightly)
 #[cfg(all(feature = "portable_simd", not(target_arch = "aarch64")))]
@@ -370,36 +370,18 @@ impl DataBlock {
     pub const LEN: usize = 4;
 }
 
-/// Internal point storage for Ouster frame building
-///
-/// Uses SoA layout for SIMD-friendly processing.
-#[derive(Debug, Clone)]
-struct Points {
-    x: Vec<f32>,
-    y: Vec<f32>,
-    z: Vec<f32>,
-    l: Vec<u8>,
-}
-
-impl Points {
-    fn new(len: usize) -> Self {
-        Points {
-            x: vec![0f32; len],
-            y: vec![0f32; len],
-            z: vec![0f32; len],
-            l: vec![0u8; len],
-        }
-    }
-}
-
 pub struct FrameReader {
     pub rows: usize,
     pub cols: usize,
     columns_per_packet: usize,
     frame_id: u16,
+    /// Depth buffer owned by FrameReader - never copied
     depth: Array2<u16>,
+    /// Reflectivity buffer owned by FrameReader - never copied
     reflect: Array2<u8>,
     timestamp: u64,
+    /// True when a complete frame is ready for processing
+    frame_ready: bool,
 }
 
 impl FrameReader {
@@ -422,30 +404,39 @@ impl FrameReader {
             depth: Array2::zeros((rows, cols)),
             reflect: Array2::zeros((rows, cols)),
             timestamp: 0,
+            frame_ready: false,
         })
     }
 
-    pub fn update<F>(&mut self, slice: &[u8], mut complete: F) -> Result<(), Error>
-    where
-        F: FnMut(u64, u16, Array2<u16>, Array2<u8>),
-    {
+    /// Process a UDP packet, accumulating data into internal buffers.
+    ///
+    /// Returns `Ok(true)` when a frame boundary is detected (new frame_id),
+    /// meaning the previous frame's data is complete and ready for processing.
+    ///
+    /// # Zero-Copy Design
+    ///
+    /// The depth and reflect buffers are owned by FrameReader and never copied.
+    /// After this returns `true`, call `depth()` and `reflect()` to get
+    /// references to the completed frame data, then call `start_new_frame()`
+    /// to prepare for the next frame.
+    pub fn update(&mut self, slice: &[u8]) -> Result<bool, Error> {
         let header = HeaderSlice::from_slice(slice)?;
 
-        if self.frame_id != header.frame_id() {
-            info_span!("make_frame").in_scope(|| {
-                complete(
-                    self.timestamp,
-                    self.frame_id,
-                    self.depth.clone(),
-                    self.reflect.clone(),
-                );
-
-                self.frame_id = header.frame_id();
-                self.depth.fill(0);
-                self.reflect.fill(0);
-            });
+        // Detect frame boundary
+        let is_new_frame = self.frame_id != header.frame_id();
+        if is_new_frame {
+            // Previous frame is complete - mark ready and update frame_id
+            self.frame_ready = true;
+            self.frame_id = header.frame_id();
         }
 
+        // If we just detected a boundary, don't process this packet yet
+        // The caller should first consume the completed frame
+        if self.frame_ready {
+            return Ok(true);
+        }
+
+        // Process packet columns into our buffers
         for i in 0..self.columns_per_packet {
             let column = header.column(self.rows, i)?;
             if column.status() {
@@ -464,33 +455,52 @@ impl FrameReader {
             }
         }
 
-        Ok(())
+        Ok(false)
+    }
+
+    /// Start a new frame after the previous one has been consumed.
+    ///
+    /// This clears the buffers and resets the frame_ready flag.
+    pub fn start_new_frame(&mut self) {
+        self.depth.fill(0);
+        self.reflect.fill(0);
+        self.frame_ready = false;
+    }
+
+    /// Get the timestamp of the current/completed frame.
+    pub fn timestamp(&self) -> u64 {
+        self.timestamp
+    }
+
+    /// Get the frame_id of the current/completed frame.
+    pub fn frame_id(&self) -> u16 {
+        self.frame_id
+    }
+
+    /// Get reference to the depth buffer (zero-copy access).
+    pub fn depth(&self) -> &Array2<u16> {
+        &self.depth
+    }
+
+    /// Get reference to the reflect buffer (zero-copy access).
+    pub fn reflect(&self) -> &Array2<u8> {
+        &self.reflect
     }
 }
 
+/// Point cloud coordinate calculator with pre-computed lookup tables.
+///
+/// Uses pre-computed coefficients in linear output order for efficient
+/// SIMD processing. All lookup tables are computed once at construction.
 pub struct FrameBuilder {
     pub rows: usize,
     pub cols: usize,
-    points: Points,
     pub n_points: usize,
-    pub depth: Array2<u16>,
-    pub reflect: Array2<u8>,
     pub crop: (usize, usize),
-    column_window: [usize; 2],
-    pixel_shift_by_row: Vec<i16>,
-    beam_to_lidar: Array2<f32>,
-    altitude_angles: Vec<f32>,
+    /// Scratch buffer for range values (internal units before conversion)
     pub range: Vec<f32>,
+    /// Range delta for coordinate calculation
     range_delta: f32,
-    x_range: Array2<f32>,
-    y_range: Array2<f32>,
-    x_delta: Vec<f32>,
-    y_delta: Vec<f32>,
-    x_range_cache: Vec<f32>,
-    y_range_cache: Vec<f32>,
-    x_delta_cache: Vec<f32>,
-    y_delta_cache: Vec<f32>,
-    altitude: Vec<f32>,
 
     // Pre-computed coefficients in linear output order for direct indexing.
     /// Source indices: linear index into packet depth/reflect arrays
@@ -513,7 +523,6 @@ impl FrameBuilder {
     pub fn new(params: &Parameters) -> Self {
         let rows = params.lidar_data_format.pixels_per_column;
         let cols = params.lidar_data_format.columns_per_frame;
-        let maxlen = rows * cols;
         let pixel_shift_by_row = params.lidar_data_format.pixel_shift_by_row.clone();
         let column_window = params.lidar_data_format.column_window;
         let beam_to_lidar = Array2::from_shape_vec(
@@ -614,27 +623,10 @@ impl FrameBuilder {
         FrameBuilder {
             rows,
             cols,
-            points: Points::new(maxlen),
             n_points: 0,
-            depth: Array2::zeros((rows, cols)),
-            reflect: Array2::zeros((rows, cols)),
-            column_window,
-            pixel_shift_by_row,
-            beam_to_lidar,
-            altitude_angles: altitude_sin,
             crop,
+            range: vec![0f32; n_output_points],
             range_delta,
-            range: vec![0f32; maxlen],
-            altitude: vec![0f32; maxlen],
-            x_range,
-            y_range,
-            x_delta,
-            y_delta,
-            x_range_cache: vec![0f32; maxlen],
-            y_range_cache: vec![0f32; maxlen],
-            x_delta_cache: vec![0f32; maxlen],
-            y_delta_cache: vec![0f32; maxlen],
-            // Pre-computed coefficients
             src_indices,
             x_coeff,
             y_coeff,
@@ -645,123 +637,11 @@ impl FrameBuilder {
         }
     }
 
-    pub fn update(&mut self, depth: &Array2<u16>, reflect: &Array2<u8>) {
-        self.update_images(depth, reflect);
-        self.update_points();
-    }
-
-    /// Update and write directly into a LidarFrameWriter
-    pub fn update_into_frame<F: LidarFrameWriter>(
-        &mut self,
-        depth: &Array2<u16>,
-        reflect: &Array2<u8>,
-        frame: &mut F,
-    ) {
-        self.update_images(depth, reflect);
-        self.update_points_into_frame(frame);
-    }
-
-    #[instrument(skip_all, fields(rows = self.rows, cols = self.cols))]
-    fn update_images(&mut self, depth: &Array2<u16>, reflect: &Array2<u8>) {
-        let rows = self.rows;
-        let cols = self.column_window[1] - self.column_window[0];
-        let col_offset = self.column_window[0];
-
-        for row in 0..rows {
-            let shift = self.pixel_shift_by_row[row];
-
-            for col in 0..cols {
-                let colout = (col as i16 + shift).clamp(0, cols as i16 - 1) as usize;
-                self.depth[[row, colout]] = match depth[[row, col + col_offset]] {
-                    0 => 0,
-                    r => (r as f32 * 8.0 - self.range_delta) as u16,
-                };
-                self.reflect[[row, colout]] = reflect[[row, col + col_offset]];
-            }
-        }
-    }
-
-    #[instrument(skip_all, fields(rows = self.rows, cols = self.cols))]
-    fn update_points(&mut self) {
-        let col_base = self.column_window[0] as i16;
-        let mut index = 0;
-
-        for row in 0..self.rows {
-            let col_offset = (col_base - self.pixel_shift_by_row[row]).max(0) as usize;
-
-            for col in self.crop.0..self.crop.1 {
-                self.range[index] = self.depth[[row, col]] as f32;
-                self.points.l[index] = self.reflect[[row, col]];
-
-                self.x_range_cache[index] = self.x_range[[row, col + col_offset]];
-                self.y_range_cache[index] = self.y_range[[row, col + col_offset]];
-
-                self.x_delta_cache[index] = self.x_delta[col + col_offset];
-                self.y_delta_cache[index] = self.y_delta[col + col_offset];
-
-                self.altitude[index] = self.altitude_angles[row];
-
-                index += 1;
-            }
-        }
-
-        self.calculate_points(index);
-        self.n_points = index;
-    }
-
-    /// Update points directly into a LidarFrameWriter, using sensor-provided
-    /// range
-    #[instrument(skip_all, fields(rows = self.rows, cols = self.cols))]
-    fn update_points_into_frame<F: LidarFrameWriter>(&mut self, frame: &mut F) {
-        let col_base = self.column_window[0] as i16;
-        let mut index = 0;
-
-        for row in 0..self.rows {
-            let col_offset = (col_base - self.pixel_shift_by_row[row]).max(0) as usize;
-
-            for col in self.crop.0..self.crop.1 {
-                self.range[index] = self.depth[[row, col]] as f32;
-                self.points.l[index] = self.reflect[[row, col]];
-
-                self.x_range_cache[index] = self.x_range[[row, col + col_offset]];
-                self.y_range_cache[index] = self.y_range[[row, col + col_offset]];
-
-                self.x_delta_cache[index] = self.x_delta[col + col_offset];
-                self.y_delta_cache[index] = self.y_delta[col + col_offset];
-
-                self.altitude[index] = self.altitude_angles[row];
-
-                index += 1;
-            }
-        }
-
-        // Calculate XYZ coordinates
-        self.calculate_points(index);
-        self.n_points = index;
-
-        // Copy into frame with sensor-provided range (in meters)
-        // Range from Ouster is stored in self.range as internal units (mm * 8 -
-        // range_delta) To get actual range in meters: use the original depth
-        // value from sensor self.depth[row, col] is in mm (after range_delta
-        // adjustment), convert to meters
-        for i in 0..index {
-            let x = self.points.x[i];
-            let y = self.points.y[i];
-            let z = self.points.z[i];
-            let intensity = self.points.l[i];
-            // self.range[i] is the adjusted depth value (in internal units)
-            // Convert to meters: self.range[i] * 0.001
-            // Note: This is the sensor-provided range, NOT computed from XYZ
-            let range_m = self.range[i] * 0.001;
-            frame.push(x, y, z, intensity, range_m);
-        }
-    }
-
     /// Process depth and reflectivity data into XYZ point cloud.
     ///
     /// Reads directly from packet arrays, applies range scaling, computes
     /// Cartesian coordinates using pre-computed lookup tables, and writes
-    /// to the output frame.
+    /// directly to the output frame buffers (true zero-copy).
     #[instrument(skip_all, fields(rows = self.rows, cols = self.cols))]
     pub fn update_fused<F: LidarFrameWriter>(
         &mut self,
@@ -773,7 +653,12 @@ impl FrameBuilder {
         let depth_raw = depth.as_slice().expect("depth array not contiguous");
         let reflect_raw = reflect.as_slice().expect("reflect array not contiguous");
 
-        // Convert depth to range and extract intensity
+        // Get all mutable slices at once (avoids borrow checker issues)
+        let (frame_x, frame_y, frame_z, frame_intensity, frame_range) = frame.buffers_mut();
+
+        // Convert depth to range and extract intensity directly into frame
+        // Using indexed loop for clarity with multiple source arrays
+        #[allow(clippy::needless_range_loop)]
         for i in 0..n_points {
             let src_idx = self.src_indices[i];
             let d = depth_raw[src_idx];
@@ -783,30 +668,33 @@ impl FrameBuilder {
             } else {
                 d as f32 * 8.0 - self.range_delta
             };
-            self.points.l[i] = reflect_raw[src_idx];
+            frame_intensity[i] = reflect_raw[src_idx];
         }
 
-        // Calculate XYZ coordinates
-        self.calculate_points_fused(n_points);
+        // Calculate XYZ coordinates directly into frame buffers (zero-copy)
+        self.calculate_points_fused_into(n_points, frame_x, frame_y, frame_z);
         self.n_points = n_points;
 
-        // Write to output frame
-        for i in 0..n_points {
-            let range_m = self.range[i] * 0.001;
-            frame.push(
-                self.points.x[i],
-                self.points.y[i],
-                self.points.z[i],
-                self.points.l[i],
-                range_m,
-            );
+        // Copy range to frame (convert to meters)
+        for (i, frame_r) in frame_range.iter_mut().enumerate().take(n_points) {
+            *frame_r = self.range[i] * 0.001;
         }
+
+        // Set the valid length
+        frame.set_len(n_points);
     }
 
-    /// Calculate XYZ coordinates using NEON SIMD (aarch64).
+    /// Calculate XYZ coordinates using NEON SIMD, writing directly to provided
+    /// output slices (true zero-copy).
     #[cfg(target_arch = "aarch64")]
     #[inline(never)]
-    fn calculate_points_fused(&mut self, len: usize) {
+    fn calculate_points_fused_into(
+        &self,
+        len: usize,
+        out_x: &mut [f32],
+        out_y: &mut [f32],
+        out_z: &mut [f32],
+    ) {
         const LANES: usize = 4;
         let n_simd = len - len % LANES;
 
@@ -821,9 +709,9 @@ impl FrameBuilder {
             let y_coeff_ptr = self.y_coeff.as_ptr();
             let y_offset_ptr = self.y_offset.as_ptr();
             let z_coeff_ptr = self.z_coeff.as_ptr();
-            let x_out_ptr = self.points.x.as_mut_ptr();
-            let y_out_ptr = self.points.y.as_mut_ptr();
-            let z_out_ptr = self.points.z.as_mut_ptr();
+            let x_out_ptr = out_x.as_mut_ptr();
+            let y_out_ptr = out_y.as_mut_ptr();
+            let z_out_ptr = out_z.as_mut_ptr();
 
             for i in (0..n_simd).step_by(LANES) {
                 let r = vld1q_f32(range_ptr.add(i));
@@ -850,16 +738,23 @@ impl FrameBuilder {
         // Scalar remainder
         for i in n_simd..len {
             let r = self.range[i];
-            self.points.x[i] = (r * self.x_coeff[i] + self.x_offset[i]) * 0.001;
-            self.points.y[i] = (r * self.y_coeff[i] + self.y_offset[i]) * 0.001;
-            self.points.z[i] = (r * self.z_coeff[i] + self.beam_z) * 0.001;
+            out_x[i] = (r * self.x_coeff[i] + self.x_offset[i]) * 0.001;
+            out_y[i] = (r * self.y_coeff[i] + self.y_offset[i]) * 0.001;
+            out_z[i] = (r * self.z_coeff[i] + self.beam_z) * 0.001;
         }
     }
 
-    /// Calculate XYZ coordinates using portable_simd (nightly, non-aarch64).
+    /// Calculate XYZ coordinates using portable_simd, writing directly to
+    /// provided output slices (true zero-copy).
     #[cfg(all(feature = "portable_simd", not(target_arch = "aarch64")))]
     #[inline(never)]
-    fn calculate_points_fused(&mut self, len: usize) {
+    fn calculate_points_fused_into(
+        &self,
+        len: usize,
+        out_x: &mut [f32],
+        out_y: &mut [f32],
+        out_z: &mut [f32],
+    ) {
         const LANES: usize = 4;
         let n_simd = len - len % LANES;
 
@@ -872,174 +767,43 @@ impl FrameBuilder {
             let xc = Simd::<f32, LANES>::from_slice(&self.x_coeff[i..]);
             let xo = Simd::<f32, LANES>::from_slice(&self.x_offset[i..]);
             let x = (r * xc + xo) * scale;
-            x.copy_to_slice(&mut self.points.x[i..]);
+            x.copy_to_slice(&mut out_x[i..]);
 
             let yc = Simd::<f32, LANES>::from_slice(&self.y_coeff[i..]);
             let yo = Simd::<f32, LANES>::from_slice(&self.y_offset[i..]);
             let y = (r * yc + yo) * scale;
-            y.copy_to_slice(&mut self.points.y[i..]);
+            y.copy_to_slice(&mut out_y[i..]);
 
             let zc = Simd::<f32, LANES>::from_slice(&self.z_coeff[i..]);
             let z = (r * zc + beam_z) * scale;
-            z.copy_to_slice(&mut self.points.z[i..]);
+            z.copy_to_slice(&mut out_z[i..]);
         }
 
         // Scalar remainder
         for i in n_simd..len {
             let r = self.range[i];
-            self.points.x[i] = (r * self.x_coeff[i] + self.x_offset[i]) * 0.001;
-            self.points.y[i] = (r * self.y_coeff[i] + self.y_offset[i]) * 0.001;
-            self.points.z[i] = (r * self.z_coeff[i] + self.beam_z) * 0.001;
+            out_x[i] = (r * self.x_coeff[i] + self.x_offset[i]) * 0.001;
+            out_y[i] = (r * self.y_coeff[i] + self.y_offset[i]) * 0.001;
+            out_z[i] = (r * self.z_coeff[i] + self.beam_z) * 0.001;
         }
     }
 
-    /// Calculate XYZ coordinates using scalar code (fallback).
+    /// Calculate XYZ coordinates using scalar code, writing directly to
+    /// provided output slices (true zero-copy).
     #[cfg(all(not(feature = "portable_simd"), not(target_arch = "aarch64")))]
     #[inline(never)]
-    fn calculate_points_fused(&mut self, len: usize) {
+    fn calculate_points_fused_into(
+        &self,
+        len: usize,
+        out_x: &mut [f32],
+        out_y: &mut [f32],
+        out_z: &mut [f32],
+    ) {
         for i in 0..len {
             let r = self.range[i];
-            self.points.x[i] = (r * self.x_coeff[i] + self.x_offset[i]) * 0.001;
-            self.points.y[i] = (r * self.y_coeff[i] + self.y_offset[i]) * 0.001;
-            self.points.z[i] = (r * self.z_coeff[i] + self.beam_z) * 0.001;
-        }
-    }
-
-    /// Get direct access to internal points for legacy compatibility
-    pub fn points_x(&self) -> &[f32] {
-        &self.points.x[..self.n_points]
-    }
-
-    pub fn points_y(&self) -> &[f32] {
-        &self.points.y[..self.n_points]
-    }
-
-    pub fn points_z(&self) -> &[f32] {
-        &self.points.z[..self.n_points]
-    }
-
-    pub fn points_intensity(&self) -> &[u8] {
-        &self.points.l[..self.n_points]
-    }
-
-    /// Calculate XYZ coordinates from cached range data using NEON SIMD
-    /// (aarch64).
-    ///
-    /// Uses 4-wide NEON lanes with fused multiply-add instructions.
-    #[cfg(target_arch = "aarch64")]
-    #[inline(never)]
-    fn calculate_points(&mut self, len: usize) {
-        const LANES: usize = 4;
-        let n_simd = len - len % LANES;
-
-        // SAFETY: NEON intrinsics are always available on aarch64.
-        // All pointer accesses are bounds-checked by array lengths.
-        unsafe {
-            let beam_to_lidar_z = vdupq_n_f32(self.beam_to_lidar[[2, 3]]);
-            let scale = vdupq_n_f32(0.001);
-
-            let range_ptr = self.range.as_ptr();
-            let x_range_ptr = self.x_range_cache.as_ptr();
-            let x_delta_ptr = self.x_delta_cache.as_ptr();
-            let y_range_ptr = self.y_range_cache.as_ptr();
-            let y_delta_ptr = self.y_delta_cache.as_ptr();
-            let altitude_ptr = self.altitude.as_ptr();
-            let x_out_ptr = self.points.x.as_mut_ptr();
-            let y_out_ptr = self.points.y.as_mut_ptr();
-            let z_out_ptr = self.points.z.as_mut_ptr();
-
-            for index in (0..n_simd).step_by(LANES) {
-                // Load range values
-                let r = vld1q_f32(range_ptr.add(index));
-
-                // X = (r * x_range + x_delta) * scale
-                let x_range = vld1q_f32(x_range_ptr.add(index));
-                let x_delta = vld1q_f32(x_delta_ptr.add(index));
-                let x = vmulq_f32(vfmaq_f32(x_delta, r, x_range), scale);
-                vst1q_f32(x_out_ptr.add(index), x);
-
-                // Y = (r * y_range + y_delta) * scale
-                let y_range = vld1q_f32(y_range_ptr.add(index));
-                let y_delta = vld1q_f32(y_delta_ptr.add(index));
-                let y = vmulq_f32(vfmaq_f32(y_delta, r, y_range), scale);
-                vst1q_f32(y_out_ptr.add(index), y);
-
-                // Z = (r * altitude + beam_to_lidar_z) * scale
-                let alt = vld1q_f32(altitude_ptr.add(index));
-                let z = vmulq_f32(vfmaq_f32(beam_to_lidar_z, r, alt), scale);
-                vst1q_f32(z_out_ptr.add(index), z);
-            }
-        }
-
-        // Handle remaining elements with scalar code
-        let beam_to_lidar_z = self.beam_to_lidar[[2, 3]];
-        for index in n_simd..len {
-            let r = self.range[index];
-            self.points.x[index] =
-                (r * self.x_range_cache[index] + self.x_delta_cache[index]) * 0.001;
-            self.points.y[index] =
-                (r * self.y_range_cache[index] + self.y_delta_cache[index]) * 0.001;
-            self.points.z[index] = (r * self.altitude[index] + beam_to_lidar_z) * 0.001;
-        }
-    }
-
-    /// Calculate XYZ coordinates from cached range data using portable_simd
-    /// (nightly).
-    ///
-    /// Uses 4-wide SIMD lanes for non-aarch64 targets.
-    #[cfg(all(feature = "portable_simd", not(target_arch = "aarch64")))]
-    #[inline(never)]
-    fn calculate_points(&mut self, len: usize) {
-        const LANES: usize = 4;
-        let n_simd = len - len % LANES;
-
-        let beam_to_lidar = Simd::<f32, LANES>::splat(self.beam_to_lidar[[2, 3]]);
-        let scale = Simd::<f32, LANES>::splat(0.001);
-
-        for index in (0..n_simd).step_by(LANES) {
-            let r = Simd::<f32, LANES>::from_slice(&self.range[index..]);
-
-            let x_range = Simd::<f32, LANES>::from_slice(&self.x_range_cache[index..]);
-            let x_delta = Simd::<f32, LANES>::from_slice(&self.x_delta_cache[index..]);
-            let x = (r * x_range + x_delta) * scale;
-            x.copy_to_slice(&mut self.points.x[index..]);
-
-            let y_range = Simd::<f32, LANES>::from_slice(&self.y_range_cache[index..]);
-            let y_delta = Simd::<f32, LANES>::from_slice(&self.y_delta_cache[index..]);
-            let y = (r * y_range + y_delta) * scale;
-            y.copy_to_slice(&mut self.points.y[index..]);
-
-            let altitude = Simd::<f32, LANES>::from_slice(&self.altitude[index..]);
-            let z = (r * altitude + beam_to_lidar) * scale;
-            z.copy_to_slice(&mut self.points.z[index..]);
-        }
-
-        // Handle remaining elements with scalar code
-        let beam_to_lidar_z = self.beam_to_lidar[[2, 3]];
-        for index in n_simd..len {
-            let r = self.range[index];
-            self.points.x[index] =
-                (r * self.x_range_cache[index] + self.x_delta_cache[index]) * 0.001;
-            self.points.y[index] =
-                (r * self.y_range_cache[index] + self.y_delta_cache[index]) * 0.001;
-            self.points.z[index] = (r * self.altitude[index] + beam_to_lidar_z) * 0.001;
-        }
-    }
-
-    /// Calculate XYZ coordinates from cached range data using scalar code
-    /// (fallback).
-    #[cfg(all(not(feature = "portable_simd"), not(target_arch = "aarch64")))]
-    #[inline(never)]
-    fn calculate_points(&mut self, len: usize) {
-        let beam_to_lidar_z = self.beam_to_lidar[[2, 3]];
-
-        for index in 0..len {
-            let r = self.range[index];
-            self.points.x[index] =
-                (r * self.x_range_cache[index] + self.x_delta_cache[index]) * 0.001;
-            self.points.y[index] =
-                (r * self.y_range_cache[index] + self.y_delta_cache[index]) * 0.001;
-            self.points.z[index] = (r * self.altitude[index] + beam_to_lidar_z) * 0.001;
+            out_x[i] = (r * self.x_coeff[i] + self.x_offset[i]) * 0.001;
+            out_y[i] = (r * self.y_coeff[i] + self.y_offset[i]) * 0.001;
+            out_z[i] = (r * self.z_coeff[i] + self.beam_z) * 0.001;
         }
     }
 }
@@ -1162,19 +926,42 @@ impl LidarFrameWriter for OusterLidarFrame {
     fn set_len(&mut self, len: usize) {
         self.len = len.min(self.capacity());
     }
+
+    fn buffers_mut(&mut self) -> (&mut [f32], &mut [f32], &mut [f32], &mut [u8], &mut [f32]) {
+        (
+            &mut self.x,
+            &mut self.y,
+            &mut self.z,
+            &mut self.intensity,
+            &mut self.range,
+        )
+    }
 }
+
+/// Maximum UDP packet size for Ouster sensors (OS1-128 at 1024 mode)
+const MAX_PACKET_SIZE: usize = 16 * 1024;
 
 /// Ouster LiDAR driver implementing the common LidarDriver trait
 ///
 /// This driver wraps the FrameReader and FrameBuilder to provide
 /// a unified interface for processing Ouster UDP packets.
+///
+/// # Zero-Copy Architecture
+///
+/// The driver uses a true zero-copy design:
+/// - FrameReader owns internal depth/reflect buffers (never copied)
+/// - FrameBuilder writes directly to client-provided frame buffers
+/// - No intermediate copies or allocations during processing
+/// - Pre-allocated packet buffer handles frame boundary packets
 pub struct OusterDriver {
-    /// Frame reader for packet parsing
+    /// Frame reader for packet parsing (owns depth/reflect buffers)
     frame_reader: FrameReader,
     /// Frame builder for point cloud computation
     frame_builder: FrameBuilder,
-    /// Pending frame data (depth, reflect) waiting to be processed
-    pending_frame: Option<(u64, u16, Array2<u16>, Array2<u8>)>,
+    /// Pre-allocated buffer for packet that triggers frame boundary
+    pending_packet_buf: Vec<u8>,
+    /// Length of valid data in pending_packet_buf (0 = no pending packet)
+    pending_packet_len: usize,
 }
 
 impl OusterDriver {
@@ -1186,7 +973,8 @@ impl OusterDriver {
         Ok(Self {
             frame_reader,
             frame_builder,
-            pending_frame: None,
+            pending_packet_buf: vec![0u8; MAX_PACKET_SIZE],
+            pending_packet_len: 0,
         })
     }
 
@@ -1204,59 +992,42 @@ impl OusterDriver {
     pub fn crop(&self) -> (usize, usize) {
         self.frame_builder.crop
     }
-
-    /// Get access to the range buffer (for clustering, legacy)
-    pub fn range(&self) -> &[f32] {
-        &self.frame_builder.range
-    }
-
-    /// Get the number of valid points in the last frame
-    pub fn n_points(&self) -> usize {
-        self.frame_builder.n_points
-    }
-
-    /// Get direct access to point X coordinates
-    pub fn points_x(&self) -> &[f32] {
-        self.frame_builder.points_x()
-    }
-
-    /// Get direct access to point Y coordinates
-    pub fn points_y(&self) -> &[f32] {
-        self.frame_builder.points_y()
-    }
-
-    /// Get direct access to point Z coordinates
-    pub fn points_z(&self) -> &[f32] {
-        self.frame_builder.points_z()
-    }
-
-    /// Get direct access to point intensities
-    pub fn points_intensity(&self) -> &[u8] {
-        self.frame_builder.points_intensity()
-    }
 }
 
 impl LidarDriver for OusterDriver {
     fn process<F: LidarFrameWriter>(&mut self, frame: &mut F, data: &[u8]) -> Result<bool, Error> {
-        // Use the existing FrameReader to parse packets
-        self.frame_reader
-            .update(data, |timestamp, frame_id, depth, reflect| {
-                // Warn if we're overwriting a pending frame (PR #4 fix)
-                if self.pending_frame.is_some() {
-                    warn!("Dropping unprocessed frame - processing too slow");
-                }
-                self.pending_frame = Some((timestamp, frame_id, depth, reflect));
-            })?;
+        // Process pending packet from previous frame boundary first
+        if self.pending_packet_len > 0 {
+            let pending = &self.pending_packet_buf[..self.pending_packet_len];
+            self.frame_reader.update(pending)?;
+            self.pending_packet_len = 0;
+        }
 
-        // Check if we have a complete frame
-        if let Some((timestamp, frame_id, depth, reflect)) = self.pending_frame.take() {
+        // Process current packet
+        let frame_ready = self.frame_reader.update(data)?;
+
+        if frame_ready {
+            // Store this packet in pre-allocated buffer (no allocation)
+            let len = data.len().min(MAX_PACKET_SIZE);
+            self.pending_packet_buf[..len].copy_from_slice(&data[..len]);
+            self.pending_packet_len = len;
+
+            // Get zero-copy references to FrameReader's buffers
+            let timestamp = self.frame_reader.timestamp();
+            let frame_id = self.frame_reader.frame_id();
+            let depth = self.frame_reader.depth();
+            let reflect = self.frame_reader.reflect();
+
             // Reset frame for new data
             frame.reset();
             frame.set_timestamp(timestamp);
             frame.set_frame_id(frame_id as u32);
 
-            // Build point cloud from depth and reflectivity data
-            self.frame_builder.update_fused(&depth, &reflect, frame);
+            // Build point cloud directly into frame buffers (true zero-copy)
+            self.frame_builder.update_fused(depth, reflect, frame);
+
+            // Prepare FrameReader for next frame
+            self.frame_reader.start_new_frame();
 
             Ok(true)
         } else {
