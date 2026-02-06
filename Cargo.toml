@@ -83,3 +83,12 @@ debug = true
 [[bench]]
 name = "format_points_bench"
 harness = false
+
+[[bench]]
+name = "driver_bench"
+harness = false
+required-features = ["pcap"]
+
+[dev-dependencies]
+criterion = { version = "0.6", features = ["html_reports"] }
+tokio = { version = "1.49.0", features = ["rt", "macros"] }
