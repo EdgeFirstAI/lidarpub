@@ -18,8 +18,12 @@ use serde::{Deserialize, Serialize};
 use std::{f32::consts::PI, fmt};
 use tracing::{info_span, instrument, warn};
 
-#[cfg(feature = "portable_simd")]
+// SIMD imports: NEON on aarch64 (stable), portable_simd elsewhere (nightly)
+#[cfg(all(feature = "portable_simd", not(target_arch = "aarch64")))]
 use std::simd::Simd;
+
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::*;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
@@ -487,6 +491,22 @@ pub struct FrameBuilder {
     x_delta_cache: Vec<f32>,
     y_delta_cache: Vec<f32>,
     altitude: Vec<f32>,
+
+    // Pre-computed coefficients in linear output order for direct indexing.
+    /// Source indices: linear index into packet depth/reflect arrays
+    src_indices: Vec<usize>,
+    /// Pre-flattened x_range coefficients (for r * x_coeff calculation)
+    x_coeff: Vec<f32>,
+    /// Pre-flattened y_range coefficients (for r * y_coeff calculation)
+    y_coeff: Vec<f32>,
+    /// Pre-flattened x_delta offsets
+    x_offset: Vec<f32>,
+    /// Pre-flattened y_delta offsets
+    y_offset: Vec<f32>,
+    /// Pre-flattened altitude coefficients (sin of altitude angle)
+    z_coeff: Vec<f32>,
+    /// beam_to_lidar Z offset (cached for SIMD broadcast)
+    beam_z: f32,
 }
 
 impl FrameBuilder {
@@ -544,14 +564,52 @@ impl FrameBuilder {
             }
         }
 
-        let x_delta = enc
+        let x_delta: Vec<f32> = enc
             .iter()
             .map(|x| beam_to_lidar[[0, 3]] * x.cos())
             .collect();
-        let y_delta = enc
+        let y_delta: Vec<f32> = enc
             .iter()
             .map(|x| beam_to_lidar[[0, 3]] * x.sin())
             .collect();
+
+        // Pre-compute altitude sin values
+        let altitude_sin: Vec<f32> = altitude_angles.iter().map(|x| x.sin()).collect();
+
+        // Pre-compute coefficients in linear output order.
+        let output_cols = crop.1 - crop.0;
+        let n_output_points = rows * output_cols;
+        let mut src_indices = Vec::with_capacity(n_output_points);
+        let mut x_coeff = Vec::with_capacity(n_output_points);
+        let mut y_coeff = Vec::with_capacity(n_output_points);
+        let mut x_offset = Vec::with_capacity(n_output_points);
+        let mut y_offset = Vec::with_capacity(n_output_points);
+        let mut z_coeff = Vec::with_capacity(n_output_points);
+
+        let col_base = column_window[0] as i16;
+        let packet_cols = column_window[1] - column_window[0];
+
+        for row in 0..rows {
+            let col_offset = (col_base - pixel_shift_by_row[row]).max(0) as usize;
+
+            for col in crop.0..crop.1 {
+                // Source index: reverse pixel shift to find packet data location
+                let shift = pixel_shift_by_row[row];
+                let src_col = ((col as i16 - shift).clamp(0, packet_cols as i16 - 1)) as usize
+                    + column_window[0];
+                src_indices.push(row * cols + src_col);
+
+                // Lookup table index with column offset adjustment
+                let lookup_col = col + col_offset;
+                x_coeff.push(x_range[[row, lookup_col]]);
+                y_coeff.push(y_range[[row, lookup_col]]);
+                x_offset.push(x_delta[lookup_col]);
+                y_offset.push(y_delta[lookup_col]);
+                z_coeff.push(altitude_sin[row]);
+            }
+        }
+
+        let beam_z = beam_to_lidar[[2, 3]];
 
         FrameBuilder {
             rows,
@@ -563,7 +621,7 @@ impl FrameBuilder {
             column_window,
             pixel_shift_by_row,
             beam_to_lidar,
-            altitude_angles: altitude_angles.iter().map(|x| x.sin()).collect(),
+            altitude_angles: altitude_sin,
             crop,
             range_delta,
             range: vec![0f32; maxlen],
@@ -576,6 +634,14 @@ impl FrameBuilder {
             y_range_cache: vec![0f32; maxlen],
             x_delta_cache: vec![0f32; maxlen],
             y_delta_cache: vec![0f32; maxlen],
+            // Pre-computed coefficients
+            src_indices,
+            x_coeff,
+            y_coeff,
+            x_offset,
+            y_offset,
+            z_coeff,
+            beam_z,
         }
     }
 
@@ -691,6 +757,154 @@ impl FrameBuilder {
         }
     }
 
+    /// Process depth and reflectivity data into XYZ point cloud.
+    ///
+    /// Reads directly from packet arrays, applies range scaling, computes
+    /// Cartesian coordinates using pre-computed lookup tables, and writes
+    /// to the output frame.
+    #[instrument(skip_all, fields(rows = self.rows, cols = self.cols))]
+    pub fn update_fused<F: LidarFrameWriter>(
+        &mut self,
+        depth: &Array2<u16>,
+        reflect: &Array2<u8>,
+        frame: &mut F,
+    ) {
+        let n_points = self.src_indices.len();
+        let depth_raw = depth.as_slice().expect("depth array not contiguous");
+        let reflect_raw = reflect.as_slice().expect("reflect array not contiguous");
+
+        // Convert depth to range and extract intensity
+        for i in 0..n_points {
+            let src_idx = self.src_indices[i];
+            let d = depth_raw[src_idx];
+            // Range calculation: 0 stays 0, otherwise apply scale and offset
+            self.range[i] = if d == 0 {
+                0.0
+            } else {
+                d as f32 * 8.0 - self.range_delta
+            };
+            self.points.l[i] = reflect_raw[src_idx];
+        }
+
+        // Calculate XYZ coordinates
+        self.calculate_points_fused(n_points);
+        self.n_points = n_points;
+
+        // Write to output frame
+        for i in 0..n_points {
+            let range_m = self.range[i] * 0.001;
+            frame.push(
+                self.points.x[i],
+                self.points.y[i],
+                self.points.z[i],
+                self.points.l[i],
+                range_m,
+            );
+        }
+    }
+
+    /// Calculate XYZ coordinates using NEON SIMD (aarch64).
+    #[cfg(target_arch = "aarch64")]
+    #[inline(never)]
+    fn calculate_points_fused(&mut self, len: usize) {
+        const LANES: usize = 4;
+        let n_simd = len - len % LANES;
+
+        // SAFETY: NEON intrinsics are always available on aarch64.
+        unsafe {
+            let beam_z = vdupq_n_f32(self.beam_z);
+            let scale = vdupq_n_f32(0.001);
+
+            let range_ptr = self.range.as_ptr();
+            let x_coeff_ptr = self.x_coeff.as_ptr();
+            let x_offset_ptr = self.x_offset.as_ptr();
+            let y_coeff_ptr = self.y_coeff.as_ptr();
+            let y_offset_ptr = self.y_offset.as_ptr();
+            let z_coeff_ptr = self.z_coeff.as_ptr();
+            let x_out_ptr = self.points.x.as_mut_ptr();
+            let y_out_ptr = self.points.y.as_mut_ptr();
+            let z_out_ptr = self.points.z.as_mut_ptr();
+
+            for i in (0..n_simd).step_by(LANES) {
+                let r = vld1q_f32(range_ptr.add(i));
+
+                // X = (r * x_coeff + x_offset) * scale
+                let xc = vld1q_f32(x_coeff_ptr.add(i));
+                let xo = vld1q_f32(x_offset_ptr.add(i));
+                let x = vmulq_f32(vfmaq_f32(xo, r, xc), scale);
+                vst1q_f32(x_out_ptr.add(i), x);
+
+                // Y = (r * y_coeff + y_offset) * scale
+                let yc = vld1q_f32(y_coeff_ptr.add(i));
+                let yo = vld1q_f32(y_offset_ptr.add(i));
+                let y = vmulq_f32(vfmaq_f32(yo, r, yc), scale);
+                vst1q_f32(y_out_ptr.add(i), y);
+
+                // Z = (r * z_coeff + beam_z) * scale
+                let zc = vld1q_f32(z_coeff_ptr.add(i));
+                let z = vmulq_f32(vfmaq_f32(beam_z, r, zc), scale);
+                vst1q_f32(z_out_ptr.add(i), z);
+            }
+        }
+
+        // Scalar remainder
+        for i in n_simd..len {
+            let r = self.range[i];
+            self.points.x[i] = (r * self.x_coeff[i] + self.x_offset[i]) * 0.001;
+            self.points.y[i] = (r * self.y_coeff[i] + self.y_offset[i]) * 0.001;
+            self.points.z[i] = (r * self.z_coeff[i] + self.beam_z) * 0.001;
+        }
+    }
+
+    /// Calculate XYZ coordinates using portable_simd (nightly, non-aarch64).
+    #[cfg(all(feature = "portable_simd", not(target_arch = "aarch64")))]
+    #[inline(never)]
+    fn calculate_points_fused(&mut self, len: usize) {
+        const LANES: usize = 4;
+        let n_simd = len - len % LANES;
+
+        let beam_z = Simd::<f32, LANES>::splat(self.beam_z);
+        let scale = Simd::<f32, LANES>::splat(0.001);
+
+        for i in (0..n_simd).step_by(LANES) {
+            let r = Simd::<f32, LANES>::from_slice(&self.range[i..]);
+
+            let xc = Simd::<f32, LANES>::from_slice(&self.x_coeff[i..]);
+            let xo = Simd::<f32, LANES>::from_slice(&self.x_offset[i..]);
+            let x = (r * xc + xo) * scale;
+            x.copy_to_slice(&mut self.points.x[i..]);
+
+            let yc = Simd::<f32, LANES>::from_slice(&self.y_coeff[i..]);
+            let yo = Simd::<f32, LANES>::from_slice(&self.y_offset[i..]);
+            let y = (r * yc + yo) * scale;
+            y.copy_to_slice(&mut self.points.y[i..]);
+
+            let zc = Simd::<f32, LANES>::from_slice(&self.z_coeff[i..]);
+            let z = (r * zc + beam_z) * scale;
+            z.copy_to_slice(&mut self.points.z[i..]);
+        }
+
+        // Scalar remainder
+        for i in n_simd..len {
+            let r = self.range[i];
+            self.points.x[i] = (r * self.x_coeff[i] + self.x_offset[i]) * 0.001;
+            self.points.y[i] = (r * self.y_coeff[i] + self.y_offset[i]) * 0.001;
+            self.points.z[i] = (r * self.z_coeff[i] + self.beam_z) * 0.001;
+        }
+    }
+
+    /// Calculate XYZ coordinates using scalar code (fallback).
+    #[cfg(all(not(feature = "portable_simd"), not(target_arch = "aarch64")))]
+    #[inline(never)]
+    fn calculate_points_fused(&mut self, len: usize) {
+        for i in 0..len {
+            let r = self.range[i];
+            self.points.x[i] = (r * self.x_coeff[i] + self.x_offset[i]) * 0.001;
+            self.points.y[i] = (r * self.y_coeff[i] + self.y_offset[i]) * 0.001;
+            self.points.z[i] = (r * self.z_coeff[i] + self.beam_z) * 0.001;
+        }
+    }
+
     /// Get direct access to internal points for legacy compatibility
     pub fn points_x(&self) -> &[f32] {
         &self.points.x[..self.n_points]
@@ -708,52 +922,113 @@ impl FrameBuilder {
         &self.points.l[..self.n_points]
     }
 
-    /// Calculate XYZ coordinates from range data using SIMD (portable_simd
-    /// feature).
+    /// Calculate XYZ coordinates from cached range data using NEON SIMD
+    /// (aarch64).
     ///
-    /// Uses 4-wide SIMD lanes for processing.
-    #[cfg(feature = "portable_simd")]
+    /// Uses 4-wide NEON lanes with fused multiply-add instructions.
+    #[cfg(target_arch = "aarch64")]
     #[inline(never)]
     fn calculate_points(&mut self, len: usize) {
         const LANES: usize = 4;
+        let n_simd = len - len % LANES;
 
-        let beam_to_lidar = Simd::<f32, LANES>::splat(self.beam_to_lidar[[2, 3]]);
-        let scale = Simd::<f32, LANES>::splat(0.001);
+        // SAFETY: NEON intrinsics are always available on aarch64.
+        // All pointer accesses are bounds-checked by array lengths.
+        unsafe {
+            let beam_to_lidar_z = vdupq_n_f32(self.beam_to_lidar[[2, 3]]);
+            let scale = vdupq_n_f32(0.001);
 
-        for index in (0..len).step_by(LANES) {
-            let r = Simd::<f32, LANES>::from_slice(&self.range[index..]);
+            let range_ptr = self.range.as_ptr();
+            let x_range_ptr = self.x_range_cache.as_ptr();
+            let x_delta_ptr = self.x_delta_cache.as_ptr();
+            let y_range_ptr = self.y_range_cache.as_ptr();
+            let y_delta_ptr = self.y_delta_cache.as_ptr();
+            let altitude_ptr = self.altitude.as_ptr();
+            let x_out_ptr = self.points.x.as_mut_ptr();
+            let y_out_ptr = self.points.y.as_mut_ptr();
+            let z_out_ptr = self.points.z.as_mut_ptr();
 
-            let x_range = Simd::<f32, LANES>::from_slice(&self.x_range_cache[index..]);
-            let x_delta = Simd::<f32, LANES>::from_slice(&self.x_delta_cache[index..]);
-            let x = r * x_range + x_delta;
-            let x = x * scale;
-            x.copy_to_slice(&mut self.points.x[index..]);
+            for index in (0..n_simd).step_by(LANES) {
+                // Load range values
+                let r = vld1q_f32(range_ptr.add(index));
 
-            let y_range = Simd::<f32, LANES>::from_slice(&self.y_range_cache[index..]);
-            let y_delta = Simd::<f32, LANES>::from_slice(&self.y_delta_cache[index..]);
-            let y = r * y_range + y_delta;
-            let y = y * scale;
-            y.copy_to_slice(&mut self.points.y[index..]);
+                // X = (r * x_range + x_delta) * scale
+                let x_range = vld1q_f32(x_range_ptr.add(index));
+                let x_delta = vld1q_f32(x_delta_ptr.add(index));
+                let x = vmulq_f32(vfmaq_f32(x_delta, r, x_range), scale);
+                vst1q_f32(x_out_ptr.add(index), x);
 
-            let altitude = Simd::<f32, LANES>::from_slice(&self.altitude[index..]);
-            let z = r * altitude + beam_to_lidar;
-            let z = z * scale;
-            z.copy_to_slice(&mut self.points.z[index..]);
+                // Y = (r * y_range + y_delta) * scale
+                let y_range = vld1q_f32(y_range_ptr.add(index));
+                let y_delta = vld1q_f32(y_delta_ptr.add(index));
+                let y = vmulq_f32(vfmaq_f32(y_delta, r, y_range), scale);
+                vst1q_f32(y_out_ptr.add(index), y);
+
+                // Z = (r * altitude + beam_to_lidar_z) * scale
+                let alt = vld1q_f32(altitude_ptr.add(index));
+                let z = vmulq_f32(vfmaq_f32(beam_to_lidar_z, r, alt), scale);
+                vst1q_f32(z_out_ptr.add(index), z);
+            }
         }
 
-        // Handle remaining elements that don't fill a full SIMD lane
-        for index in len - len % LANES..len {
+        // Handle remaining elements with scalar code
+        let beam_to_lidar_z = self.beam_to_lidar[[2, 3]];
+        for index in n_simd..len {
             let r = self.range[index];
             self.points.x[index] =
                 (r * self.x_range_cache[index] + self.x_delta_cache[index]) * 0.001;
             self.points.y[index] =
                 (r * self.y_range_cache[index] + self.y_delta_cache[index]) * 0.001;
-            self.points.z[index] = (r * self.altitude[index] + self.beam_to_lidar[[2, 3]]) * 0.001;
+            self.points.z[index] = (r * self.altitude[index] + beam_to_lidar_z) * 0.001;
         }
     }
 
-    /// Calculate XYZ coordinates from range data using scalar code (fallback).
-    #[cfg(not(feature = "portable_simd"))]
+    /// Calculate XYZ coordinates from cached range data using portable_simd
+    /// (nightly).
+    ///
+    /// Uses 4-wide SIMD lanes for non-aarch64 targets.
+    #[cfg(all(feature = "portable_simd", not(target_arch = "aarch64")))]
+    #[inline(never)]
+    fn calculate_points(&mut self, len: usize) {
+        const LANES: usize = 4;
+        let n_simd = len - len % LANES;
+
+        let beam_to_lidar = Simd::<f32, LANES>::splat(self.beam_to_lidar[[2, 3]]);
+        let scale = Simd::<f32, LANES>::splat(0.001);
+
+        for index in (0..n_simd).step_by(LANES) {
+            let r = Simd::<f32, LANES>::from_slice(&self.range[index..]);
+
+            let x_range = Simd::<f32, LANES>::from_slice(&self.x_range_cache[index..]);
+            let x_delta = Simd::<f32, LANES>::from_slice(&self.x_delta_cache[index..]);
+            let x = (r * x_range + x_delta) * scale;
+            x.copy_to_slice(&mut self.points.x[index..]);
+
+            let y_range = Simd::<f32, LANES>::from_slice(&self.y_range_cache[index..]);
+            let y_delta = Simd::<f32, LANES>::from_slice(&self.y_delta_cache[index..]);
+            let y = (r * y_range + y_delta) * scale;
+            y.copy_to_slice(&mut self.points.y[index..]);
+
+            let altitude = Simd::<f32, LANES>::from_slice(&self.altitude[index..]);
+            let z = (r * altitude + beam_to_lidar) * scale;
+            z.copy_to_slice(&mut self.points.z[index..]);
+        }
+
+        // Handle remaining elements with scalar code
+        let beam_to_lidar_z = self.beam_to_lidar[[2, 3]];
+        for index in n_simd..len {
+            let r = self.range[index];
+            self.points.x[index] =
+                (r * self.x_range_cache[index] + self.x_delta_cache[index]) * 0.001;
+            self.points.y[index] =
+                (r * self.y_range_cache[index] + self.y_delta_cache[index]) * 0.001;
+            self.points.z[index] = (r * self.altitude[index] + beam_to_lidar_z) * 0.001;
+        }
+    }
+
+    /// Calculate XYZ coordinates from cached range data using scalar code
+    /// (fallback).
+    #[cfg(all(not(feature = "portable_simd"), not(target_arch = "aarch64")))]
     #[inline(never)]
     fn calculate_points(&mut self, len: usize) {
         let beam_to_lidar_z = self.beam_to_lidar[[2, 3]];
@@ -980,9 +1255,8 @@ impl LidarDriver for OusterDriver {
             frame.set_timestamp(timestamp);
             frame.set_frame_id(frame_id as u32);
 
-            // Process the frame through FrameBuilder directly into the client's frame
-            self.frame_builder
-                .update_into_frame(&depth, &reflect, frame);
+            // Build point cloud from depth and reflectivity data
+            self.frame_builder.update_fused(&depth, &reflect, frame);
 
             Ok(true)
         } else {

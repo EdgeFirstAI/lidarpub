@@ -10,7 +10,8 @@
 //! Run with: cargo bench --bench driver_bench --features pcap
 //!
 //! For on-target profiling, cross-compile and run:
-//!   cargo bench --bench driver_bench --features pcap --target aarch64-unknown-linux-gnu
+//!   cargo bench --bench driver_bench --features pcap --target
+//! aarch64-unknown-linux-gnu
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::path::Path;
@@ -46,9 +47,9 @@ fn load_packets(path: &str, port: Option<u16>) -> Vec<Vec<u8>> {
     let mut source = source;
     while source.has_more() {
         let mut buf = vec![0u8; 16 * 1024];
-        let len = rt.block_on(async {
-            source.recv(&mut buf).await
-        }).expect("Failed to read packet");
+        let len = rt
+            .block_on(async { source.recv(&mut buf).await })
+            .expect("Failed to read packet");
         buf.truncate(len);
         packets.push(buf);
     }
@@ -102,10 +103,10 @@ fn load_ouster_params() -> Parameters {
         udp_profile_imu: Option<String>,
     }
 
-    let sensor_info_str = std::fs::read_to_string(OS1_SENSOR_INFO)
-        .expect("Failed to read sensor_info.json");
-    let partial: PartialSensorInfo = serde_json::from_str(&sensor_info_str)
-        .expect("Failed to parse sensor_info.json");
+    let sensor_info_str =
+        std::fs::read_to_string(OS1_SENSOR_INFO).expect("Failed to read sensor_info.json");
+    let partial: PartialSensorInfo =
+        serde_json::from_str(&sensor_info_str).expect("Failed to parse sensor_info.json");
 
     let lidar_mode = partial.lidar_mode.as_deref().unwrap_or("1024x10");
     let cols: usize = lidar_mode
@@ -123,18 +124,30 @@ fn load_ouster_params() -> Parameters {
     use edgefirst_lidarpub::ouster::{BeamIntrinsics, LidarDataFormat, SensorInfo};
 
     let beam_intrinsics = BeamIntrinsics {
-        beam_altitude_angles: partial.beam_altitude_angles.unwrap_or_else(|| {
-            (0..rows).map(|i| (i as f32 - 31.5) * 0.7).collect()
-        }),
+        beam_altitude_angles: partial
+            .beam_altitude_angles
+            .unwrap_or_else(|| (0..rows).map(|i| (i as f32 - 31.5) * 0.7).collect()),
         beam_azimuth_angles: partial
             .beam_azimuth_angles
             .unwrap_or_else(|| vec![0.0; rows]),
         beam_to_lidar_transform: partial.beam_to_lidar_transform.unwrap_or_else(|| {
             vec![
-                1.0, 0.0, 0.0, partial.lidar_origin_to_beam_origin_mm.unwrap_or(27.67),
-                0.0, 1.0, 0.0, 0.0,
-                0.0, 0.0, 1.0, 0.0,
-                0.0, 0.0, 0.0, 1.0,
+                1.0,
+                0.0,
+                0.0,
+                partial.lidar_origin_to_beam_origin_mm.unwrap_or(27.67),
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
             ]
         }),
     };
@@ -422,8 +435,14 @@ fn bench_comparison(c: &mut Criterion) {
         (frames, points)
     };
 
-    println!("Robosense E1R: {} frames, {} total points", e1r_frames, e1r_points);
-    println!("Ouster OS1: {} frames, {} total points", os1_frames, os1_points);
+    println!(
+        "Robosense E1R: {} frames, {} total points",
+        e1r_frames, e1r_points
+    );
+    println!(
+        "Ouster OS1: {} frames, {} total points",
+        os1_frames, os1_points
+    );
 
     // Benchmark throughput in points per second
     group.throughput(Throughput::Elements(e1r_points as u64));

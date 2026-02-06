@@ -14,6 +14,10 @@ path = "src/main.rs"
 name = "lidar_viewer"
 required-features = ["rerun"]
 
+[[example]]
+name = "pcap_viewer"
+required-features = ["rerun"]
+
 [features]
 default = ["tracy"]
 # Enable portable_simd for non-aarch64 targets when using nightly Rust.
