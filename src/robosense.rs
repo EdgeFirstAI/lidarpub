@@ -275,6 +275,8 @@ pub struct RobosenseDriver {
     device_info: DeviceInfo,
     /// Whether we've received any packets yet
     first_packet: bool,
+    /// Frame was completed on previous call; next call must reset before processing
+    needs_reset: bool,
 }
 
 impl RobosenseDriver {
@@ -285,6 +287,7 @@ impl RobosenseDriver {
             last_pkt_cnt: u16::MAX,
             device_info: DeviceInfo::default(),
             first_packet: true,
+            needs_reset: false,
         }
     }
 
@@ -451,27 +454,35 @@ impl LidarDriver for RobosenseDriver {
         // Parse header
         let header = self.parse_header(data)?;
 
-        // Check for frame boundary
-        let is_boundary = self.is_frame_boundary(header.pkt_cnt);
-        let frame_complete = is_boundary && !self.first_packet && !frame.is_empty();
-
-        // If frame is complete, return early so client can consume it
-        // Next call will start fresh frame
-        if frame_complete {
-            // Increment frame_id for next frame
-            self.frame_id = self.frame_id.wrapping_add(1);
-            self.last_pkt_cnt = header.pkt_cnt;
-            self.first_packet = false;
-            return Ok(true);
-        }
-
-        // Start new frame if at boundary
-        if is_boundary {
+        // If previous call returned Ok(true), reset frame for the new cycle.
+        // The boundary packet that triggered completion was already consumed,
+        // so this packet is the first data packet of the new frame.
+        if self.needs_reset {
             frame.reset();
-            // Use local timestamp if available, otherwise use packet timestamp
             let ts = timestamp().unwrap_or(header.timestamp_ns);
             frame.set_timestamp(ts);
             frame.set_frame_id(self.frame_id);
+            self.needs_reset = false;
+        } else {
+            // Check for frame boundary
+            let is_boundary = self.is_frame_boundary(header.pkt_cnt);
+            let frame_complete = is_boundary && !self.first_packet && !frame.is_empty();
+
+            if frame_complete {
+                self.frame_id = self.frame_id.wrapping_add(1);
+                self.last_pkt_cnt = header.pkt_cnt;
+                self.first_packet = false;
+                self.needs_reset = true;
+                return Ok(true);
+            }
+
+            // Start new frame if at boundary (first packet case)
+            if is_boundary {
+                frame.reset();
+                let ts = timestamp().unwrap_or(header.timestamp_ns);
+                frame.set_timestamp(ts);
+                frame.set_frame_id(self.frame_id);
+            }
         }
 
         self.first_packet = false;
@@ -550,6 +561,7 @@ mod tests {
         let driver = RobosenseDriver::new();
         assert_eq!(driver.frame_id, 0);
         assert!(driver.first_packet);
+        assert!(!driver.needs_reset);
     }
 
     #[test]
