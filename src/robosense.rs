@@ -52,6 +52,42 @@ const DIFOP_SYNC: [u8; 8] = [0xa5, 0xff, 0x00, 0x5a, 0x11, 0x11, 0x55, 0x55];
 /// DIFOP packet size
 const DIFOP_PACKET_SIZE: usize = 256;
 
+/// Return mode values from MSOP header byte 8
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReturnMode {
+    /// Dual return mode
+    Dual = 0x00,
+    /// Strongest return mode
+    #[default]
+    Strongest = 0x04,
+    /// Last return mode
+    Last = 0x05,
+    /// Nearest return mode
+    Nearest = 0x06,
+}
+
+impl From<u8> for ReturnMode {
+    fn from(value: u8) -> Self {
+        match value {
+            0x00 => ReturnMode::Dual,
+            0x05 => ReturnMode::Last,
+            0x06 => ReturnMode::Nearest,
+            _ => ReturnMode::Strongest,
+        }
+    }
+}
+
+impl std::fmt::Display for ReturnMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReturnMode::Dual => write!(f, "Dual"),
+            ReturnMode::Strongest => write!(f, "Strongest"),
+            ReturnMode::Last => write!(f, "Last"),
+            ReturnMode::Nearest => write!(f, "Nearest"),
+        }
+    }
+}
+
 /// Time synchronization mode values
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TimeSyncMode {
@@ -96,8 +132,25 @@ impl From<u8> for TimeSyncStatus {
     }
 }
 
+/// IMU data from DIFOP packets (bytes 200-223)
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImuData {
+    /// Accelerometer X-axis (m/s²)
+    pub accel_x: f32,
+    /// Accelerometer Y-axis (m/s²)
+    pub accel_y: f32,
+    /// Accelerometer Z-axis (m/s²)
+    pub accel_z: f32,
+    /// Gyroscope X-axis (rad/s)
+    pub gyro_x: f32,
+    /// Gyroscope Y-axis (rad/s)
+    pub gyro_y: f32,
+    /// Gyroscope Z-axis (rad/s)
+    pub gyro_z: f32,
+}
+
 /// Device information from DIFOP packets
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 #[allow(dead_code)]
 pub struct DeviceInfo {
     /// Device serial number
@@ -116,6 +169,8 @@ pub struct DeviceInfo {
     pub msop_port: u16,
     /// DIFOP destination port
     pub difop_port: u16,
+    /// IMU data (accelerometer and gyroscope)
+    pub imu: Option<ImuData>,
 }
 
 impl DeviceInfo {
@@ -277,6 +332,10 @@ pub struct RobosenseDriver {
     first_packet: bool,
     /// Frame was completed on previous call; next call must reset before processing
     needs_reset: bool,
+    /// Return mode from MSOP header
+    return_mode: ReturnMode,
+    /// Whether to filter noisy points (PointAttribute == 2)
+    filter_noisy: bool,
 }
 
 impl RobosenseDriver {
@@ -288,7 +347,19 @@ impl RobosenseDriver {
             device_info: DeviceInfo::default(),
             first_packet: true,
             needs_reset: false,
+            return_mode: ReturnMode::default(),
+            filter_noisy: true,
         }
+    }
+
+    /// Get the current return mode
+    pub fn return_mode(&self) -> ReturnMode {
+        self.return_mode
+    }
+
+    /// Set whether to filter noisy points
+    pub fn set_filter_noisy(&mut self, filter: bool) {
+        self.filter_noisy = filter;
     }
 
     /// Process a DIFOP packet for device information
@@ -332,6 +403,35 @@ impl RobosenseDriver {
         // Time sync status: byte 102
         self.device_info.timesync_status = TimeSyncStatus::from(data[102]);
 
+        // IMU data: bytes 200-223, 6× big-endian f32
+        // Order: accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z
+        if data.len() >= 224 {
+            let accel_x = f32::from_be_bytes([data[200], data[201], data[202], data[203]]);
+            let accel_y = f32::from_be_bytes([data[204], data[205], data[206], data[207]]);
+            let accel_z = f32::from_be_bytes([data[208], data[209], data[210], data[211]]);
+            let gyro_x = f32::from_be_bytes([data[212], data[213], data[214], data[215]]);
+            let gyro_y = f32::from_be_bytes([data[216], data[217], data[218], data[219]]);
+            let gyro_z = f32::from_be_bytes([data[220], data[221], data[222], data[223]]);
+
+            // Only store if values are finite (not NaN or Inf from uninitialized data)
+            if accel_x.is_finite()
+                && accel_y.is_finite()
+                && accel_z.is_finite()
+                && gyro_x.is_finite()
+                && gyro_y.is_finite()
+                && gyro_z.is_finite()
+            {
+                self.device_info.imu = Some(ImuData {
+                    accel_x,
+                    accel_y,
+                    accel_z,
+                    gyro_x,
+                    gyro_y,
+                    gyro_z,
+                });
+            }
+        }
+
         Ok(())
     }
 
@@ -362,6 +462,9 @@ impl RobosenseDriver {
         let microseconds = u32::from_be_bytes([data[16], data[17], data[18], data[19]]);
         let timestamp_ns = seconds * 1_000_000_000 + microseconds as u64 * 1_000;
 
+        // Return mode: byte 8
+        let return_mode = ReturnMode::from(data[8]);
+
         // Temperature: byte 31, Temp = LidarTmp - 80
         // Subtraction done in i16 to avoid overflow when data[31] > 127
         let temperature = (i16::from(data[31]) - 80) as i8;
@@ -370,6 +473,7 @@ impl RobosenseDriver {
             pkt_cnt,
             timestamp_ns,
             temperature,
+            return_mode,
         })
     }
 
@@ -390,6 +494,12 @@ impl RobosenseDriver {
             return Ok(());
         }
 
+        // PointAttribute: byte 11 (1 = normal, 2 = noisy)
+        // Filter noisy points when enabled
+        if self.filter_noisy && block[11] == 2 {
+            return Ok(());
+        }
+
         let radius = radius_raw as f32 * DISTANCE_RESOLUTION;
 
         // Direction vectors: signed 16-bit, divide by 2^15 for unit vector
@@ -402,9 +512,6 @@ impl RobosenseDriver {
 
         // Intensity: byte 10
         let intensity = block[10];
-
-        // PointAttribute: byte 11 (1 = normal, 2 = noisy)
-        // let _attribute = block[11];
 
         // Compute XYZ coordinates
         let x = radius * dir_x;
@@ -453,6 +560,7 @@ impl LidarDriver for RobosenseDriver {
 
         // Parse header
         let header = self.parse_header(data)?;
+        self.return_mode = header.return_mode;
 
         // If previous call returned Ok(true), reset frame for the new cycle.
         // The boundary packet that triggered completion was already consumed,
@@ -511,6 +619,8 @@ struct MsopHeader {
     /// LiDAR temperature in Celsius
     #[allow(dead_code)]
     temperature: i8,
+    /// Return mode
+    return_mode: ReturnMode,
 }
 
 #[cfg(test)]

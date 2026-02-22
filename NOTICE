@@ -108,6 +108,10 @@ https://crates.io/crates/etherparse
 PCAP/PCAPNG file format parser
 https://crates.io/crates/pcap-parser
 
+**mdns-sd** (MIT OR Apache-2.0) - Optional, enabled with `--features discovery`
+mDNS Service Discovery for Ouster sensor detection
+https://crates.io/crates/mdns-sd
+
 **rerun** (MIT OR Apache-2.0) - Optional, enabled with `--features rerun`
 Real-time 3D visualization and data logging
 https://crates.io/crates/rerun

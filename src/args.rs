@@ -17,8 +17,10 @@ pub struct Args {
 
     /// Connect to target device or pcap file.  If target is a valid pcap file,
     /// it will be used otherwise it will be tried as a hostname or IP address.
+    /// Required for Ouster sensors. For Robosense, optional: when provided,
+    /// filters packets to only accept from this source IP.
     #[arg(env)]
-    pub target: String,
+    pub target: Option<String>,
 
     // --- Ouster-specific options ---
     /// Azimuth field of view start and stop angles in degrees.
@@ -50,6 +52,18 @@ pub struct Args {
     /// (Robosense only)
     #[arg(long, env, default_value = "7788")]
     pub difop_port: u16,
+
+    /// Include noisy points (PointAttribute == 2) in the point cloud.
+    /// By default, noisy points are filtered out.
+    /// (Robosense only)
+    #[arg(long, env, default_value = "false")]
+    pub include_noisy: bool,
+
+    /// Discover Robosense sensors on the network and exit.
+    /// Listens for DIFOP packets and prints device information.
+    /// (Robosense only)
+    #[arg(long, env)]
+    pub discover: bool,
 
     /// Frame transformation vector from the base_link
     #[arg(
