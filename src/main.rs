@@ -25,7 +25,7 @@ use cluster::cluster_thread;
 use edgefirst_schemas::{
     builtin_interfaces::Time,
     geometry_msgs::{Quaternion, Transform, TransformStamped, Vector3},
-    sensor_msgs::{PointCloud2, IMU},
+    sensor_msgs::{IMU, PointCloud2},
     serde_cdr,
     std_msgs::Header,
 };
@@ -306,11 +306,8 @@ async fn run_robosense(session: Session, args: Args) -> Result<(), Box<dyn std::
 
                         if let Ok(bytes) = serde_cdr::serialize(&msg) {
                             let zbytes = ZBytes::from(bytes);
-                            let enc = Encoding::APPLICATION_CDR
-                                .with_schema("sensor_msgs/msg/Imu");
-                            if let Err(e) =
-                                imu_publisher.put(zbytes).encoding(enc).await
-                            {
+                            let enc = Encoding::APPLICATION_CDR.with_schema("sensor_msgs/msg/Imu");
+                            if let Err(e) = imu_publisher.put(zbytes).encoding(enc).await {
                                 debug!("IMU publish error: {:?}", e);
                             }
                         }
@@ -499,8 +496,14 @@ fn query_ouster_api(
     addr: std::net::IpAddr,
     port: u16,
 ) -> Result<SensorInfo, Box<dyn std::error::Error>> {
-    let api = format!("http://{}:{}/api/v1/sensor/metadata/sensor_info", addr, port);
-    let sensor_info = ureq::get(&api).call()?.body_mut().read_json::<SensorInfo>()?;
+    let api = format!(
+        "http://{}:{}/api/v1/sensor/metadata/sensor_info",
+        addr, port
+    );
+    let sensor_info = ureq::get(&api)
+        .call()?
+        .body_mut()
+        .read_json::<SensorInfo>()?;
     Ok(sensor_info)
 }
 
@@ -554,12 +557,7 @@ async fn discover_robosense(
             if let Some(imu) = &info.imu {
                 println!(
                     "  IMU:       accel=({:.3}, {:.3}, {:.3}) gyro=({:.3}, {:.3}, {:.3})",
-                    imu.accel_x,
-                    imu.accel_y,
-                    imu.accel_z,
-                    imu.gyro_x,
-                    imu.gyro_y,
-                    imu.gyro_z
+                    imu.accel_x, imu.accel_y, imu.accel_z, imu.gyro_x, imu.gyro_y, imu.gyro_z
                 );
             }
             println!();
@@ -587,7 +585,9 @@ impl LidarDriver for RobosenseDriverWrapper {
         match self.inner.lock() {
             Ok(mut driver) => {
                 let result = driver.process(frame, data);
-                if !self.logged_return_mode && let Ok(true) = &result {
+                if !self.logged_return_mode
+                    && let Ok(true) = &result
+                {
                     info!(return_mode = %driver.return_mode(), "First frame received");
                     self.logged_return_mode = true;
                 }
