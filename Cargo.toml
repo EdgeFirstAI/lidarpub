@@ -3,7 +3,7 @@ name = "edgefirst-lidarpub"
 description = "EdgeFirst LiDAR Publisher"
 repository = "https://github.com/EdgeFirstAI/lidarpub"
 license = "Apache-2.0"
-version = "1.4.2"
+version = "2.0.0"
 edition = "2024"
 
 [[bin]]
