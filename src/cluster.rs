@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2025 Au-Zone Technologies. All Rights Reserved.
 
-use crate::Args;
-use std::{
-    ops::Add,
-    simd::{Simd, ToBytes},
+use crate::{
+    Args,
+    formats::{clustered_xyz_fields, format_clustered_17byte},
+    lidar::Points,
 };
+use std::ops::Add;
 use tracing::{info_span, instrument};
 
 type RangeType = u16;
@@ -75,16 +76,11 @@ impl Add for Coord {
 }
 
 use edgefirst_schemas::{
-    builtin_interfaces::Time,
-    sensor_msgs::{PointCloud2, PointField},
-    serde_cdr,
-    std_msgs::Header,
+    builtin_interfaces::Time, sensor_msgs::PointCloud2, serde_cdr, std_msgs::Header,
 };
 use kanal::Receiver;
 use tracing::error;
 use zenoh::bytes::{Encoding, ZBytes};
-
-use crate::{PointFieldType, ouster::Points};
 
 // If the receiver is empty, waits for the next message, otherwise returns the
 // most recent message on this receiver. If the receiver is closed, returns None
@@ -228,6 +224,9 @@ fn expand_cluster(data: &mut ClusterData, coord: Coord, id: u32) -> bool {
     true
 }
 
+/// Format clustered point cloud data into a PointCloud2 message.
+///
+/// Uses the shared SIMD formatters from the formats module.
 #[instrument(skip_all)]
 fn format_points_clustered(
     points: &Points,
@@ -236,97 +235,17 @@ fn format_points_clustered(
     timestamp: Time,
     frame_id: String,
 ) -> Result<(ZBytes, Encoding), serde_cdr::Error> {
-    const N: usize = 4;
+    let fields = clustered_xyz_fields();
 
-    let fields = vec![
-        PointField {
-            name: String::from("x"),
-            offset: 0,
-            datatype: PointFieldType::FLOAT32 as u8,
-            count: 1,
-        },
-        PointField {
-            name: String::from("y"),
-            offset: 4,
-            datatype: PointFieldType::FLOAT32 as u8,
-            count: 1,
-        },
-        PointField {
-            name: String::from("z"),
-            offset: 8,
-            datatype: PointFieldType::FLOAT32 as u8,
-            count: 1,
-        },
-        PointField {
-            name: String::from("cluster_id"),
-            offset: 12,
-            datatype: PointFieldType::UINT32 as u8,
-            count: 1,
-        },
-        PointField {
-            name: String::from("reflect"),
-            offset: 16,
-            datatype: PointFieldType::UINT8 as u8,
-            count: 1,
-        },
-    ];
-
-    let mut data = vec![0u8; 17 * n_points];
-
-    for index in (0..n_points).step_by(N) {
-        let x = Simd::<f32, N>::from_slice(&points.x[index..index + N]);
-        let x = x.to_le_bytes();
-        let y = Simd::<f32, N>::from_slice(&points.y[index..index + N]);
-        let y = y.to_le_bytes();
-        let z = Simd::<f32, N>::from_slice(&points.z[index..index + N]);
-        let z = z.to_le_bytes();
-        let id = Simd::<u32, N>::from_slice(&cluster_ids[index..index + N]);
-        let id = id.to_le_bytes();
-
-        let out = index * 17;
-        data[out..out + 4].copy_from_slice(&x[..4]);
-        data[out + 4..out + 8].copy_from_slice(&y[..4]);
-        data[out + 8..out + 12].copy_from_slice(&z[..4]);
-        data[out + 12..out + 16].copy_from_slice(&id[..4]);
-        data[out + 16] = points.l[index];
-
-        let out = (index + 1) * 17;
-        data[out..out + 4].copy_from_slice(&x[4..8]);
-        data[out + 4..out + 8].copy_from_slice(&y[4..8]);
-        data[out + 8..out + 12].copy_from_slice(&z[4..8]);
-        data[out + 12..out + 16].copy_from_slice(&id[4..8]);
-        data[out + 16] = points.l[index];
-
-        let out = (index + 2) * 17;
-        data[out..out + 4].copy_from_slice(&x[8..12]);
-        data[out + 4..out + 8].copy_from_slice(&y[8..12]);
-        data[out + 8..out + 12].copy_from_slice(&z[8..12]);
-        data[out + 12..out + 16].copy_from_slice(&id[8..12]);
-        data[out + 16] = points.l[index];
-
-        let out = (index + 3) * 17;
-        data[out..out + 4].copy_from_slice(&x[12..16]);
-        data[out + 4..out + 8].copy_from_slice(&y[12..16]);
-        data[out + 8..out + 12].copy_from_slice(&z[12..16]);
-        data[out + 12..out + 16].copy_from_slice(&id[12..16]);
-        data[out + 16] = points.l[index];
-    }
-
-    #[allow(clippy::needless_range_loop)]
-    for index in n_points - n_points % N..n_points {
-        let x = points.x[index].to_le_bytes();
-        let y = points.y[index].to_le_bytes();
-        let z = points.z[index].to_le_bytes();
-        let id = cluster_ids[index].to_le_bytes();
-        let l = points.l[index];
-
-        let out = index * 13;
-        data[out..out + 4].copy_from_slice(&x);
-        data[out + 4..out + 8].copy_from_slice(&y);
-        data[out + 8..out + 12].copy_from_slice(&z);
-        data[out + 12..out + 16].copy_from_slice(&id);
-        data[out + 16] = l;
-    }
+    // Use the shared SIMD formatter from formats module
+    let data = format_clustered_17byte(
+        &points.x,
+        &points.y,
+        &points.z,
+        cluster_ids,
+        &points.intensity,
+        n_points,
+    );
 
     let msg = PointCloud2 {
         header: Header {

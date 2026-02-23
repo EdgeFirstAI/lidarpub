@@ -1,12 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2025 Au-Zone Technologies. All Rights Reserved.
 
-#![feature(portable_simd)]
+//! Point cloud formatting uses architecture-specific SIMD optimizations:
+//! - aarch64: Native NEON intrinsics (stable Rust)
+//! - x86_64/other with `portable_simd` feature: std::simd (nightly Rust)
+//! - Fallback: Scalar implementation (stable Rust)
+
+#![cfg_attr(
+    all(feature = "portable_simd", not(target_arch = "aarch64")),
+    feature(portable_simd)
+)]
 
 mod args;
 mod cluster;
 mod common;
+mod formats;
+mod lidar;
 mod ouster;
+mod robosense;
 
 use args::Args;
 use clap::Parser as _;
@@ -14,25 +25,25 @@ use cluster::cluster_thread;
 use edgefirst_schemas::{
     builtin_interfaces::Time,
     geometry_msgs::{Quaternion, Transform, TransformStamped, Vector3},
-    sensor_msgs::{Image, PointCloud2, PointField},
+    sensor_msgs::{IMU, PointCloud2},
     serde_cdr,
     std_msgs::Header,
 };
-use kanal::Receiver;
-use ndarray::Array2;
-use ouster::{
-    BeamIntrinsics, Config, FrameBuilder, FrameReader, LidarDataFormat, Parameters, Points,
-    SensorInfo,
-};
+use formats::{format_points_13byte, standard_xyz_intensity_fields};
+use lidar::{LidarDriver, LidarFrame, SensorType};
+use ouster::{BeamIntrinsics, Config, LidarDataFormat, OusterLidarFrame, Parameters, SensorInfo};
+use robosense::{RobosenseDriver, RobosenseLidarFrame};
 use std::{
+    collections::HashMap,
     io::{IsTerminal as _, Write as _},
     net::TcpStream,
-    simd::{Simd, ToBytes as _},
+    sync::{Arc, Mutex},
     thread::sleep,
     time::{Duration, Instant, SystemTime},
 };
+
 use tokio::net::UdpSocket;
-use tracing::{Instrument, debug, error, info, info_span, trace};
+use tracing::{debug, error, info, trace, warn};
 use tracing_subscriber::{Layer as _, Registry, layer::SubscriberExt as _};
 use tracy_client::frame_mark;
 use zenoh::{
@@ -45,19 +56,6 @@ use zenoh::{
 #[global_allocator]
 static GLOBAL: tracy_client::ProfiledAllocator<std::alloc::System> =
     tracy_client::ProfiledAllocator::new(std::alloc::System, 100);
-
-#[derive(Debug)]
-#[allow(dead_code)]
-pub enum PointFieldType {
-    INT8 = 1,
-    UINT8 = 2,
-    INT16 = 3,
-    UINT16 = 4,
-    INT32 = 5,
-    UINT32 = 6,
-    FLOAT32 = 7,
-    FLOAT64 = 8,
-}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -90,12 +88,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tokio::spawn(tf_static_loop(session.clone(), args.clone()));
 
+    if args.discover {
+        return run_discover(&args).await;
+    }
+
+    match args.sensor_type {
+        SensorType::Ouster => run_ouster(session, args).await,
+        SensorType::Robosense => run_robosense(session, args).await,
+    }
+}
+
+/// Run the Ouster LiDAR sensor
+async fn run_ouster(session: Session, args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    let target = args.target.as_deref().ok_or(
+        "Ouster sensor requires a target hostname or IP address. Usage: edgefirst-lidarpub <TARGET>",
+    )?;
+
     let local = {
-        let stream = TcpStream::connect(format!("{}:80", &args.target))?;
+        let stream = TcpStream::connect(format!("{}:80", target))?;
         stream.local_addr()?.ip()
     };
 
-    let api = format!("http://{}//api/v1/sensor", &args.target);
+    let api = format!("http://{}//api/v1/sensor", target);
 
     let config = Config {
         udp_dest: local.to_string(),
@@ -164,7 +178,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     debug!("{:?}", params);
-    let mut frame_reader = FrameReader::new(&params.lidar_data_format)?;
+
+    // Create OusterDriver
+    let driver = ouster::OusterDriver::new(&params)?;
+    let rows = driver.rows();
+    let cols = driver.cols();
+
+    // Create client-owned frame with appropriate capacity
+    let capacity = rows * cols;
+    let frame = OusterLidarFrame::with_capacity(capacity);
 
     // On Linux [::] will bind to IPv4 and IPv6 but not on Windows so we bind
     // according to the local address IP version.
@@ -173,48 +195,427 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         false => format!("[::]:{}", config.udp_port_lidar),
     };
 
-    common::set_process_priority();
-    let sock = UdpSocket::bind(bind_addr).await?;
-    let sock = common::set_socket_bufsize(sock.into_std()?, 16 * 1024 * 1024);
-    let sock = UdpSocket::from_std(sock)?;
+    run_lidar_loop(session, args, driver, frame, &bind_addr, rows, cols, None).await
+}
 
-    let mut buf = [0u8; 16 * 1024];
-    let (tx, rx) = kanal::bounded(128);
+/// Run the Robosense E1R LiDAR sensor
+async fn run_robosense(session: Session, args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    let mut robosense_driver = RobosenseDriver::new();
+    robosense_driver.set_filter_noisy(!args.include_noisy);
+    let driver = Arc::new(Mutex::new(robosense_driver));
 
-    std::thread::Builder::new()
-        .name("processor".to_string())
-        .spawn(move || {
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(frame_processor(session, args, params, rx));
-        })?;
+    // Start DIFOP listener for device information and IMU publishing
+    let difop_driver = driver.clone();
+    let difop_port = args.difop_port;
+    let imu_topic = format!("{}/imu", args.lidar_topic);
+    let imu_frame_id = args.frame_id.clone();
 
-    loop {
-        let len = match sock.recv_from(&mut buf).await {
-            Ok((len, _)) => len,
+    let imu_publisher = session
+        .declare_publisher(imu_topic)
+        .priority(Priority::Data)
+        .congestion_control(CongestionControl::Drop)
+        .await
+        .unwrap();
+
+    // Use oneshot channel to confirm DIFOP startup (PR #7 fix)
+    let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+
+    tokio::spawn(async move {
+        let bind_addr = format!("0.0.0.0:{}", difop_port);
+        let sock = match UdpSocket::bind(&bind_addr).await {
+            Ok(s) => {
+                let _ = startup_tx.send(Ok(()));
+                s
+            }
             Err(e) => {
-                error!("udp_read recv error: {:?}", e);
-                continue;
+                let _ = startup_tx.send(Err(e));
+                return;
             }
         };
+        info!("Listening for DIFOP packets on port {}", difop_port);
 
-        frame_reader.update(&buf[..len], |timestamp, frame_id, depth, reflect| match tx
-            .send((timestamp, frame_id, depth, reflect))
-        {
-            Ok(_) => {}
-            Err(e) => error!("frame send error: {:?}", e),
-        })?;
+        let mut buf = [0u8; 512];
+        let mut logged_device_info = false;
+        let mut last_device_info: Option<robosense::DeviceInfo> = None;
+
+        loop {
+            match sock.recv(&mut buf).await {
+                Ok(len) => {
+                    // Extract device info under lock, then release before await
+                    let info = {
+                        let Ok(mut driver) = difop_driver.lock() else {
+                            continue;
+                        };
+                        if let Err(e) = driver.process_difop(&buf[..len]) {
+                            debug!("DIFOP parse error: {:?}", e);
+                            continue;
+                        }
+                        driver.device_info().clone()
+                    };
+
+                    // First DIFOP: log at INFO level
+                    if !logged_device_info {
+                        info!(
+                            serial = %info.serial_string(),
+                            firmware = %info.version_string(),
+                            timesync_mode = ?info.timesync_mode,
+                            timesync_status = ?info.timesync_status,
+                            "Robosense E1R device info"
+                        );
+                        logged_device_info = true;
+                    } else if last_device_info.as_ref() != Some(&info) {
+                        trace!(
+                            serial = %info.serial_string(),
+                            firmware = %info.version_string(),
+                            "DIFOP device info updated"
+                        );
+                    }
+
+                    // Publish IMU data if present
+                    if let Some(imu) = &info.imu {
+                        let now = SystemTime::now()
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            .unwrap();
+                        let timestamp = Time::from_nanos(now.as_nanos() as u64);
+
+                        let msg = IMU {
+                            header: Header {
+                                stamp: timestamp,
+                                frame_id: imu_frame_id.clone(),
+                            },
+                            orientation: Quaternion {
+                                x: 0.0,
+                                y: 0.0,
+                                z: 0.0,
+                                w: 1.0,
+                            },
+                            orientation_covariance: [0.0; 9],
+                            angular_velocity: Vector3 {
+                                x: imu.gyro_x as f64,
+                                y: imu.gyro_y as f64,
+                                z: imu.gyro_z as f64,
+                            },
+                            angular_velocity_covariance: [0.0; 9],
+                            linear_acceleration: Vector3 {
+                                x: imu.accel_x as f64,
+                                y: imu.accel_y as f64,
+                                z: imu.accel_z as f64,
+                            },
+                            linear_acceleration_covariance: [0.0; 9],
+                        };
+
+                        if let Ok(bytes) = serde_cdr::serialize(&msg) {
+                            let zbytes = ZBytes::from(bytes);
+                            let enc = Encoding::APPLICATION_CDR.with_schema("sensor_msgs/msg/Imu");
+                            if let Err(e) = imu_publisher.put(zbytes).encoding(enc).await {
+                                debug!("IMU publish error: {:?}", e);
+                            }
+                        }
+                    }
+
+                    last_device_info = Some(info);
+                }
+                Err(e) => {
+                    error!("DIFOP recv error: {:?}", e);
+                }
+            }
+        }
+    });
+
+    // Wait for DIFOP startup confirmation (PR #7 fix)
+    match startup_rx.await {
+        Ok(Ok(())) => info!("DIFOP listener started on port {}", difop_port),
+        Ok(Err(e)) => warn!("DIFOP bind failed: {} (continuing without DIFOP)", e),
+        Err(_) => warn!("DIFOP startup channel dropped"),
+    }
+
+    // E1R doesn't have a fixed row/col structure like Ouster
+    // Use approximate values for clustering (not typically used with E1R)
+    let rows = 1;
+    let cols = 30_000; // ~26k points per frame
+
+    let bind_addr = format!("0.0.0.0:{}", args.msop_port);
+    info!("Listening for MSOP packets on port {}", args.msop_port);
+
+    // Parse target as source IP filter for Robosense
+    let source_filter: Option<std::net::IpAddr> = args
+        .target
+        .as_deref()
+        .map(|t| t.parse())
+        .transpose()
+        .map_err(|e| format!("Invalid target IP address: {}", e))?;
+
+    // Create client-owned frame
+    let frame = RobosenseLidarFrame::new();
+
+    // Wrap the driver in a struct that can be used with run_lidar_loop
+    let driver = RobosenseDriverWrapper {
+        inner: driver,
+        logged_return_mode: false,
+    };
+
+    run_lidar_loop(
+        session,
+        args,
+        driver,
+        frame,
+        &bind_addr,
+        rows,
+        cols,
+        source_filter,
+    )
+    .await
+}
+
+/// Discover LiDAR sensors on the network.
+///
+/// Runs all discovery methods in parallel and stops on Ctrl-C.
+/// - Robosense: Passive UDP listening for DIFOP packets on the configured port
+/// - Ouster: mDNS browsing for `_roger._tcp` services (requires `discovery` feature)
+async fn run_discover(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let found = Arc::new(AtomicUsize::new(0));
+
+    println!("Discovering LiDAR sensors... Press Ctrl-C to stop.\n");
+
+    let ouster_found = found.clone();
+    tokio::spawn(async move {
+        discover_ouster(ouster_found).await;
+    });
+
+    let robosense_found = found.clone();
+    let difop_port = args.difop_port;
+    tokio::spawn(async move {
+        if let Err(e) = discover_robosense(difop_port, robosense_found).await {
+            error!("Robosense discovery error: {}", e);
+        }
+    });
+
+    // Wait for Ctrl-C
+    tokio::signal::ctrl_c().await.ok();
+    println!();
+
+    let total = found.load(Ordering::Relaxed);
+    println!("Discovery complete: {} sensor(s) found", total);
+
+    // The mDNS daemon spawns background threads that can't be cancelled
+    // from here, so force a clean exit.
+    std::process::exit(0);
+}
+
+/// Discover Ouster sensors via mDNS browsing for `_roger._tcp`.
+#[cfg(feature = "discovery")]
+async fn discover_ouster(found: Arc<std::sync::atomic::AtomicUsize>) {
+    use mdns_sd::{ServiceDaemon, ServiceEvent};
+    use std::sync::atomic::Ordering;
+
+    let mdns = match ServiceDaemon::new() {
+        Ok(d) => d,
+        Err(e) => {
+            warn!("Failed to start mDNS daemon: {}", e);
+            return;
+        }
+    };
+
+    let service_type = "_roger._tcp.local.";
+    let receiver = match mdns.browse(service_type) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Failed to browse mDNS: {}", e);
+            let _ = mdns.shutdown();
+            return;
+        }
+    };
+
+    // mDNS recv_timeout is blocking, run on a blocking thread
+    tokio::task::spawn_blocking(move || {
+        loop {
+            match receiver.recv_timeout(Duration::from_secs(1)) {
+                Ok(ServiceEvent::ServiceResolved(info)) => {
+                    let hostname = info.get_hostname();
+                    let port = info.get_port();
+                    let properties = info.get_properties();
+
+                    let sn = properties
+                        .get("sn")
+                        .map(|v| v.val_str().to_string())
+                        .unwrap_or_default();
+                    let pn = properties
+                        .get("pn")
+                        .map(|v| v.val_str().to_string())
+                        .unwrap_or_default();
+                    let fw = properties
+                        .get("fw")
+                        .map(|v| v.val_str().to_string())
+                        .unwrap_or_default();
+
+                    let addrs_v4 = info.get_addresses_v4();
+                    let ip_str = addrs_v4
+                        .iter()
+                        .next()
+                        .map(|a| a.to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
+
+                    println!("Found Ouster at {}:", ip_str);
+                    println!("  Hostname:  {}", hostname);
+                    println!("  Part No:   {}", pn);
+                    println!("  Serial:    {}", sn);
+                    println!("  Firmware:  {}", fw);
+                    println!("  API Port:  {}", port);
+
+                    // Try to query HTTP API for more details
+                    if let Some(addr) = addrs_v4.iter().next() {
+                        match query_ouster_api(std::net::IpAddr::V4(*addr), port) {
+                            Ok(sensor_info) => {
+                                println!("  Product:   {}", sensor_info.prod_line);
+                                println!("  Status:    {}", sensor_info.status);
+                                println!("  Build:     {}", sensor_info.build_rev);
+                            }
+                            Err(e) => {
+                                log::debug!("Could not query Ouster API: {}", e);
+                            }
+                        }
+                    }
+
+                    println!();
+                    found.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+    })
+    .await
+    .ok();
+}
+
+/// Query Ouster HTTP API for sensor information.
+#[cfg(feature = "discovery")]
+fn query_ouster_api(
+    addr: std::net::IpAddr,
+    port: u16,
+) -> Result<SensorInfo, Box<dyn std::error::Error>> {
+    let api = format!(
+        "http://{}:{}/api/v1/sensor/metadata/sensor_info",
+        addr, port
+    );
+    let sensor_info = ureq::get(&api)
+        .call()?
+        .body_mut()
+        .read_json::<SensorInfo>()?;
+    Ok(sensor_info)
+}
+
+/// Stub when discovery feature is not enabled.
+#[cfg(not(feature = "discovery"))]
+async fn discover_ouster(_found: Arc<std::sync::atomic::AtomicUsize>) {
+    println!("Ouster discovery requires the 'discovery' feature.");
+    println!("  Rebuild with: cargo build --features discovery\n");
+}
+
+/// Discover Robosense sensors via passive DIFOP UDP listening.
+async fn discover_robosense(
+    difop_port: u16,
+    found: Arc<std::sync::atomic::AtomicUsize>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::sync::atomic::Ordering;
+
+    let bind_addr = format!("0.0.0.0:{}", difop_port);
+    let sock = UdpSocket::bind(&bind_addr).await?;
+
+    let mut buf = [0u8; 512];
+    let mut seen: HashMap<std::net::IpAddr, robosense::DeviceInfo> = HashMap::new();
+
+    loop {
+        let (len, addr) = sock.recv_from(&mut buf).await?;
+
+        let src_ip = addr.ip();
+        if seen.contains_key(&src_ip) {
+            continue;
+        }
+
+        let mut driver = RobosenseDriver::new();
+        if driver.process_difop(&buf[..len]).is_ok() {
+            let info = driver.device_info().clone();
+            let local_ip = format!(
+                "{}.{}.{}.{}",
+                info.local_ip[0], info.local_ip[1], info.local_ip[2], info.local_ip[3]
+            );
+
+            println!("Found Robosense E1R at {}:", src_ip);
+            println!("  Serial:    {}", info.serial_string());
+            println!("  Firmware:  {}", info.version_string());
+            println!(
+                "  Time Sync: {:?} ({:?})",
+                info.timesync_mode, info.timesync_status
+            );
+            println!("  Local IP:  {}", local_ip);
+            println!("  MSOP Port: {}", info.msop_port);
+            println!("  DIFOP Port: {}", info.difop_port);
+
+            if let Some(imu) = &info.imu {
+                println!(
+                    "  IMU:       accel=({:.3}, {:.3}, {:.3}) gyro=({:.3}, {:.3}, {:.3})",
+                    imu.accel_x, imu.accel_y, imu.accel_z, imu.gyro_x, imu.gyro_y, imu.gyro_z
+                );
+            }
+            println!();
+
+            found.fetch_add(1, Ordering::Relaxed);
+            seen.insert(src_ip, info);
+        }
     }
 }
 
-async fn frame_processor(
+/// Wrapper to allow shared RobosenseDriver with DIFOP thread
+struct RobosenseDriverWrapper {
+    inner: Arc<Mutex<RobosenseDriver>>,
+    logged_return_mode: bool,
+}
+
+impl LidarDriver for RobosenseDriverWrapper {
+    fn process<F: lidar::LidarFrameWriter>(
+        &mut self,
+        frame: &mut F,
+        data: &[u8],
+    ) -> Result<bool, lidar::Error> {
+        // Handle mutex poison gracefully - the DIFOP thread may have panicked
+        // but the driver state is likely still valid for packet processing
+        match self.inner.lock() {
+            Ok(mut driver) => {
+                let result = driver.process(frame, data);
+                if !self.logged_return_mode
+                    && let Ok(true) = &result
+                {
+                    info!(return_mode = %driver.return_mode(), "First frame received");
+                    self.logged_return_mode = true;
+                }
+                result
+            }
+            Err(poisoned) => {
+                warn!(
+                    "Driver mutex poisoned (DIFOP thread may have panicked), \
+                     recovering with potentially stale device info"
+                );
+                poisoned.into_inner().process(frame, data)
+            }
+        }
+    }
+}
+
+/// Generic lidar processing loop
+#[allow(clippy::too_many_arguments)]
+async fn run_lidar_loop<D: LidarDriver, F: lidar::LidarFrameWriter + LidarFrame>(
     session: Session,
     args: Args,
-    params: Parameters,
-    rx: Receiver<(u64, u16, Array2<u16>, Array2<u8>)>,
-) {
+    mut driver: D,
+    mut frame: F,
+    bind_addr: &str,
+    rows: usize,
+    cols: usize,
+    source_filter: Option<std::net::IpAddr>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let points_publisher = session
         .declare_publisher(format!("{}/points", args.lidar_topic))
         .priority(Priority::DataHigh)
@@ -229,22 +630,7 @@ async fn frame_processor(
         .await
         .unwrap();
 
-    let depth_publisher = session
-        .declare_publisher(format!("{}/depth", args.lidar_topic))
-        .priority(Priority::DataHigh)
-        .congestion_control(CongestionControl::Drop)
-        .await
-        .unwrap();
-
-    let reflect_publisher = session
-        .declare_publisher(format!("{}/reflect", args.lidar_topic))
-        .priority(Priority::DataHigh)
-        .congestion_control(CongestionControl::Drop)
-        .await
-        .unwrap();
-
-    let mut builder = FrameBuilder::new(&params);
-
+    // Set up clustering if enabled
     let (tx_cluster, rx_cluster) = kanal::bounded(8);
     if args.clustering {
         let args_ = args.clone();
@@ -258,170 +644,107 @@ async fn frame_processor(
                     .block_on(cluster_thread(
                         rx_cluster,
                         cluster_publisher,
-                        builder.rows,
-                        builder.crop.1 - builder.crop.0,
+                        rows,
+                        cols,
                         args_,
                     ));
             }) {
-            Ok(_) => {}
+            Ok(_) => info!("Clustering thread started"),
             Err(e) => error!("Could not start clustering thread: {:?}", e),
         };
     }
 
+    common::set_process_priority();
+    let sock = UdpSocket::bind(bind_addr).await?;
+    let sock = common::set_socket_bufsize(sock.into_std()?, 16 * 1024 * 1024);
+    let sock = UdpSocket::from_std(sock)?;
+
+    let mut buf = [0u8; 16 * 1024];
+
+    if let Some(filter_ip) = source_filter {
+        info!("Filtering packets from source IP: {}", filter_ip);
+    }
+    info!("Starting LiDAR processing loop");
+
     loop {
-        let (timestamp, frame_id, depth, reflect) = rx.recv().unwrap();
-
-        let span = info_span!("frame");
-        async {
-            builder.update(&depth, &reflect);
-
-            trace!(
-                timestamp = timestamp,
-                frame_id = frame_id,
-                n_points = builder.n_points,
-                "publishing frame"
-            );
-
-            let timestamp = Time::from_nanos(timestamp);
-            if args.clustering {
-                let _ = tx_cluster.send((
-                    builder.range[0..builder.n_points].to_vec(),
-                    builder.points.clone(),
-                    timestamp.clone(),
-                ));
+        let (len, src_addr) = match sock.recv_from(&mut buf).await {
+            Ok((len, addr)) => (len, addr),
+            Err(e) => {
+                error!("UDP recv error: {:?}", e);
+                continue;
             }
+        };
 
-            let (msg, enc) = format_points(
-                &builder.points,
-                builder.n_points,
-                timestamp.clone(),
-                args.frame_id.clone(),
-            )
-            .unwrap();
-            match points_publisher.put(msg).encoding(enc).await {
-                Ok(_) => {}
-                Err(e) => error!("publish points error: {:?}", e),
-            }
-
-            let (msg, enc) = format_depth(
-                &builder.depth,
-                &builder.crop,
-                timestamp.clone(),
-                args.frame_id.clone(),
-            )
-            .unwrap();
-            match depth_publisher.put(msg).encoding(enc).await {
-                Ok(_) => {}
-                Err(e) => error!("depth publish error: {:?}", e),
-            }
-
-            let (msg, enc) = format_reflect(
-                &builder.reflect,
-                &builder.crop,
-                timestamp,
-                args.frame_id.clone(),
-            )
-            .unwrap();
-            match reflect_publisher.put(msg).encoding(enc).await {
-                Ok(_) => {}
-                Err(e) => error!("reflect publish error: {:?}", e),
-            }
-
-            // match tokio::try_join!(points_span, depth_span, reflect_span)
-            // {     Ok(_) => trace!("{} message sent",
-            // args.lidar_topic),     Err(e) => error!("{}
-            // message error: {:?}", args.lidar_topic, e), }
+        // Filter by source IP if configured
+        if let Some(filter_ip) = source_filter
+            && src_addr.ip() != filter_ip
+        {
+            continue;
         }
-        .instrument(span)
-        .await;
 
-        args.tracy.then(frame_mark);
+        // Process packet into client-owned frame
+        match driver.process(&mut frame, &buf[..len]) {
+            Ok(true) => {
+                // Frame is complete - process it
+                let n_points = frame.len();
+                let timestamp_ns = frame.timestamp();
+                let frame_id = frame.frame_id();
+
+                trace!(
+                    timestamp = timestamp_ns,
+                    frame_id = frame_id,
+                    n_points = n_points,
+                    "publishing frame"
+                );
+
+                let timestamp = Time::from_nanos(timestamp_ns);
+
+                // Send to clustering if enabled
+                if args.clustering {
+                    // Use pre-computed range directly - NO sqrt needed! (PR #2 fix)
+                    let ranges: Vec<f32> = frame.range().to_vec();
+                    let points = lidar::Points {
+                        x: frame.x().to_vec(),
+                        y: frame.y().to_vec(),
+                        z: frame.z().to_vec(),
+                        intensity: frame.intensity().to_vec(),
+                    };
+                    let _ = tx_cluster.send((ranges, points, timestamp.clone()));
+                }
+
+                // Format and publish point cloud
+                let (msg, enc) = format_points(&frame, timestamp, args.frame_id.clone())?;
+
+                if let Err(e) = points_publisher.put(msg).encoding(enc).await {
+                    error!("publish points error: {:?}", e);
+                }
+
+                args.tracy.then(frame_mark);
+            }
+            Ok(false) => {
+                // More packets needed to complete frame
+            }
+            Err(e) => {
+                debug!("Packet processing error: {:?}", e);
+            }
+        }
     }
 }
 
+/// Format point cloud data into a PointCloud2 message.
+///
+/// Uses the shared SIMD formatters from the formats module.
 #[inline(never)]
-fn format_points(
-    points: &Points,
-    n_points: usize,
+fn format_points<F: LidarFrame>(
+    frame: &F,
     timestamp: Time,
     frame_id: String,
 ) -> Result<(ZBytes, Encoding), serde_cdr::Error> {
-    const N: usize = 4;
+    let fields = standard_xyz_intensity_fields();
+    let n_points = frame.len();
 
-    let fields = vec![
-        PointField {
-            name: String::from("x"),
-            offset: 0,
-            datatype: PointFieldType::FLOAT32 as u8,
-            count: 1,
-        },
-        PointField {
-            name: String::from("y"),
-            offset: 4,
-            datatype: PointFieldType::FLOAT32 as u8,
-            count: 1,
-        },
-        PointField {
-            name: String::from("z"),
-            offset: 8,
-            datatype: PointFieldType::FLOAT32 as u8,
-            count: 1,
-        },
-        PointField {
-            name: String::from("reflect"),
-            offset: 12,
-            datatype: PointFieldType::UINT8 as u8,
-            count: 1,
-        },
-    ];
-
-    let mut data = vec![0u8; 13 * n_points];
-
-    for index in (0..n_points).step_by(N) {
-        let x = Simd::<f32, N>::from_slice(&points.x[index..index + N]);
-        let x = x.to_le_bytes();
-        let y = Simd::<f32, N>::from_slice(&points.y[index..index + N]);
-        let y = y.to_le_bytes();
-        let z = Simd::<f32, N>::from_slice(&points.z[index..index + N]);
-        let z = z.to_le_bytes();
-
-        let out = index * 13;
-        data[out..out + 4].copy_from_slice(&x[..4]);
-        data[out + 4..out + 8].copy_from_slice(&y[..4]);
-        data[out + 8..out + 12].copy_from_slice(&z[..4]);
-        data[out + 12] = points.l[index];
-
-        let out = (index + 1) * 13;
-        data[out..out + 4].copy_from_slice(&x[4..8]);
-        data[out + 4..out + 8].copy_from_slice(&y[4..8]);
-        data[out + 8..out + 12].copy_from_slice(&z[4..8]);
-        data[out + 12] = points.l[index];
-
-        let out = (index + 2) * 13;
-        data[out..out + 4].copy_from_slice(&x[8..12]);
-        data[out + 4..out + 8].copy_from_slice(&y[8..12]);
-        data[out + 8..out + 12].copy_from_slice(&z[8..12]);
-        data[out + 12] = points.l[index];
-
-        let out = (index + 3) * 13;
-        data[out..out + 4].copy_from_slice(&x[12..16]);
-        data[out + 4..out + 8].copy_from_slice(&y[12..16]);
-        data[out + 8..out + 12].copy_from_slice(&z[12..16]);
-        data[out + 12] = points.l[index];
-    }
-
-    for index in n_points - n_points % N..n_points {
-        let x = points.x[index].to_le_bytes();
-        let y = points.y[index].to_le_bytes();
-        let z = points.z[index].to_le_bytes();
-        let l = points.l[index];
-
-        let out = index * 13;
-        data[out..out + 4].copy_from_slice(&x);
-        data[out + 4..out + 8].copy_from_slice(&y);
-        data[out + 8..out + 12].copy_from_slice(&z);
-        data[out + 12] = l;
-    }
+    // Use the shared SIMD formatter
+    let data = format_points_13byte(frame.x(), frame.y(), frame.z(), frame.intensity(), n_points);
 
     let msg = PointCloud2 {
         header: Header {
@@ -440,82 +763,6 @@ fn format_points(
 
     let msg = ZBytes::from(serde_cdr::serialize(&msg)?);
     let enc = Encoding::APPLICATION_CDR.with_schema("sensor_msgs/msg/PointCloud2");
-
-    Ok((msg, enc))
-}
-
-#[inline(never)]
-fn format_depth(
-    depth: &Array2<u16>,
-    crop: &(usize, usize),
-    timestamp: Time,
-    frame_id: String,
-) -> Result<(ZBytes, Encoding), serde_cdr::Error> {
-    const N: usize = 8;
-
-    let depth = depth
-        .slice(ndarray::s![.., crop.0..crop.1])
-        .as_standard_layout()
-        .to_owned();
-    let (height, width) = depth.dim();
-    let depth = depth.as_slice().unwrap();
-    let mut data = vec![0u8; height * width * 2];
-
-    for index in (0..height * width).step_by(N) {
-        let x = Simd::<u16, N>::from_slice(&depth[index..]);
-        let x = x.to_le_bytes();
-
-        let out = index * 2;
-        x.copy_to_slice(&mut data[out..out + 16]);
-    }
-
-    let msg = Image {
-        header: Header {
-            stamp: timestamp,
-            frame_id,
-        },
-        height: height as u32,
-        width: width as u32,
-        encoding: "mono16".to_owned(),
-        is_bigendian: 0,
-        step: width as u32 * 2,
-        data,
-    };
-
-    let msg = ZBytes::from(serde_cdr::serialize(&msg)?);
-    let enc = Encoding::APPLICATION_CDR.with_schema("sensor_msgs/msg/Image");
-
-    Ok((msg, enc))
-}
-
-#[inline(never)]
-fn format_reflect(
-    reflect: &Array2<u8>,
-    crop: &(usize, usize),
-    timestamp: Time,
-    frame_id: String,
-) -> Result<(ZBytes, Encoding), serde_cdr::Error> {
-    let reflect = reflect
-        .slice(ndarray::s![.., crop.0..crop.1])
-        .as_standard_layout()
-        .to_owned();
-    let (height, width) = reflect.dim();
-
-    let msg = Image {
-        header: Header {
-            stamp: timestamp,
-            frame_id,
-        },
-        height: height as u32,
-        width: width as u32,
-        encoding: "mono8".to_owned(),
-        is_bigendian: 0,
-        step: width as u32,
-        data: reflect.as_slice().unwrap().to_vec(),
-    };
-
-    let msg = ZBytes::from(serde_cdr::serialize(&msg)?);
-    let enc = Encoding::APPLICATION_CDR.with_schema("sensor_msgs/msg/Image");
 
     Ok((msg, enc))
 }
