@@ -341,6 +341,7 @@ async fn run_robosense(session: Session, args: Args) -> Result<(), Box<dyn std::
     let source_filter: Option<std::net::IpAddr> = args
         .target
         .as_deref()
+        .filter(|t| !t.is_empty())
         .map(|t| t.parse())
         .transpose()
         .map_err(|e| format!("Invalid target IP address: {}", e))?;

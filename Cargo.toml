@@ -3,7 +3,7 @@ name = "edgefirst-lidarpub"
 description = "EdgeFirst LiDAR Publisher"
 repository = "https://github.com/EdgeFirstAI/lidarpub"
 license = "Apache-2.0"
-version = "2.0.0"
+version = "2.0.1"
 edition = "2024"
 
 [[bin]]
@@ -38,17 +38,17 @@ profiling = [
 ]
 
 [dependencies]
-clap = { version = "4.5.57", features = ["derive", "env"] }
-edgefirst-schemas = "1.5.2"
-env_logger = "0.11.8"
+clap = { version = "4.5.60", features = ["derive", "env"] }
+edgefirst-schemas = "1.5.5"
+env_logger = "0.11.9"
 etherparse = { version = "0.19.0", optional = true }
-kanal = { git = "https://github.com/fereidani/kanal", rev = "b6aeab2" }
-libc = "0.2.180"
+kanal = { git = "https://github.com/fereidani/kanal", rev = "9a4b98d" }
+libc = "0.2.182"
 mdns-sd = { version = "0.18.0", optional = true }
 log = "0.4.29"
 ndarray = "0.17.2"
 pcap-parser = { version = "0.17.0", optional = true }
-rerun = { version = "0.29.0", optional = true, features = ["clap"] }
+rerun = { version = "0.29.2", optional = true, features = ["clap"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 tokio = { version = "1.49.0", features = [
@@ -74,7 +74,7 @@ tracy-client = { version = "0.18.4", default-features = false, features = [
     "ondemand",
     "fibers",
 ] }
-ureq = { version = "3.1.4", features = ["json"] }
+ureq = { version = "3.2.0", features = ["json"] }
 zenoh = "1.7.2"
 
 [profile.release]

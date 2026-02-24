@@ -1,0 +1,93 @@
+# EdgeFirst LiDAR Publisher (/etc/default/lidarpub)
+#
+# Environment variables for the edgefirst-lidarpub systemd service.
+# Uncomment and modify values as needed. Lines beginning with # are ignored.
+# Only one SENSOR_TYPE section should be active at a time.
+
+# ---------------------------------------------------------------------------
+# Common settings (apply to all sensor types)
+# ---------------------------------------------------------------------------
+
+# Log level for the application. Refer to RUST_LOG / tracing documentation.
+# Examples: "info", "debug", "warn", "lidarpub=debug,info"
+RUST_LOG="info"
+
+# Sensor type: "ouster" or "robosense"
+SENSOR_TYPE="ouster"
+
+# Target device hostname, IP address, or pcap file path.
+#   Ouster:    Required. IP or hostname of the sensor (e.g. "192.168.1.100").
+#   Robosense: Optional. When set, filters incoming UDP packets to only
+#              accept from this source IP (e.g. "192.168.1.200").
+#   Pcap:      If the value is a valid pcap file path, it is used for
+#              offline replay instead of connecting to a live sensor.
+#TARGET=
+
+# LiDAR frame transformation from base_link (camera).
+# TF_VEC:  Translation "X Y Z" in meters.
+# TF_QUAT: Rotation quaternion "X Y Z W".
+#
+# Uncomment ONE pair matching your hardware configuration:
+#
+# --- Maivin + Robosense E1R ---
+# E1R mounted 2cm below the camera (base_link), facing forward.
+# No rotation needed: E1R native frame aligns with ROS conventions.
+#TF_VEC="0 0 -0.02"
+#TF_QUAT="0 0 0 1"
+#
+# --- Maivin + Ouster with Mounting Kit ---
+# Ouster mounted 19cm below the camera (base_link) using the Maivin
+# Ouster Mounting Kit. ~180-degree Z rotation required because the
+# Ouster 0-degree point is at the rear connector.
+#TF_VEC="0 0 -0.19"
+#TF_QUAT="0 0 -0.9998157 0.0191974"
+
+# Base frame name for TF publishing.
+#BASE_FRAME_ID="base_link"
+
+# LiDAR child frame name for TF publishing.
+#FRAME_ID="lidar"
+
+# Zenoh base topic for LiDAR data.
+# Published topics: {LIDAR_TOPIC}/points, {LIDAR_TOPIC}/clusters, etc.
+#LIDAR_TOPIC="rt/lidar"
+
+# Enable point cloud clustering.
+#CLUSTERING="false"
+
+# Clustering distance threshold in millimeters.
+#CLUSTERING_EPS="256"
+
+# Minimum points per cluster.
+#CLUSTERING_MINPTS="4"
+
+# ---------------------------------------------------------------------------
+# Ouster settings (ignored when SENSOR_TYPE="robosense")
+# ---------------------------------------------------------------------------
+
+# Azimuth field of view: start and stop angles in degrees.
+# The 0-degree point is the rear connector of the Ouster LiDAR.
+AZIMUTH="0 360"
+
+# LiDAR column and refresh rate. Format: "COLxHZ".
+# Valid values: 512x10 1024x10 2048x10 512x20 1024x20
+LIDAR_MODE="1024x10"
+
+# Timestamp mode for the Ouster sensor.
+# "internal" uses the internal oscillator (time since boot).
+# "ptp1588" synchronizes to a PTP-1588 master (e.g. ptp4l on Maivin).
+TIMESTAMP_MODE="internal"
+
+# ---------------------------------------------------------------------------
+# Robosense E1R settings (ignored when SENSOR_TYPE="ouster")
+# ---------------------------------------------------------------------------
+
+# MSOP (Main data Stream Output Protocol) UDP port.
+#MSOP_PORT="6699"
+
+# DIFOP (Device Information Output Protocol) UDP port.
+#DIFOP_PORT="7788"
+
+# Include noisy points (PointAttribute == 2) in the point cloud.
+# By default noisy points are filtered out.
+#INCLUDE_NOISY="false"

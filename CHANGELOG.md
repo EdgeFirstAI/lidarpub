@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.1] - 2026-02-24
+
+### Added
+- `lidarpub.default` configuration file for `/etc/default/lidarpub` with documented
+  settings for both Ouster and Robosense sensor types, published as a release artifact
+
+### Fixed
+- Empty `TARGET` environment variable causing silent startup failure in Robosense
+  mode when set via `/etc/default/lidarpub` (empty string parsed as invalid IP)
+
+### Changed
+- Updated dependencies: clap 4.5.60, edgefirst-schemas 1.5.5, env_logger 0.11.9,
+  libc 0.2.182, rerun 0.29.2, ureq 3.2.0, kanal rev 9a4b98d
+
 ## [2.0.0] - 2026-02-23
 
 ### Added
