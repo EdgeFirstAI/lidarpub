@@ -14,7 +14,7 @@
 //!   cargo bench --bench cluster_bench --target aarch64-unknown-linux-gnu
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use edgefirst_lidarpub::cluster::{ClusterData, cluster_};
+use edgefirst_lidarpub::cluster::{ClusterData, VoxelClusterData, cluster_, voxel_cluster};
 
 /// Generate a synthetic point cloud with clustered structure.
 ///
@@ -142,6 +142,57 @@ fn bench_all_noise(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark HashMap vs Flat spatial hash at E1R and Ouster sizes.
+///
+/// On aarch64, both use NEON distance checks. On x86_64, both use scalar.
+/// The comparison isolates the spatial hash data structure performance.
+fn bench_hash_comparison(c: &mut Criterion) {
+    let mut group = c.benchmark_group("hash_comparison");
+
+    for &n_points in &[26_000, 65_536] {
+        let n_clusters = 30;
+        let pts_per_cluster = n_points / 5 / n_clusters;
+        let scene = generate_scene(n_points, n_clusters, pts_per_cluster);
+
+        group.throughput(Throughput::Elements(n_points as u64));
+
+        // HashMap variant
+        group.bench_with_input(
+            BenchmarkId::new("hashmap", n_points),
+            &scene,
+            |b, scene| {
+                let mut data = ClusterData::new(0.256, 4);
+                let _ = cluster_(&mut data, &scene.x, &scene.y, &scene.z);
+                b.iter(|| cluster_(&mut data, &scene.x, &scene.y, &scene.z));
+            },
+        );
+
+        // Flat variant
+        group.bench_with_input(
+            BenchmarkId::new("flat", n_points),
+            &scene,
+            |b, scene| {
+                let mut data = ClusterData::new_flat(0.256, 4);
+                let _ = cluster_(&mut data, &scene.x, &scene.y, &scene.z);
+                b.iter(|| cluster_(&mut data, &scene.x, &scene.y, &scene.z));
+            },
+        );
+
+        // Voxel connected-component variant
+        group.bench_with_input(
+            BenchmarkId::new("voxel", n_points),
+            &scene,
+            |b, scene| {
+                let mut data = VoxelClusterData::new(0.256, 4);
+                let _ = voxel_cluster(&mut data, &scene.x, &scene.y, &scene.z);
+                b.iter(|| voxel_cluster(&mut data, &scene.x, &scene.y, &scene.z));
+            },
+        );
+    }
+
+    group.finish();
+}
+
 /// Benchmark warmup vs steady-state to verify zero-allocation claim.
 fn bench_warmup(c: &mut Criterion) {
     let mut group = c.benchmark_group("dbscan_warmup");
@@ -173,6 +224,7 @@ criterion_group!(
     bench_cluster_sizes,
     bench_dense_cluster,
     bench_all_noise,
+    bench_hash_comparison,
     bench_warmup,
 );
 criterion_main!(benches);
