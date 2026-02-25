@@ -6,8 +6,20 @@
 //! Divides 3D space into voxels of size `eps`, hashes each point into its voxel,
 //! and queries the 27 adjacent voxels (3×3×3) for neighbor searches. This gives
 //! O(n) average performance for uniform distributions.
+//!
+//! Two spatial hash implementations are provided:
+//! - `SpatialHash` — HashMap-based (default, backward compatible)
+//! - `FlatSpatialHash` — Open-addressing with contiguous point storage
+//!
+//! On aarch64, neighbor distance checks use NEON SIMD intrinsics to process
+//! 4 points per iteration.
 
 use std::collections::HashMap;
+
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::*;
+
+// ── Section 1: SpatialHash (HashMap-based) ──────────────────────────────────
 
 /// 3D spatial hash for O(1) average neighbor queries.
 ///
@@ -60,26 +72,499 @@ impl SpatialHash {
     ) {
         neighbors.clear();
         let (cx, cy, cz) = self.voxel_key(qx, qy, qz);
+
         for dx in -1..=1 {
             for dy in -1..=1 {
                 for dz in -1..=1 {
                     let key = (cx + dx, cy + dy, cz + dz);
                     if let Some(indices) = self.cells.get(&key) {
-                        for &idx in indices {
-                            let ddx = x[idx] - qx;
-                            let ddy = y[idx] - qy;
-                            let ddz = z[idx] - qz;
-                            let dist_sq = ddx * ddx + ddy * ddy + ddz * ddz;
-                            if dist_sq < eps_sq {
-                                neighbors.push(idx);
-                            }
-                        }
+                        #[cfg(target_arch = "aarch64")]
+                        Self::query_neighbors_neon(
+                            indices, qx, qy, qz, x, y, z, eps_sq, neighbors,
+                        );
+                        #[cfg(not(target_arch = "aarch64"))]
+                        Self::query_neighbors_scalar(
+                            indices, qx, qy, qz, x, y, z, eps_sq, neighbors,
+                        );
                     }
                 }
             }
         }
     }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    #[allow(clippy::too_many_arguments)]
+    fn query_neighbors_scalar(
+        indices: &[usize],
+        qx: f32,
+        qy: f32,
+        qz: f32,
+        x: &[f32],
+        y: &[f32],
+        z: &[f32],
+        eps_sq: f32,
+        neighbors: &mut Vec<usize>,
+    ) {
+        for &idx in indices {
+            let ddx = x[idx] - qx;
+            let ddy = y[idx] - qy;
+            let ddz = z[idx] - qz;
+            let dist_sq = ddx * ddx + ddy * ddy + ddz * ddz;
+            if dist_sq < eps_sq {
+                neighbors.push(idx);
+            }
+        }
+    }
+
+    /// NEON-vectorized distance check: processes 4 points per iteration.
+    ///
+    /// Gathers scattered point coordinates into stack arrays, loads them into
+    /// NEON registers, and uses fused multiply-add for distance computation.
+    #[cfg(target_arch = "aarch64")]
+    #[allow(clippy::too_many_arguments)]
+    fn query_neighbors_neon(
+        indices: &[usize],
+        qx: f32,
+        qy: f32,
+        qz: f32,
+        x: &[f32],
+        y: &[f32],
+        z: &[f32],
+        eps_sq: f32,
+        neighbors: &mut Vec<usize>,
+    ) {
+        let len = indices.len();
+        let n_simd = len - len % 4;
+
+        // SAFETY: NEON intrinsics are always available on aarch64.
+        // All index accesses are bounded by the indices slice length and
+        // the x/y/z coordinate arrays (caller guarantees indices are valid).
+        unsafe {
+            let qx_v = vdupq_n_f32(qx);
+            let qy_v = vdupq_n_f32(qy);
+            let qz_v = vdupq_n_f32(qz);
+            let eps_sq_v = vdupq_n_f32(eps_sq);
+
+            for i in (0..n_simd).step_by(4) {
+                let i0 = indices[i];
+                let i1 = indices[i + 1];
+                let i2 = indices[i + 2];
+                let i3 = indices[i + 3];
+
+                // Gather coordinates into stack arrays and load into NEON
+                let xbuf: [f32; 4] = [x[i0], x[i1], x[i2], x[i3]];
+                let ybuf: [f32; 4] = [y[i0], y[i1], y[i2], y[i3]];
+                let zbuf: [f32; 4] = [z[i0], z[i1], z[i2], z[i3]];
+
+                let xv = vld1q_f32(xbuf.as_ptr());
+                let yv = vld1q_f32(ybuf.as_ptr());
+                let zv = vld1q_f32(zbuf.as_ptr());
+
+                // Vectorized distance: dx*dx + dy*dy + dz*dz
+                let ddx = vsubq_f32(xv, qx_v);
+                let ddy = vsubq_f32(yv, qy_v);
+                let ddz = vsubq_f32(zv, qz_v);
+                let dist_sq =
+                    vfmaq_f32(vfmaq_f32(vmulq_f32(ddx, ddx), ddy, ddy), ddz, ddz);
+
+                // Compare: dist_sq < eps_sq → 0xFFFFFFFF per lane
+                let mask = vcltq_f32(dist_sq, eps_sq_v);
+                let mask_u32 = vreinterpretq_u32_f32(vreinterpretq_f32_u32(mask));
+
+                if vgetq_lane_u32::<0>(mask_u32) != 0 {
+                    neighbors.push(i0);
+                }
+                if vgetq_lane_u32::<1>(mask_u32) != 0 {
+                    neighbors.push(i1);
+                }
+                if vgetq_lane_u32::<2>(mask_u32) != 0 {
+                    neighbors.push(i2);
+                }
+                if vgetq_lane_u32::<3>(mask_u32) != 0 {
+                    neighbors.push(i3);
+                }
+            }
+        }
+
+        // Scalar remainder for last 1-3 points
+        for &idx in &indices[n_simd..] {
+            let ddx = x[idx] - qx;
+            let ddy = y[idx] - qy;
+            let ddz = z[idx] - qz;
+            let dist_sq = ddx * ddx + ddy * ddy + ddz * ddz;
+            if dist_sq < eps_sq {
+                neighbors.push(idx);
+            }
+        }
+    }
 }
+
+// ── Section 2: FlatSpatialHash (open-addressing, contiguous storage) ────────
+
+const SENTINEL: (i32, i32, i32) = (i32::MIN, i32::MIN, i32::MIN);
+const FLAT_TABLE_SIZE: usize = 4096;
+
+/// Flat-array spatial hash with open-addressing and contiguous point storage.
+///
+/// Eliminates HashMap's SipHash overhead and pointer chasing by storing voxel
+/// keys in an open-addressed table and point indices in a contiguous array
+/// (grouped by voxel). Built in two passes: count, then scatter.
+struct FlatSpatialHash {
+    /// Voxel key per slot (SENTINEL = empty).
+    bucket_keys: Vec<(i32, i32, i32)>,
+    /// Start index into `point_indices` for each bucket.
+    bucket_offsets: Vec<u32>,
+    /// Number of points in each bucket.
+    bucket_counts: Vec<u32>,
+    /// Write cursor per bucket (used during scatter pass, then reset).
+    bucket_cursors: Vec<u32>,
+    /// Contiguous per-voxel point indices.
+    point_indices: Vec<u32>,
+    /// `table_size - 1` for fast modulo.
+    mask: u32,
+    inv_cell_size: f32,
+    /// Indices of occupied buckets for fast clear.
+    dirty_buckets: Vec<u32>,
+}
+
+impl FlatSpatialHash {
+    fn new(cell_size: f32) -> Self {
+        Self {
+            bucket_keys: vec![SENTINEL; FLAT_TABLE_SIZE],
+            bucket_offsets: vec![0; FLAT_TABLE_SIZE],
+            bucket_counts: vec![0; FLAT_TABLE_SIZE],
+            bucket_cursors: vec![0; FLAT_TABLE_SIZE],
+            point_indices: Vec::new(),
+            mask: (FLAT_TABLE_SIZE - 1) as u32,
+            inv_cell_size: 1.0 / cell_size,
+            dirty_buckets: Vec::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        // Only reset occupied buckets — O(occupied) not O(table_size)
+        for &slot in &self.dirty_buckets {
+            let s = slot as usize;
+            self.bucket_keys[s] = SENTINEL;
+            self.bucket_counts[s] = 0;
+            self.bucket_cursors[s] = 0;
+        }
+        self.dirty_buckets.clear();
+    }
+
+    fn voxel_key(&self, x: f32, y: f32, z: f32) -> (i32, i32, i32) {
+        (
+            (x * self.inv_cell_size).floor() as i32,
+            (y * self.inv_cell_size).floor() as i32,
+            (z * self.inv_cell_size).floor() as i32,
+        )
+    }
+
+    /// FxHash-style hash for voxel keys: wrapping multiply + XOR fold.
+    #[inline(always)]
+    fn hash_key(&self, key: (i32, i32, i32)) -> u32 {
+        let mut h = (key.0 as u32).wrapping_mul(0x9e37_79b9);
+        h ^= (key.1 as u32).wrapping_mul(0x517c_c1b7);
+        h ^= (key.2 as u32).wrapping_mul(0x6a09_e667);
+        h & self.mask
+    }
+
+    /// Find or insert a slot for `key` via linear probing. Returns the slot index.
+    #[inline(always)]
+    fn find_or_insert_slot(&mut self, key: (i32, i32, i32)) -> usize {
+        let mut slot = self.hash_key(key) as usize;
+        loop {
+            if self.bucket_keys[slot] == key {
+                return slot;
+            }
+            if self.bucket_keys[slot] == SENTINEL {
+                self.bucket_keys[slot] = key;
+                self.dirty_buckets.push(slot as u32);
+                return slot;
+            }
+            slot = (slot + 1) & (self.mask as usize);
+        }
+    }
+
+    /// Find a slot for `key` (read-only lookup). Returns `None` if not found.
+    #[inline(always)]
+    fn find_slot(&self, key: (i32, i32, i32)) -> Option<usize> {
+        let mut slot = self.hash_key(key) as usize;
+        loop {
+            if self.bucket_keys[slot] == key {
+                return Some(slot);
+            }
+            if self.bucket_keys[slot] == SENTINEL {
+                return None;
+            }
+            slot = (slot + 1) & (self.mask as usize);
+        }
+    }
+
+    /// Two-pass build: count points per voxel, compute offsets, scatter indices.
+    fn build(&mut self, x: &[f32], y: &[f32], z: &[f32], valid: &[bool]) {
+        let n = x.len();
+
+        // Pass 1: Count points per voxel
+        for i in 0..n {
+            if !valid[i] {
+                continue;
+            }
+            let key = self.voxel_key(x[i], y[i], z[i]);
+            let slot = self.find_or_insert_slot(key);
+            self.bucket_counts[slot] += 1;
+        }
+
+        // Prefix sum to compute offsets
+        let mut total: u32 = 0;
+        for &slot in &self.dirty_buckets {
+            let s = slot as usize;
+            self.bucket_offsets[s] = total;
+            self.bucket_cursors[s] = total;
+            total += self.bucket_counts[s];
+        }
+
+        // Allocate contiguous storage
+        self.point_indices.resize(total as usize, 0);
+
+        // Pass 2: Scatter point indices into contiguous ranges
+        for i in 0..n {
+            if !valid[i] {
+                continue;
+            }
+            let key = self.voxel_key(x[i], y[i], z[i]);
+            // Slot is guaranteed to exist from pass 1
+            let slot = self.find_slot(key).unwrap();
+            let cursor = self.bucket_cursors[slot] as usize;
+            self.point_indices[cursor] = i as u32;
+            self.bucket_cursors[slot] += 1;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn query_neighbors(
+        &self,
+        qx: f32,
+        qy: f32,
+        qz: f32,
+        x: &[f32],
+        y: &[f32],
+        z: &[f32],
+        eps_sq: f32,
+        neighbors: &mut Vec<usize>,
+    ) {
+        neighbors.clear();
+        let (cx, cy, cz) = self.voxel_key(qx, qy, qz);
+
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    let key = (cx + dx, cy + dy, cz + dz);
+                    if let Some(slot) = self.find_slot(key) {
+                        let offset = self.bucket_offsets[slot] as usize;
+                        let count = self.bucket_counts[slot] as usize;
+                        let indices = &self.point_indices[offset..offset + count];
+
+                        #[cfg(target_arch = "aarch64")]
+                        Self::query_neighbors_neon(
+                            indices, qx, qy, qz, x, y, z, eps_sq, neighbors,
+                        );
+                        #[cfg(not(target_arch = "aarch64"))]
+                        Self::query_neighbors_scalar(
+                            indices, qx, qy, qz, x, y, z, eps_sq, neighbors,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    #[allow(clippy::too_many_arguments)]
+    fn query_neighbors_scalar(
+        indices: &[u32],
+        qx: f32,
+        qy: f32,
+        qz: f32,
+        x: &[f32],
+        y: &[f32],
+        z: &[f32],
+        eps_sq: f32,
+        neighbors: &mut Vec<usize>,
+    ) {
+        for &idx_u32 in indices {
+            let idx = idx_u32 as usize;
+            let ddx = x[idx] - qx;
+            let ddy = y[idx] - qy;
+            let ddz = z[idx] - qz;
+            let dist_sq = ddx * ddx + ddy * ddy + ddz * ddz;
+            if dist_sq < eps_sq {
+                neighbors.push(idx);
+            }
+        }
+    }
+
+    /// NEON-vectorized distance check for contiguous u32 index slices.
+    #[cfg(target_arch = "aarch64")]
+    #[allow(clippy::too_many_arguments)]
+    fn query_neighbors_neon(
+        indices: &[u32],
+        qx: f32,
+        qy: f32,
+        qz: f32,
+        x: &[f32],
+        y: &[f32],
+        z: &[f32],
+        eps_sq: f32,
+        neighbors: &mut Vec<usize>,
+    ) {
+        let len = indices.len();
+        let n_simd = len - len % 4;
+
+        // SAFETY: NEON intrinsics are always available on aarch64.
+        // All index accesses are bounded by the indices slice length and
+        // the x/y/z coordinate arrays (caller guarantees indices are valid).
+        unsafe {
+            let qx_v = vdupq_n_f32(qx);
+            let qy_v = vdupq_n_f32(qy);
+            let qz_v = vdupq_n_f32(qz);
+            let eps_sq_v = vdupq_n_f32(eps_sq);
+
+            for i in (0..n_simd).step_by(4) {
+                let i0 = indices[i] as usize;
+                let i1 = indices[i + 1] as usize;
+                let i2 = indices[i + 2] as usize;
+                let i3 = indices[i + 3] as usize;
+
+                // Gather coordinates into stack arrays and load into NEON
+                let xbuf: [f32; 4] = [x[i0], x[i1], x[i2], x[i3]];
+                let ybuf: [f32; 4] = [y[i0], y[i1], y[i2], y[i3]];
+                let zbuf: [f32; 4] = [z[i0], z[i1], z[i2], z[i3]];
+
+                let xv = vld1q_f32(xbuf.as_ptr());
+                let yv = vld1q_f32(ybuf.as_ptr());
+                let zv = vld1q_f32(zbuf.as_ptr());
+
+                // Vectorized distance: dx*dx + dy*dy + dz*dz
+                let ddx = vsubq_f32(xv, qx_v);
+                let ddy = vsubq_f32(yv, qy_v);
+                let ddz = vsubq_f32(zv, qz_v);
+                let dist_sq =
+                    vfmaq_f32(vfmaq_f32(vmulq_f32(ddx, ddx), ddy, ddy), ddz, ddz);
+
+                // Compare: dist_sq < eps_sq → 0xFFFFFFFF per lane
+                let mask = vcltq_f32(dist_sq, eps_sq_v);
+                let mask_u32 = vreinterpretq_u32_f32(vreinterpretq_f32_u32(mask));
+
+                if vgetq_lane_u32::<0>(mask_u32) != 0 {
+                    neighbors.push(i0);
+                }
+                if vgetq_lane_u32::<1>(mask_u32) != 0 {
+                    neighbors.push(i1);
+                }
+                if vgetq_lane_u32::<2>(mask_u32) != 0 {
+                    neighbors.push(i2);
+                }
+                if vgetq_lane_u32::<3>(mask_u32) != 0 {
+                    neighbors.push(i3);
+                }
+            }
+        }
+
+        // Scalar remainder for last 1-3 points
+        for &idx_u32 in &indices[n_simd..] {
+            let idx = idx_u32 as usize;
+            let ddx = x[idx] - qx;
+            let ddy = y[idx] - qy;
+            let ddz = z[idx] - qz;
+            let dist_sq = ddx * ddx + ddy * ddy + ddz * ddz;
+            if dist_sq < eps_sq {
+                neighbors.push(idx);
+            }
+        }
+    }
+
+    /// Number of occupied voxel buckets.
+    fn occupied_count(&self) -> usize {
+        self.dirty_buckets.len()
+    }
+
+    /// Slot index of the i-th occupied bucket.
+    fn dirty_bucket_slot(&self, i: usize) -> usize {
+        self.dirty_buckets[i] as usize
+    }
+
+    /// Voxel key at the given table slot.
+    fn key_at_slot(&self, slot: usize) -> (i32, i32, i32) {
+        self.bucket_keys[slot]
+    }
+
+    /// Number of points in the given table slot.
+    fn count_at_slot(&self, slot: usize) -> usize {
+        self.bucket_counts[slot] as usize
+    }
+
+    /// Point indices for the given table slot.
+    fn indices_at_slot(&self, slot: usize) -> &[u32] {
+        let offset = self.bucket_offsets[slot] as usize;
+        let count = self.bucket_counts[slot] as usize;
+        &self.point_indices[offset..offset + count]
+    }
+
+    /// Reverse-lookup: find the dirty_bucket index for a given table slot.
+    fn dirty_bucket_index(&self, slot: usize) -> Option<usize> {
+        let slot_u32 = slot as u32;
+        self.dirty_buckets.iter().position(|&s| s == slot_u32)
+    }
+}
+
+// ── Section 3: SpatialHashKind enum dispatch ────────────────────────────────
+
+enum SpatialHashKind {
+    HashMap(SpatialHash),
+    Flat(FlatSpatialHash),
+}
+
+impl SpatialHashKind {
+    fn clear(&mut self) {
+        match self {
+            Self::HashMap(h) => h.clear(),
+            Self::Flat(f) => f.clear(),
+        }
+    }
+
+    fn insert_hashmap(&mut self, idx: usize, x: f32, y: f32, z: f32) {
+        if let Self::HashMap(h) = self {
+            h.insert(idx, x, y, z);
+        }
+    }
+
+    fn build_flat(&mut self, x: &[f32], y: &[f32], z: &[f32], valid: &[bool]) {
+        if let Self::Flat(f) = self {
+            f.build(x, y, z, valid);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn query_neighbors(
+        &self,
+        qx: f32,
+        qy: f32,
+        qz: f32,
+        x: &[f32],
+        y: &[f32],
+        z: &[f32],
+        eps_sq: f32,
+        neighbors: &mut Vec<usize>,
+    ) {
+        match self {
+            Self::HashMap(h) => h.query_neighbors(qx, qy, qz, x, y, z, eps_sq, neighbors),
+            Self::Flat(f) => f.query_neighbors(qx, qy, qz, x, y, z, eps_sq, neighbors),
+        }
+    }
+}
+
+// ── Section 4: ClusterData + cluster_ ───────────────────────────────────────
 
 /// Reusable state for spatial hash DBSCAN clustering.
 ///
@@ -89,20 +574,34 @@ pub struct ClusterData {
     cluster_ids: Vec<u32>,
     eps_sq: f32,
     min_pts: usize,
-    spatial_hash: SpatialHash,
+    spatial_hash: SpatialHashKind,
     queue: Vec<usize>,
     neighbors: Vec<usize>,
 }
 
 impl ClusterData {
-    /// Create a new `ClusterData` with the given epsilon (meters) and minimum
-    /// points per cluster.
+    /// Create a new `ClusterData` using HashMap-based spatial hash.
     pub fn new(eps_m: f32, min_pts: usize) -> Self {
         Self {
             cluster_ids: Vec::new(),
             eps_sq: eps_m * eps_m,
             min_pts,
-            spatial_hash: SpatialHash::new(eps_m),
+            spatial_hash: SpatialHashKind::HashMap(SpatialHash::new(eps_m)),
+            queue: Vec::new(),
+            neighbors: Vec::new(),
+        }
+    }
+
+    /// Create a new `ClusterData` using flat-array spatial hash.
+    ///
+    /// Uses open-addressing with contiguous point storage for better cache
+    /// behavior and no SipHash overhead.
+    pub fn new_flat(eps_m: f32, min_pts: usize) -> Self {
+        Self {
+            cluster_ids: Vec::new(),
+            eps_sq: eps_m * eps_m,
+            min_pts,
+            spatial_hash: SpatialHashKind::Flat(FlatSpatialHash::new(eps_m)),
             queue: Vec::new(),
             neighbors: Vec::new(),
         }
@@ -126,12 +625,28 @@ pub fn cluster_(data: &mut ClusterData, x: &[f32], y: &[f32], z: &[f32]) -> Vec<
 
     // Build spatial hash — skip origin points (invalid sensor returns)
     data.spatial_hash.clear();
-    for i in 0..n {
-        if x[i] == 0.0 && y[i] == 0.0 && z[i] == 0.0 {
-            data.cluster_ids[i] = VISITED; // mark as visited (noise)
-            continue;
+
+    match &mut data.spatial_hash {
+        SpatialHashKind::HashMap(_) => {
+            for i in 0..n {
+                if x[i] == 0.0 && y[i] == 0.0 && z[i] == 0.0 {
+                    data.cluster_ids[i] = VISITED;
+                    continue;
+                }
+                data.spatial_hash.insert_hashmap(i, x[i], y[i], z[i]);
+            }
         }
-        data.spatial_hash.insert(i, x[i], y[i], z[i]);
+        SpatialHashKind::Flat(_) => {
+            // Mark invalid points, then batch-build
+            let mut valid = vec![true; n];
+            for i in 0..n {
+                if x[i] == 0.0 && y[i] == 0.0 && z[i] == 0.0 {
+                    data.cluster_ids[i] = VISITED;
+                    valid[i] = false;
+                }
+            }
+            data.spatial_hash.build_flat(x, y, z, &valid);
+        }
     }
 
     let mut id: u32 = 0;
@@ -228,7 +743,10 @@ fn expand_cluster(
     }
 }
 
+// ── Section 5: Tests ────────────────────────────────────────────────────────
+
 #[cfg(test)]
+#[allow(clippy::needless_range_loop)]
 mod tests {
     use super::{ClusterData, cluster_};
 
@@ -267,6 +785,29 @@ mod tests {
     }
 
     #[test]
+    fn test_cluster_spatial_flat() {
+        let x = vec![1.0, 1.05, 1.1, 5.0, 5.05, 5.1, 0.0];
+        let y = vec![0.0, 0.05, 0.0, 0.0, 0.05, 0.0, 0.0];
+        let z = vec![0.0, 0.0, 0.05, 0.0, 0.0, 0.05, 0.0];
+
+        let mut data = ClusterData::new_flat(0.2, 2);
+
+        let clusters = cluster_(&mut data, &x, &y, &z);
+
+        assert_eq!(clusters[6], 0, "Origin point should be noise");
+        assert!(clusters[0] > 0, "Point 0 should be in a cluster");
+        assert_eq!(clusters[0], clusters[1]);
+        assert_eq!(clusters[0], clusters[2]);
+        assert!(clusters[3] > 0, "Point 3 should be in a cluster");
+        assert_eq!(clusters[3], clusters[4]);
+        assert_eq!(clusters[3], clusters[5]);
+        assert_ne!(
+            clusters[0], clusters[3],
+            "Cluster A and B should have different IDs"
+        );
+    }
+
+    #[test]
     fn test_cluster_25k_spatial() {
         // All-zero points = all invalid = all noise
         let n = 1024 * 24;
@@ -280,6 +821,22 @@ mod tests {
         let clusters = cluster_(&mut data, &x, &y, &z);
         let elapsed = start.elapsed();
         println!("Clustering 25k all-zero points took: {:?}", elapsed);
+
+        for c in clusters {
+            assert_eq!(c, 0, "All-zero points should be noise (cluster ID 0)");
+        }
+    }
+
+    #[test]
+    fn test_cluster_25k_spatial_flat() {
+        let n = 1024 * 24;
+        let x = vec![0.0f32; n];
+        let y = vec![0.0f32; n];
+        let z = vec![0.0f32; n];
+
+        let mut data = ClusterData::new_flat(0.256, 4);
+
+        let clusters = cluster_(&mut data, &x, &y, &z);
 
         for c in clusters {
             assert_eq!(c, 0, "All-zero points should be noise (cluster ID 0)");
@@ -310,6 +867,83 @@ mod tests {
         // Scattered points should be noise
         for i in 5..8 {
             assert_eq!(clusters[i], 0, "Scattered point {} should be noise", i);
+        }
+    }
+
+    #[test]
+    fn test_cluster_unstructured_flat() {
+        let x = vec![2.0, 2.01, 2.02, 2.0, 2.01, 10.0, 20.0, 30.0];
+        let y = vec![3.0, 3.01, 3.0, 3.02, 3.01, 10.0, 20.0, 30.0];
+        let z = vec![1.0, 1.0, 1.01, 1.0, 1.01, 10.0, 20.0, 30.0];
+
+        let mut data = ClusterData::new_flat(0.1, 3);
+
+        let clusters = cluster_(&mut data, &x, &y, &z);
+
+        assert!(clusters[0] > 0, "Dense points should be clustered");
+        for i in 1..5 {
+            assert_eq!(
+                clusters[0], clusters[i],
+                "Points 0..5 should be in same cluster"
+            );
+        }
+        for i in 5..8 {
+            assert_eq!(clusters[i], 0, "Scattered point {} should be noise", i);
+        }
+    }
+
+    #[test]
+    fn test_cluster_hashmap_vs_flat() {
+        // Verify both implementations produce identical cluster IDs on same input
+        let x = vec![
+            1.0, 1.05, 1.1, 1.02, 1.08, // cluster A
+            5.0, 5.05, 5.1, 5.02, 5.08, // cluster B
+            0.0, 20.0, 30.0, // noise + origin
+        ];
+        let y = vec![
+            0.0, 0.05, 0.0, 0.02, 0.03, 0.0, 0.05, 0.0, 0.02, 0.03, 0.0, 20.0, 30.0,
+        ];
+        let z = vec![
+            0.0, 0.0, 0.05, 0.01, 0.02, 0.0, 0.0, 0.05, 0.01, 0.02, 0.0, 20.0, 30.0,
+        ];
+
+        let mut data_hashmap = ClusterData::new(0.2, 3);
+        let mut data_flat = ClusterData::new_flat(0.2, 3);
+
+        let clusters_hashmap = cluster_(&mut data_hashmap, &x, &y, &z);
+        let clusters_flat = cluster_(&mut data_flat, &x, &y, &z);
+
+        assert_eq!(
+            clusters_hashmap.len(),
+            clusters_flat.len(),
+            "Both should produce same number of cluster IDs"
+        );
+
+        // Cluster IDs may differ in numbering but the groupings must match.
+        // Check that points in the same cluster in hashmap are also in the
+        // same cluster in flat, and vice versa.
+        for i in 0..clusters_hashmap.len() {
+            for j in (i + 1)..clusters_hashmap.len() {
+                let same_hashmap = clusters_hashmap[i] == clusters_hashmap[j];
+                let same_flat = clusters_flat[i] == clusters_flat[j];
+                assert_eq!(
+                    same_hashmap, same_flat,
+                    "Points {} and {} grouping mismatch: hashmap={}, flat={}",
+                    i, j, clusters_hashmap[i], clusters_flat[j]
+                );
+            }
+        }
+
+        // Noise points must be the same
+        for i in 0..clusters_hashmap.len() {
+            assert_eq!(
+                clusters_hashmap[i] == 0,
+                clusters_flat[i] == 0,
+                "Point {} noise mismatch: hashmap={}, flat={}",
+                i,
+                clusters_hashmap[i],
+                clusters_flat[i]
+            );
         }
     }
 }
