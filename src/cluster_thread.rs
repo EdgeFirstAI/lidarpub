@@ -9,10 +9,15 @@ use crate::{
 use edgefirst_schemas::{
     builtin_interfaces::Time, sensor_msgs::PointCloud2, serde_cdr, std_msgs::Header,
 };
-use edgefirst_lidarpub::cluster::{ClusterData, cluster_};
+use edgefirst_lidarpub::cluster::{ClusterData, VoxelClusterData, cluster_, voxel_cluster};
 use kanal::Receiver;
 use tracing::{error, info_span, instrument};
 use zenoh::bytes::{Encoding, ZBytes};
+
+enum ClusteringKind {
+    Dbscan(ClusterData),
+    Voxel(VoxelClusterData),
+}
 
 // If the receiver is empty, waits for the next message, otherwise returns the
 // most recent message on this receiver. If the receiver is closed, returns None
@@ -35,7 +40,13 @@ pub async fn cluster_thread(
     publ: zenoh::pubsub::Publisher<'_>,
     args: Args,
 ) {
-    let mut data = ClusterData::new(args.clustering_eps as f32 / 1000.0, args.clustering_minpts);
+    let eps_m = args.clustering_eps as f32 / 1000.0;
+    let min_pts = args.clustering_minpts;
+
+    let mut kind = match args.clustering.as_str() {
+        "voxel" => ClusteringKind::Voxel(VoxelClusterData::new(eps_m, min_pts)),
+        _ => ClusteringKind::Dbscan(ClusterData::new_flat(eps_m, min_pts)),
+    };
 
     loop {
         let (_ranges, points, time) = match drain_recv(&mut rx).await {
@@ -44,8 +55,10 @@ pub async fn cluster_thread(
         };
 
         let n_points = points.x.len();
-        let clusters = info_span!("clustering")
-            .in_scope(|| cluster_(&mut data, &points.x, &points.y, &points.z));
+        let clusters = info_span!("clustering").in_scope(|| match &mut kind {
+            ClusteringKind::Dbscan(data) => cluster_(data, &points.x, &points.y, &points.z),
+            ClusteringKind::Voxel(data) => voxel_cluster(data, &points.x, &points.y, &points.z),
+        });
 
         let (msg, enc) = match format_points_clustered(
             &points,
