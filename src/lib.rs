@@ -67,6 +67,7 @@
 
 #![cfg_attr(feature = "portable_simd", feature(portable_simd))]
 
+pub mod cluster;
 pub mod common;
 pub mod formats;
 pub mod lidar;

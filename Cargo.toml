@@ -89,6 +89,10 @@ strip = false
 debug = true
 
 [[bench]]
+name = "cluster_bench"
+harness = false
+
+[[bench]]
 name = "format_points_bench"
 harness = false
 

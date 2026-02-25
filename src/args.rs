@@ -109,11 +109,11 @@ pub struct Args {
     #[arg(long, env, default_value = "false")]
     pub clustering: bool,
 
-    /// the distancing metric for clustering, in millimeters
+    /// 3D Euclidean distance threshold for clustering, in millimeters
     #[arg(long, env, default_value = "256")]
     pub clustering_eps: u16,
 
-    /// the number of points needed per clustering, in millimeters
+    /// Minimum number of points to form a cluster
     #[arg(long, env, default_value = "4")]
     pub clustering_minpts: usize,
 

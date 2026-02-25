@@ -12,7 +12,7 @@
 )]
 
 mod args;
-mod cluster;
+mod cluster_thread;
 mod common;
 mod formats;
 mod lidar;
@@ -21,7 +21,7 @@ mod robosense;
 
 use args::Args;
 use clap::Parser as _;
-use cluster::cluster_thread;
+use cluster_thread::cluster_thread;
 use edgefirst_schemas::{
     builtin_interfaces::Time,
     geometry_msgs::{Quaternion, Transform, TransformStamped, Vector3},
@@ -195,7 +195,7 @@ async fn run_ouster(session: Session, args: Args) -> Result<(), Box<dyn std::err
         false => format!("[::]:{}", config.udp_port_lidar),
     };
 
-    run_lidar_loop(session, args, driver, frame, &bind_addr, rows, cols, None).await
+    run_lidar_loop(session, args, driver, frame, &bind_addr, None).await
 }
 
 /// Run the Robosense E1R LiDAR sensor
@@ -329,11 +329,6 @@ async fn run_robosense(session: Session, args: Args) -> Result<(), Box<dyn std::
         Err(_) => warn!("DIFOP startup channel dropped"),
     }
 
-    // E1R doesn't have a fixed row/col structure like Ouster
-    // Use approximate values for clustering (not typically used with E1R)
-    let rows = 1;
-    let cols = 30_000; // ~26k points per frame
-
     let bind_addr = format!("0.0.0.0:{}", args.msop_port);
     info!("Listening for MSOP packets on port {}", args.msop_port);
 
@@ -355,17 +350,7 @@ async fn run_robosense(session: Session, args: Args) -> Result<(), Box<dyn std::
         logged_return_mode: false,
     };
 
-    run_lidar_loop(
-        session,
-        args,
-        driver,
-        frame,
-        &bind_addr,
-        rows,
-        cols,
-        source_filter,
-    )
-    .await
+    run_lidar_loop(session, args, driver, frame, &bind_addr, source_filter).await
 }
 
 /// Discover LiDAR sensors on the network.
@@ -606,15 +591,12 @@ impl LidarDriver for RobosenseDriverWrapper {
 }
 
 /// Generic lidar processing loop
-#[allow(clippy::too_many_arguments)]
 async fn run_lidar_loop<D: LidarDriver, F: lidar::LidarFrameWriter + LidarFrame>(
     session: Session,
     args: Args,
     mut driver: D,
     mut frame: F,
     bind_addr: &str,
-    rows: usize,
-    cols: usize,
     source_filter: Option<std::net::IpAddr>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let points_publisher = session
@@ -642,13 +624,7 @@ async fn run_lidar_loop<D: LidarDriver, F: lidar::LidarFrameWriter + LidarFrame>
                     .enable_all()
                     .build()
                     .unwrap()
-                    .block_on(cluster_thread(
-                        rx_cluster,
-                        cluster_publisher,
-                        rows,
-                        cols,
-                        args_,
-                    ));
+                    .block_on(cluster_thread(rx_cluster, cluster_publisher, args_));
             }) {
             Ok(_) => info!("Clustering thread started"),
             Err(e) => error!("Could not start clustering thread: {:?}", e),

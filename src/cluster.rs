@@ -1,271 +1,231 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2025 Au-Zone Technologies. All Rights Reserved.
 
-use crate::{
-    Args,
-    formats::{clustered_xyz_fields, format_clustered_17byte},
-    lidar::Points,
-};
-use std::ops::Add;
-use tracing::{info_span, instrument};
+//! 3D Spatial Hash DBSCAN clustering for point clouds.
+//!
+//! Divides 3D space into voxels of size `eps`, hashes each point into its voxel,
+//! and queries the 27 adjacent voxels (3×3×3) for neighbor searches. This gives
+//! O(n) average performance for uniform distributions.
 
-type RangeType = u16;
+use std::collections::HashMap;
 
-pub struct ClusterData {
-    range: Vec<RangeType>,
-    rows: usize,
-    cols: usize,
-    cluster_ids: Vec<u32>, // 0 = noise, otherwise cluster_id
-    eps: RangeType,
-    min_pts: usize,
-    wrap: bool,
+/// 3D spatial hash for O(1) average neighbor queries.
+///
+/// Points are binned into voxels of size `1/inv_cell_size`. Neighbor queries
+/// check the 27 adjacent voxels (3×3×3) and filter by squared Euclidean
+/// distance.
+struct SpatialHash {
+    cells: HashMap<(i32, i32, i32), Vec<usize>>,
+    inv_cell_size: f32,
 }
 
-const OFFSETS: [Coord; 8] = [
-    Coord(-1, -1),
-    Coord(-1, 0),
-    Coord(-1, 1),
-    Coord(0, -1),
-    // Coord(0, 0),
-    Coord(0, 1),
-    Coord(1, -1),
-    Coord(1, 0),
-    Coord(1, 1),
-];
-
-#[derive(Debug, Clone, Copy)]
-struct Coord(isize, isize);
-
-impl ClusterData {
-    fn set_id(&mut self, c: Coord, id: u32) {
-        let ind = self.get_index(c);
-        if let Some(ind) = ind {
-            self.cluster_ids[ind] = id;
+impl SpatialHash {
+    fn new(cell_size: f32) -> Self {
+        Self {
+            cells: HashMap::new(),
+            inv_cell_size: 1.0 / cell_size,
         }
     }
 
-    fn get_id(&mut self, c: Coord) -> Option<u32> {
-        let ind = self.get_index(c)?;
-        Some(self.cluster_ids[ind])
-    }
-
-    fn get_range(&self, c: Coord) -> Option<RangeType> {
-        let ind = self.get_index(c)?;
-        Some(self.range[ind])
-    }
-
-    fn get_index(&self, c: Coord) -> Option<usize> {
-        if self.wrap {
-            let ind = (c.0 + self.rows as isize) % self.rows as isize * self.cols as isize
-                + (c.1 + self.cols as isize) % self.cols as isize;
-            Some(ind as usize)
-        } else if 0 <= c.0 && c.0 < self.rows as isize && 0 <= c.1 && c.1 < self.cols as isize {
-            Some(c.0 as usize * self.cols + c.1 as usize)
-        } else {
-            None
-        }
-    }
-}
-
-impl Add for Coord {
-    type Output = Self;
-
-    fn add(self, rhs: Self) -> Self::Output {
-        Coord(self.0 + rhs.0, self.1 + rhs.1)
-    }
-}
-
-use edgefirst_schemas::{
-    builtin_interfaces::Time, sensor_msgs::PointCloud2, serde_cdr, std_msgs::Header,
-};
-use kanal::Receiver;
-use tracing::error;
-use zenoh::bytes::{Encoding, ZBytes};
-
-// If the receiver is empty, waits for the next message, otherwise returns the
-// most recent message on this receiver. If the receiver is closed, returns None
-async fn drain_recv<T>(rx: &mut Receiver<T>) -> Option<T> {
-    let mut msg = match rx.try_recv() {
-        Err(_) => {
-            return None;
-        }
-        Ok(Some(v)) => v,
-        Ok(None) => return rx.recv().map_or(None, |x| Some(x)),
-    };
-    while let Ok(Some(v)) = rx.try_recv() {
-        msg = v;
-    }
-    Some(msg)
-}
-
-pub async fn cluster_thread(
-    mut rx: Receiver<(Vec<f32>, Points, Time)>,
-    publ: zenoh::pubsub::Publisher<'_>,
-    rows: usize,
-    cols: usize,
-    args: Args,
-) {
-    // only wrapping when the full circle is used
-    let wrap = args.azimuth == [0, 360];
-    let mut data = ClusterData {
-        cluster_ids: Vec::new(),
-        range: Vec::new(),
-        rows,
-        cols,
-        eps: args.clustering_eps,
-        min_pts: args.clustering_minpts,
-        wrap,
-    };
-    loop {
-        let (ranges, points, time) = match drain_recv(&mut rx).await {
-            Some(v) => v,
-            None => return,
-        };
-
-        let clusters = info_span!("clustering").in_scope(|| {
-            data.range = ranges.into_iter().map(|v| v as RangeType).collect();
-            cluster_(&mut data)
-        });
-
-        let (msg, enc) = match format_points_clustered(
-            &points,
-            &clusters,
-            rows * cols,
-            time,
-            args.frame_id.clone(),
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                error!("Could not encode clustered PCD: {:?}", e);
-                return;
-            }
-        };
-
-        match publ.put(msg).encoding(enc).await {
-            Ok(_) => {}
-            Err(e) => error!("cluster publish error: {:?}", e),
-        }
-    }
-}
-
-pub fn cluster_(data: &mut ClusterData) -> Vec<u32> {
-    assert!(data.range.len() == data.rows * data.cols);
-    // let index = |r, c| r * cols_ + c;
-    data.cluster_ids = vec![0; data.rows * data.cols];
-    let mut id = 1;
-    for row in 0..data.rows {
-        for col in 0..data.cols {
-            let c = Coord(row as isize, col as isize);
-            if data.get_id(c).unwrap() > 0 {
-                continue;
-            }
-            if expand_cluster(data, c, id) {
-                id += 1;
-            }
-        }
-    }
-    let mut c = Vec::new();
-    std::mem::swap(&mut c, &mut data.cluster_ids);
-    c
-}
-
-fn get_valid_neighbours(data: &ClusterData, coord: Coord) -> Vec<Coord> {
-    let r = data.get_range(coord).unwrap();
-    if r == 0 {
-        return Vec::new();
-    }
-    OFFSETS
-        .iter()
-        .filter_map(|x| {
-            let new_coord = coord + *x;
-            let r_ = data.get_range(new_coord)?;
-            if r.abs_diff(r_) < data.eps {
-                Some(new_coord)
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
-fn expand_cluster(data: &mut ClusterData, coord: Coord, id: u32) -> bool {
-    let mut queue = vec![];
-    let valid = get_valid_neighbours(data, coord);
-    if valid.len() < data.min_pts {
-        return false;
-    }
-
-    data.set_id(coord, id);
-    for c in valid {
-        // println!("\t\tc={:?}", c);
-        // all the connected points are at least an Edge
-        if data.get_id(c).unwrap() == 0 {
-            data.set_id(c, id);
-            queue.push(c);
+    fn clear(&mut self) {
+        for v in self.cells.values_mut() {
+            v.clear();
         }
     }
 
-    while let Some(coord) = queue.pop() {
-        let valid = get_valid_neighbours(data, coord);
-        // println!("2. Current={:?}\tValid={:?}", coord, valid);
+    fn voxel_key(&self, x: f32, y: f32, z: f32) -> (i32, i32, i32) {
+        (
+            (x * self.inv_cell_size).floor() as i32,
+            (y * self.inv_cell_size).floor() as i32,
+            (z * self.inv_cell_size).floor() as i32,
+        )
+    }
 
-        // this coordinate is a Core
-        if valid.len() >= data.min_pts {
-            for c in valid {
-                // println!("\t\tc={:?}", c);
-                // all the connected points are at least an Edge
-                if data.get_id(c).unwrap() == 0 {
-                    data.set_id(c, id);
-                    queue.push(c);
+    fn insert(&mut self, idx: usize, x: f32, y: f32, z: f32) {
+        let key = self.voxel_key(x, y, z);
+        self.cells.entry(key).or_default().push(idx);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn query_neighbors(
+        &self,
+        qx: f32,
+        qy: f32,
+        qz: f32,
+        x: &[f32],
+        y: &[f32],
+        z: &[f32],
+        eps_sq: f32,
+        neighbors: &mut Vec<usize>,
+    ) {
+        neighbors.clear();
+        let (cx, cy, cz) = self.voxel_key(qx, qy, qz);
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    let key = (cx + dx, cy + dy, cz + dz);
+                    if let Some(indices) = self.cells.get(&key) {
+                        for &idx in indices {
+                            let ddx = x[idx] - qx;
+                            let ddy = y[idx] - qy;
+                            let ddz = z[idx] - qz;
+                            let dist_sq = ddx * ddx + ddy * ddy + ddz * ddz;
+                            if dist_sq < eps_sq {
+                                neighbors.push(idx);
+                            }
+                        }
+                    }
                 }
             }
         }
     }
-    true
 }
 
-/// Format clustered point cloud data into a PointCloud2 message.
+/// Reusable state for spatial hash DBSCAN clustering.
 ///
-/// Uses the shared SIMD formatters from the formats module.
-#[instrument(skip_all)]
-fn format_points_clustered(
-    points: &Points,
-    cluster_ids: &[u32],
-    n_points: usize,
-    timestamp: Time,
-    frame_id: String,
-) -> Result<(ZBytes, Encoding), serde_cdr::Error> {
-    let fields = clustered_xyz_fields();
+/// All internal buffers are retained between calls to avoid allocation after
+/// the first frame (warmup).
+pub struct ClusterData {
+    cluster_ids: Vec<u32>,
+    eps_sq: f32,
+    min_pts: usize,
+    spatial_hash: SpatialHash,
+    queue: Vec<usize>,
+    neighbors: Vec<usize>,
+}
 
-    // Use the shared SIMD formatter from formats module
-    let data = format_clustered_17byte(
-        &points.x,
-        &points.y,
-        &points.z,
-        cluster_ids,
-        &points.intensity,
-        n_points,
-    );
+impl ClusterData {
+    /// Create a new `ClusterData` with the given epsilon (meters) and minimum
+    /// points per cluster.
+    pub fn new(eps_m: f32, min_pts: usize) -> Self {
+        Self {
+            cluster_ids: Vec::new(),
+            eps_sq: eps_m * eps_m,
+            min_pts,
+            spatial_hash: SpatialHash::new(eps_m),
+            queue: Vec::new(),
+            neighbors: Vec::new(),
+        }
+    }
+}
 
-    let msg = PointCloud2 {
-        header: Header {
-            stamp: timestamp,
-            frame_id,
-        },
-        height: 1,
-        width: n_points as u32,
-        fields,
-        is_bigendian: false,
-        point_step: 17,
-        row_step: 17 * n_points as u32,
-        data,
-        is_dense: true,
-    };
+const VISITED: u32 = u32::MAX;
+const UNVISITED: u32 = 0;
 
-    let msg = ZBytes::from(serde_cdr::serialize(&msg)?);
-    let enc = Encoding::APPLICATION_CDR.with_schema("sensor_msgs/msg/PointCloud2");
+/// Run DBSCAN clustering on the given point cloud.
+///
+/// Returns a `Vec<u32>` where 0 = noise and non-zero values are cluster IDs.
+/// Origin points (0,0,0) are treated as invalid sensor returns and marked as
+/// noise.
+pub fn cluster_(data: &mut ClusterData, x: &[f32], y: &[f32], z: &[f32]) -> Vec<u32> {
+    let n = x.len();
 
-    Ok((msg, enc))
+    // Reset cluster IDs
+    data.cluster_ids.clear();
+    data.cluster_ids.resize(n, UNVISITED);
+
+    // Build spatial hash — skip origin points (invalid sensor returns)
+    data.spatial_hash.clear();
+    for i in 0..n {
+        if x[i] == 0.0 && y[i] == 0.0 && z[i] == 0.0 {
+            data.cluster_ids[i] = VISITED; // mark as visited (noise)
+            continue;
+        }
+        data.spatial_hash.insert(i, x[i], y[i], z[i]);
+    }
+
+    let mut id: u32 = 0;
+    for i in 0..n {
+        if data.cluster_ids[i] != UNVISITED {
+            continue;
+        }
+
+        // Query neighbors of point i
+        data.spatial_hash.query_neighbors(
+            x[i],
+            y[i],
+            z[i],
+            x,
+            y,
+            z,
+            data.eps_sq,
+            &mut data.neighbors,
+        );
+
+        if data.neighbors.len() < data.min_pts {
+            data.cluster_ids[i] = VISITED; // noise
+            continue;
+        }
+
+        // New cluster
+        id += 1;
+        expand_cluster(data, i, id, x, y, z);
+    }
+
+    // Convert VISITED (noise) markers back to 0
+    for cid in &mut data.cluster_ids {
+        if *cid == VISITED {
+            *cid = 0;
+        }
+    }
+
+    let mut result = Vec::new();
+    std::mem::swap(&mut result, &mut data.cluster_ids);
+    result
+}
+
+fn expand_cluster(
+    data: &mut ClusterData,
+    seed: usize,
+    id: u32,
+    x: &[f32],
+    y: &[f32],
+    z: &[f32],
+) {
+    data.cluster_ids[seed] = id;
+
+    // Seed the queue from the current neighbors buffer
+    data.queue.clear();
+    for &ni in &data.neighbors {
+        if data.cluster_ids[ni] == UNVISITED {
+            data.cluster_ids[ni] = id;
+            data.queue.push(ni);
+        } else if data.cluster_ids[ni] == VISITED {
+            // noise point absorbed into cluster as border point
+            data.cluster_ids[ni] = id;
+        }
+    }
+
+    // BFS expansion using index cursor to avoid borrow conflicts
+    let mut qi = 0;
+    while qi < data.queue.len() {
+        let pt = data.queue[qi];
+        qi += 1;
+
+        data.spatial_hash.query_neighbors(
+            x[pt],
+            y[pt],
+            z[pt],
+            x,
+            y,
+            z,
+            data.eps_sq,
+            &mut data.neighbors,
+        );
+
+        if data.neighbors.len() < data.min_pts {
+            continue;
+        }
+
+        for &ni in &data.neighbors {
+            if data.cluster_ids[ni] == UNVISITED {
+                data.cluster_ids[ni] = id;
+                data.queue.push(ni);
+            } else if data.cluster_ids[ni] == VISITED {
+                data.cluster_ids[ni] = id;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -273,113 +233,83 @@ mod tests {
     use super::{ClusterData, cluster_};
 
     #[test]
-    fn test_cluster() {
-        // Test pattern (eps=1 means adjacent points with similar values cluster):
-        // Row 0: 00 10 10 00 | 00 00 00 00
-        // Row 1: 00 10 10 00 | 10 10 00 00
-        // Row 2: 00 10 10 10 | 10 10 00 00
-        // Row 3: 00 10 10 10 | 10 10 10 10
-        //
-        // With eps=1 and min_pts=4, rows 2-3 connect left and right groups
-        // via columns 2-4, forming ONE large cluster
-        let mut r1 = vec![00, 10, 10, 00, 00, 00, 00, 00];
-        let mut r2 = vec![00, 10, 10, 00, 10, 10, 00, 00];
-        let mut r3 = vec![00, 10, 10, 10, 10, 10, 00, 00];
-        let mut r4 = vec![00, 10, 10, 10, 10, 10, 10, 10];
+    fn test_cluster_spatial() {
+        // Two clusters in 3D space + one noise point
+        // Cluster A: 3 points near (1.0, 0.0, 0.0)
+        // Cluster B: 3 points near (5.0, 0.0, 0.0)
+        // Noise: origin (0,0,0) is treated as invalid
+        let x = vec![1.0, 1.05, 1.1, 5.0, 5.05, 5.1, 0.0];
+        let y = vec![0.0, 0.05, 0.0, 0.0, 0.05, 0.0, 0.0];
+        let z = vec![0.0, 0.0, 0.05, 0.0, 0.0, 0.05, 0.0];
 
-        let mut range = Vec::new();
-        range.append(&mut r1);
-        range.append(&mut r2);
-        range.append(&mut r3);
-        range.append(&mut r4);
+        let mut data = ClusterData::new(0.2, 2);
 
-        let mut data = ClusterData {
-            cluster_ids: Vec::new(),
-            range,
-            rows: 4,
-            cols: 8,
-            eps: 1,
-            min_pts: 4,
-            wrap: false,
-        };
+        let clusters = cluster_(&mut data, &x, &y, &z);
 
-        let clusters = cluster_(&mut data);
+        // Origin point should be noise (0)
+        assert_eq!(clusters[6], 0, "Origin point should be noise");
 
-        // Verify clustering behavior:
-        // - Zeros in range should be noise (cluster ID = 0)
-        // - Non-zero values that satisfy min_pts should form cluster(s)
-        let num_noise = clusters.iter().filter(|&&c| c == 0).count();
-        let unique_clusters: std::collections::HashSet<_> =
-            clusters.iter().filter(|&&c| c != 0).copied().collect();
+        // Cluster A points should share the same non-zero ID
+        assert!(clusters[0] > 0, "Point 0 should be in a cluster");
+        assert_eq!(clusters[0], clusters[1]);
+        assert_eq!(clusters[0], clusters[2]);
 
-        assert!(
-            num_noise > 0,
-            "Expected some noise points (range=0 positions)"
-        );
-        assert!(!unique_clusters.is_empty(), "Expected at least 1 cluster");
+        // Cluster B points should share the same non-zero ID
+        assert!(clusters[3] > 0, "Point 3 should be in a cluster");
+        assert_eq!(clusters[3], clusters[4]);
+        assert_eq!(clusters[3], clusters[5]);
 
-        // The pattern with eps=1 forms a connected graph, so should be 1 cluster
-        assert_eq!(
-            unique_clusters.len(),
-            1,
-            "With eps=1, the connected 10s should form 1 cluster (rows 2-3 connect left and right)"
+        // The two clusters should have different IDs
+        assert_ne!(
+            clusters[0], clusters[3],
+            "Cluster A and B should have different IDs"
         );
     }
 
     #[test]
-    fn test_cluster_25k() {
-        // Performance test with large dataset - all zeros means all noise
-        let mut data = ClusterData {
-            cluster_ids: vec![0; 1024 * 24],
-            range: vec![0; 1024 * 24], // All zeros = all noise
-            rows: 64,
-            cols: 384,
-            eps: 3,
-            min_pts: 4,
-            wrap: false,
-        };
-        let start = std::time::Instant::now();
-        let clusters = cluster_(&mut data);
-        let elapsed = start.elapsed();
-        println!("Clustering 25k points took: {:?}", elapsed);
+    fn test_cluster_25k_spatial() {
+        // All-zero points = all invalid = all noise
+        let n = 1024 * 24;
+        let x = vec![0.0f32; n];
+        let y = vec![0.0f32; n];
+        let z = vec![0.0f32; n];
 
-        // All zeros in range means no valid neighbors, so everything is noise (cluster
-        // ID = 0)
+        let mut data = ClusterData::new(0.256, 4);
+
+        let start = std::time::Instant::now();
+        let clusters = cluster_(&mut data, &x, &y, &z);
+        let elapsed = start.elapsed();
+        println!("Clustering 25k all-zero points took: {:?}", elapsed);
+
         for c in clusters {
+            assert_eq!(c, 0, "All-zero points should be noise (cluster ID 0)");
+        }
+    }
+
+    #[test]
+    fn test_cluster_unstructured() {
+        // Simulate E1R-like variable-count unstructured point cloud
+        // 5 points forming a cluster + 3 scattered noise points
+        let x = vec![2.0, 2.01, 2.02, 2.0, 2.01, 10.0, 20.0, 30.0];
+        let y = vec![3.0, 3.01, 3.0, 3.02, 3.01, 10.0, 20.0, 30.0];
+        let z = vec![1.0, 1.0, 1.01, 1.0, 1.01, 10.0, 20.0, 30.0];
+
+        let mut data = ClusterData::new(0.1, 3);
+
+        let clusters = cluster_(&mut data, &x, &y, &z);
+
+        // First 5 points should form one cluster
+        assert!(clusters[0] > 0, "Dense points should be clustered");
+        for i in 1..5 {
             assert_eq!(
-                c, 0,
-                "With all-zero range data, all points should be noise (cluster ID 0)"
+                clusters[0], clusters[i],
+                "Points 0..5 should be in same cluster"
             );
         }
-    }
 
-    /*
-    #[test]
-    fn test_cluster_data() {
-        let d = include_bytes!("../depth.l16");
-        let ptr = d as *const u8 as *const u16;
-        let d_range_type: &[u16] = unsafe { std::slice::from_raw_parts(ptr, 64 * 382) };
-        println!("d_RangeType.len()={}", d_range_type.len());
-        let range: Vec<RangeType> = d_range_type.iter().map(|v| (*v) as RangeType).collect();
-        let mut data = ClusterData {
-            cluster_ids: vec![0; d_range_type.len()],
-            range: vec![0; range.len()],
-            rows: 64,
-            cols: 382,
-            eps: 256,
-            min_pts: 4,
-            wrap: false,
-        };
-        let _ = cluster_(&mut data);
-        let _ = cluster_(&mut data);
-        data.range = range;
-        let clusters = cluster_(&mut data);
-        print!("{:?}", clusters);
-        let mut file = std::fs::File::create("testdata/clustered.l8").unwrap();
-        // Write a slice of bytes to the file
-        for c in clusters {
-            file.write_all(&((c % 256) as u8).to_be_bytes()).unwrap();
+        // Scattered points should be noise
+        for i in 5..8 {
+            assert_eq!(clusters[i], 0, "Scattered point {} should be noise", i);
         }
     }
-    */
 }
