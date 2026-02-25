@@ -743,12 +743,144 @@ fn expand_cluster(
     }
 }
 
+// ── Section 4b: VoxelClusterData + voxel_cluster ────────────────────────────
+
+/// Reusable state for voxel connected-component clustering.
+///
+/// All internal buffers are retained between calls to avoid allocation after
+/// the first frame (warmup).
+pub struct VoxelClusterData {
+    flat_hash: FlatSpatialHash,
+    cluster_ids: Vec<u32>,
+    /// Per-dirty-bucket visited flag for BFS.
+    voxel_visited: Vec<bool>,
+    /// BFS queue storing dirty_bucket indices (not table slots).
+    voxel_queue: Vec<usize>,
+    min_pts: usize,
+}
+
+impl VoxelClusterData {
+    pub fn new(cell_size_m: f32, min_pts: usize) -> Self {
+        Self {
+            flat_hash: FlatSpatialHash::new(cell_size_m),
+            cluster_ids: Vec::new(),
+            voxel_visited: Vec::new(),
+            voxel_queue: Vec::new(),
+            min_pts,
+        }
+    }
+}
+
+/// Run voxel connected-component clustering on the given point cloud.
+///
+/// Returns a `Vec<u32>` where 0 = noise and non-zero values are cluster IDs.
+/// Points are binned into voxels of size `cell_size_m`. Adjacent occupied
+/// voxels (26-connected) with >= `min_pts` points are merged into clusters.
+/// Origin points (0,0,0) are treated as invalid sensor returns and marked noise.
+pub fn voxel_cluster(
+    data: &mut VoxelClusterData,
+    x: &[f32],
+    y: &[f32],
+    z: &[f32],
+) -> Vec<u32> {
+    let n = x.len();
+
+    // Reset output
+    data.cluster_ids.clear();
+    data.cluster_ids.resize(n, 0);
+
+    // Build spatial hash (marks invalid origin points)
+    data.flat_hash.clear();
+    let mut valid = vec![true; n];
+    for i in 0..n {
+        if x[i] == 0.0 && y[i] == 0.0 && z[i] == 0.0 {
+            valid[i] = false;
+        }
+    }
+    data.flat_hash.build(x, y, z, &valid);
+
+    let n_occupied = data.flat_hash.occupied_count();
+    if n_occupied == 0 {
+        return std::mem::take(&mut data.cluster_ids);
+    }
+
+    // Reset BFS state
+    data.voxel_visited.clear();
+    data.voxel_visited.resize(n_occupied, false);
+
+    let mut cluster_id: u32 = 0;
+
+    // BFS over voxels (not points)
+    for start in 0..n_occupied {
+        if data.voxel_visited[start] {
+            continue;
+        }
+
+        let start_slot = data.flat_hash.dirty_bucket_slot(start);
+
+        // Skip voxels below min_pts threshold
+        if data.flat_hash.count_at_slot(start_slot) < data.min_pts {
+            data.voxel_visited[start] = true;
+            continue;
+        }
+
+        // New cluster — BFS through 26-connected neighbors
+        cluster_id += 1;
+        data.voxel_queue.clear();
+        data.voxel_queue.push(start);
+        data.voxel_visited[start] = true;
+
+        // Label seed voxel's points
+        for &pt in data.flat_hash.indices_at_slot(start_slot) {
+            data.cluster_ids[pt as usize] = cluster_id;
+        }
+
+        let mut qi = 0;
+        while qi < data.voxel_queue.len() {
+            let current = data.voxel_queue[qi];
+            qi += 1;
+
+            let current_slot = data.flat_hash.dirty_bucket_slot(current);
+            let (cx, cy, cz) = data.flat_hash.key_at_slot(current_slot);
+
+            // Check 26-connected neighbors
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    for dz in -1..=1 {
+                        if dx == 0 && dy == 0 && dz == 0 {
+                            continue;
+                        }
+                        let neighbor_key = (cx + dx, cy + dy, cz + dz);
+                        if let Some(neighbor_slot) = data.flat_hash.find_slot(neighbor_key) {
+                            if let Some(nb_idx) = data.flat_hash.dirty_bucket_index(neighbor_slot) {
+                                if !data.voxel_visited[nb_idx]
+                                    && data.flat_hash.count_at_slot(neighbor_slot)
+                                        >= data.min_pts
+                                {
+                                    data.voxel_visited[nb_idx] = true;
+                                    data.voxel_queue.push(nb_idx);
+
+                                    for &pt in data.flat_hash.indices_at_slot(neighbor_slot) {
+                                        data.cluster_ids[pt as usize] = cluster_id;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    std::mem::take(&mut data.cluster_ids)
+}
+
 // ── Section 5: Tests ────────────────────────────────────────────────────────
 
 #[cfg(test)]
 #[allow(clippy::needless_range_loop)]
 mod tests {
-    use super::{ClusterData, cluster_};
+    use super::{ClusterData, VoxelClusterData, cluster_, voxel_cluster};
 
     #[test]
     fn test_cluster_spatial() {
@@ -944,6 +1076,117 @@ mod tests {
                 clusters_hashmap[i],
                 clusters_flat[i]
             );
+        }
+    }
+
+    #[test]
+    fn test_voxel_cluster_two_groups() {
+        let x = vec![1.0, 1.05, 1.1, 5.0, 5.05, 5.1, 0.0];
+        let y = vec![0.0, 0.05, 0.0, 0.0, 0.05, 0.0, 0.0];
+        let z = vec![0.0, 0.0, 0.05, 0.0, 0.0, 0.05, 0.0];
+
+        let mut data = VoxelClusterData::new(0.2, 2);
+        let clusters = voxel_cluster(&mut data, &x, &y, &z);
+
+        assert_eq!(clusters[6], 0, "Origin point should be noise");
+        assert!(clusters[0] > 0, "Point 0 should be in a cluster");
+        assert_eq!(clusters[0], clusters[1]);
+        assert_eq!(clusters[0], clusters[2]);
+        assert!(clusters[3] > 0, "Point 3 should be in a cluster");
+        assert_eq!(clusters[3], clusters[4]);
+        assert_eq!(clusters[3], clusters[5]);
+        assert_ne!(clusters[0], clusters[3], "Two groups should differ");
+    }
+
+    #[test]
+    fn test_voxel_cluster_all_noise() {
+        let n = 1024 * 24;
+        let x = vec![0.0f32; n];
+        let y = vec![0.0f32; n];
+        let z = vec![0.0f32; n];
+
+        let mut data = VoxelClusterData::new(0.256, 4);
+        let clusters = voxel_cluster(&mut data, &x, &y, &z);
+
+        for c in clusters {
+            assert_eq!(c, 0, "All-zero points should be noise");
+        }
+    }
+
+    #[test]
+    fn test_voxel_cluster_unstructured() {
+        let x = vec![2.0, 2.01, 2.02, 2.0, 2.01, 10.0, 20.0, 30.0];
+        let y = vec![3.0, 3.01, 3.0, 3.02, 3.01, 10.0, 20.0, 30.0];
+        let z = vec![1.0, 1.0, 1.01, 1.0, 1.01, 10.0, 20.0, 30.0];
+
+        let mut data = VoxelClusterData::new(0.1, 3);
+        let clusters = voxel_cluster(&mut data, &x, &y, &z);
+
+        assert!(clusters[0] > 0, "Dense points should be clustered");
+        for i in 1..5 {
+            assert_eq!(clusters[0], clusters[i], "Points 0..5 same cluster");
+        }
+        for i in 5..8 {
+            assert_eq!(clusters[i], 0, "Scattered point {} should be noise", i);
+        }
+    }
+
+    #[test]
+    fn test_voxel_cluster_adjacent_voxels_merge() {
+        // At cell_size=0.5, points at (0.1,0,0) and (0.6,0,0) are in
+        // neighboring voxels and should merge into one cluster.
+        let x = vec![0.1, 0.2, 0.3, 0.6, 0.7, 0.8];
+        let y = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let z = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+
+        let mut data = VoxelClusterData::new(0.5, 2);
+        let clusters = voxel_cluster(&mut data, &x, &y, &z);
+
+        assert!(clusters[0] > 0, "Should be clustered");
+        for i in 1..6 {
+            assert_eq!(clusters[0], clusters[i], "All should merge via adjacency");
+        }
+    }
+
+    #[test]
+    fn test_voxel_vs_dbscan_agreement() {
+        let x = vec![
+            1.0, 1.05, 1.1, 1.02, 1.08,
+            5.0, 5.05, 5.1, 5.02, 5.08,
+            0.0, 20.0, 30.0,
+        ];
+        let y = vec![
+            0.0, 0.05, 0.0, 0.02, 0.03,
+            0.0, 0.05, 0.0, 0.02, 0.03,
+            0.0, 20.0, 30.0,
+        ];
+        let z = vec![
+            0.0, 0.0, 0.05, 0.01, 0.02,
+            0.0, 0.0, 0.05, 0.01, 0.02,
+            0.0, 20.0, 30.0,
+        ];
+
+        let mut dbscan = ClusterData::new_flat(0.2, 3);
+        let mut voxel = VoxelClusterData::new(0.2, 3);
+
+        let c_dbscan = cluster_(&mut dbscan, &x, &y, &z);
+        let c_voxel = voxel_cluster(&mut voxel, &x, &y, &z);
+
+        assert_eq!(c_dbscan.len(), c_voxel.len());
+
+        for i in 0..c_dbscan.len() {
+            for j in (i + 1)..c_dbscan.len() {
+                let same_d = c_dbscan[i] == c_dbscan[j];
+                let same_v = c_voxel[i] == c_voxel[j];
+                assert_eq!(same_d, same_v,
+                    "Points {} and {} grouping mismatch: dbscan={}, voxel={}",
+                    i, j, c_dbscan[i], c_voxel[j]);
+            }
+        }
+
+        for i in 0..c_dbscan.len() {
+            assert_eq!(c_dbscan[i] == 0, c_voxel[i] == 0,
+                "Point {} noise mismatch", i);
         }
     }
 }
