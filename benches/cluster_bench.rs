@@ -219,6 +219,67 @@ fn bench_warmup(c: &mut Criterion) {
     group.finish();
 }
 
+/// Load a PCD v0.7 binary file into (x, y, z) vectors.
+/// Returns None if the file doesn't exist (allows graceful skip).
+fn load_pcd(path: &str) -> Option<PointCloud> {
+    let data = std::fs::read(path).ok()?;
+    let header_end = data.windows(12).position(|w| w == b"DATA binary\n")? + 12;
+    let body = &data[header_end..];
+    let point_size = 13; // x(4) + y(4) + z(4) + intensity(1)
+    if body.len() % point_size != 0 {
+        return None;
+    }
+    let n = body.len() / point_size;
+    let mut x = Vec::with_capacity(n);
+    let mut y = Vec::with_capacity(n);
+    let mut z = Vec::with_capacity(n);
+    for i in 0..n {
+        let off = i * point_size;
+        x.push(f32::from_le_bytes(body[off..off + 4].try_into().ok()?));
+        y.push(f32::from_le_bytes(body[off + 4..off + 8].try_into().ok()?));
+        z.push(f32::from_le_bytes(body[off + 8..off + 12].try_into().ok()?));
+    }
+    Some(PointCloud { x, y, z })
+}
+
+/// Benchmark with real LiDAR point clouds from PCD files.
+///
+/// Compares voxel vs flat DBSCAN on actual sensor data.
+/// Skips gracefully if PCD files are not present.
+fn bench_real_data(c: &mut Criterion) {
+    let mut group = c.benchmark_group("real_data");
+
+    if let Some(scene) = load_pcd("testdata/e1r_frame0.pcd") {
+        let n = scene.x.len();
+        group.throughput(Throughput::Elements(n as u64));
+
+        group.bench_function("e1r_voxel", |b| {
+            let mut data = VoxelClusterData::new(0.256, 4);
+            let _ = voxel_cluster(&mut data, &scene.x, &scene.y, &scene.z);
+            b.iter(|| voxel_cluster(&mut data, &scene.x, &scene.y, &scene.z));
+        });
+
+        group.bench_function("e1r_flat_dbscan", |b| {
+            let mut data = ClusterData::new_flat(0.256, 4);
+            let _ = cluster_(&mut data, &scene.x, &scene.y, &scene.z);
+            b.iter(|| cluster_(&mut data, &scene.x, &scene.y, &scene.z));
+        });
+    }
+
+    if let Some(scene) = load_pcd("testdata/os1_frame0.pcd") {
+        let n = scene.x.len();
+        group.throughput(Throughput::Elements(n as u64));
+
+        group.bench_function("ouster_voxel", |b| {
+            let mut data = VoxelClusterData::new(0.256, 4);
+            let _ = voxel_cluster(&mut data, &scene.x, &scene.y, &scene.z);
+            b.iter(|| voxel_cluster(&mut data, &scene.x, &scene.y, &scene.z));
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_cluster_sizes,
@@ -226,5 +287,6 @@ criterion_group!(
     bench_all_noise,
     bench_hash_comparison,
     bench_warmup,
+    bench_real_data,
 );
 criterion_main!(benches);

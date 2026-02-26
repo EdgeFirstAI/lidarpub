@@ -70,7 +70,7 @@ pub async fn cluster_thread(
             Ok(v) => v,
             Err(e) => {
                 error!("Could not encode clustered PCD: {:?}", e);
-                return;
+                continue;
             }
         };
 

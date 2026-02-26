@@ -105,9 +105,10 @@ pub struct Args {
     #[arg(long, env)]
     pub tracy: bool,
 
-    /// Enable lidar clustering task.
-    #[arg(long, env, default_value = "false")]
-    pub clustering: bool,
+    /// Clustering algorithm: "" (disabled), "dbscan", "voxel"
+    #[arg(long, env, default_value = "",
+          value_parser = PossibleValuesParser::new(["", "dbscan", "voxel"]))]
+    pub clustering: String,
 
     /// 3D Euclidean distance threshold for clustering, in millimeters
     #[arg(long, env, default_value = "256")]
@@ -132,6 +133,12 @@ pub struct Args {
     /// disable zenoh multicast scouting
     #[arg(long, env)]
     no_multicast_scouting: bool,
+}
+
+impl Args {
+    pub fn clustering_enabled(&self) -> bool {
+        !self.clustering.is_empty()
+    }
 }
 
 impl From<Args> for Config {

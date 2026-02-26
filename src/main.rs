@@ -615,16 +615,28 @@ async fn run_lidar_loop<D: LidarDriver, F: lidar::LidarFrameWriter + LidarFrame>
 
     // Set up clustering if enabled
     let (tx_cluster, rx_cluster) = kanal::bounded(8);
-    if args.clustering {
+    if args.clustering_enabled() {
         let args_ = args.clone();
         match std::thread::Builder::new()
             .name("cluster".to_string())
             .spawn(move || {
-                tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap()
-                    .block_on(cluster_thread(rx_cluster, cluster_publisher, args_));
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    tokio::runtime::Builder::new_multi_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(cluster_thread(rx_cluster, cluster_publisher, args_));
+                }));
+                if let Err(e) = result {
+                    let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else if let Some(s) = e.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "unknown panic".to_string()
+                    };
+                    error!("Clustering thread panicked: {}", msg);
+                }
             }) {
             Ok(_) => info!("Clustering thread started"),
             Err(e) => error!("Could not start clustering thread: {:?}", e),
@@ -677,7 +689,7 @@ async fn run_lidar_loop<D: LidarDriver, F: lidar::LidarFrameWriter + LidarFrame>
                 let timestamp = Time::from_nanos(timestamp_ns);
 
                 // Send to clustering if enabled
-                if args.clustering {
+                if args.clustering_enabled() {
                     // Use pre-computed range directly - NO sqrt needed! (PR #2 fix)
                     let ranges: Vec<f32> = frame.range().to_vec();
                     let points = lidar::Points {

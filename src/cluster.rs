@@ -202,7 +202,10 @@ impl SpatialHash {
 // ── Section 2: FlatSpatialHash (open-addressing, contiguous storage) ────────
 
 const SENTINEL: (i32, i32, i32) = (i32::MIN, i32::MIN, i32::MIN);
-const FLAT_TABLE_SIZE: usize = 4096;
+const INITIAL_TABLE_SIZE: usize = 4096;
+/// Maximum load factor before table must grow. At 0.75, linear probing
+/// averages ~2.5 probes per lookup — beyond this, probe chains degrade fast.
+const MAX_LOAD_FACTOR: f32 = 0.75;
 
 /// Flat-array spatial hash with open-addressing and contiguous point storage.
 ///
@@ -225,19 +228,27 @@ struct FlatSpatialHash {
     inv_cell_size: f32,
     /// Indices of occupied buckets for fast clear.
     dirty_buckets: Vec<u32>,
+    /// Reverse map: table slot → index into `dirty_buckets` (u32::MAX = empty).
+    slot_to_dirty: Vec<u32>,
+    /// Current table capacity (always a power of 2).
+    table_size: usize,
 }
+
+const SLOT_EMPTY: u32 = u32::MAX;
 
 impl FlatSpatialHash {
     fn new(cell_size: f32) -> Self {
         Self {
-            bucket_keys: vec![SENTINEL; FLAT_TABLE_SIZE],
-            bucket_offsets: vec![0; FLAT_TABLE_SIZE],
-            bucket_counts: vec![0; FLAT_TABLE_SIZE],
-            bucket_cursors: vec![0; FLAT_TABLE_SIZE],
+            bucket_keys: vec![SENTINEL; INITIAL_TABLE_SIZE],
+            bucket_offsets: vec![0; INITIAL_TABLE_SIZE],
+            bucket_counts: vec![0; INITIAL_TABLE_SIZE],
+            bucket_cursors: vec![0; INITIAL_TABLE_SIZE],
             point_indices: Vec::new(),
-            mask: (FLAT_TABLE_SIZE - 1) as u32,
+            mask: (INITIAL_TABLE_SIZE - 1) as u32,
             inv_cell_size: 1.0 / cell_size,
             dirty_buckets: Vec::new(),
+            slot_to_dirty: vec![SLOT_EMPTY; INITIAL_TABLE_SIZE],
+            table_size: INITIAL_TABLE_SIZE,
         }
     }
 
@@ -248,8 +259,62 @@ impl FlatSpatialHash {
             self.bucket_keys[s] = SENTINEL;
             self.bucket_counts[s] = 0;
             self.bucket_cursors[s] = 0;
+            self.slot_to_dirty[s] = SLOT_EMPTY;
         }
         self.dirty_buckets.clear();
+    }
+
+    /// Ensure the table is large enough for `n_points` without needing to
+    /// grow during build. Worst case: every point is in a unique voxel.
+    fn ensure_capacity(&mut self, n_points: usize) {
+        let required = ((n_points as f32 / MAX_LOAD_FACTOR) as usize).next_power_of_two();
+        if required > self.table_size {
+            self.resize_table(required);
+        }
+    }
+
+    /// Resize the table to `new_size` (must be a power of 2). Rehashes all
+    /// occupied buckets into fresh arrays.
+    fn resize_table(&mut self, new_size: usize) {
+        debug_assert!(new_size.is_power_of_two());
+        let old_keys = std::mem::replace(&mut self.bucket_keys, vec![SENTINEL; new_size]);
+        let old_counts = std::mem::replace(&mut self.bucket_counts, vec![0; new_size]);
+        self.bucket_offsets = vec![0; new_size];
+        self.bucket_cursors = vec![0; new_size];
+        self.slot_to_dirty = vec![SLOT_EMPTY; new_size];
+        self.mask = (new_size - 1) as u32;
+        self.table_size = new_size;
+
+        let old_dirty = std::mem::take(&mut self.dirty_buckets);
+        for &old_slot in &old_dirty {
+            let os = old_slot as usize;
+            let key = old_keys[os];
+            if key == SENTINEL {
+                continue;
+            }
+            let new_slot = self.insert_slot_unchecked(key);
+            self.bucket_counts[new_slot] = old_counts[os];
+        }
+    }
+
+    /// Insert a key into the table without checking load factor.
+    /// Used by `resize_table` and `find_or_insert_slot` after the check.
+    #[inline(always)]
+    fn insert_slot_unchecked(&mut self, key: (i32, i32, i32)) -> usize {
+        let mut slot = self.hash_key(key) as usize;
+        loop {
+            if self.bucket_keys[slot] == key {
+                return slot;
+            }
+            if self.bucket_keys[slot] == SENTINEL {
+                self.bucket_keys[slot] = key;
+                let dirty_idx = self.dirty_buckets.len() as u32;
+                self.dirty_buckets.push(slot as u32);
+                self.slot_to_dirty[slot] = dirty_idx;
+                return slot;
+            }
+            slot = (slot + 1) & (self.mask as usize);
+        }
     }
 
     fn voxel_key(&self, x: f32, y: f32, z: f32) -> (i32, i32, i32) {
@@ -270,20 +335,13 @@ impl FlatSpatialHash {
     }
 
     /// Find or insert a slot for `key` via linear probing. Returns the slot index.
-    #[inline(always)]
+    /// Grows the table if load factor exceeds MAX_LOAD_FACTOR.
     fn find_or_insert_slot(&mut self, key: (i32, i32, i32)) -> usize {
-        let mut slot = self.hash_key(key) as usize;
-        loop {
-            if self.bucket_keys[slot] == key {
-                return slot;
-            }
-            if self.bucket_keys[slot] == SENTINEL {
-                self.bucket_keys[slot] = key;
-                self.dirty_buckets.push(slot as u32);
-                return slot;
-            }
-            slot = (slot + 1) & (self.mask as usize);
+        // Check if we need to grow before inserting
+        if (self.dirty_buckets.len() + 1) as f32 > self.table_size as f32 * MAX_LOAD_FACTOR {
+            self.resize_table(self.table_size * 2);
         }
+        self.insert_slot_unchecked(key)
     }
 
     /// Find a slot for `key` (read-only lookup). Returns `None` if not found.
@@ -304,6 +362,9 @@ impl FlatSpatialHash {
     /// Two-pass build: count points per voxel, compute offsets, scatter indices.
     fn build(&mut self, x: &[f32], y: &[f32], z: &[f32], valid: &[bool]) {
         let n = x.len();
+
+        // Pre-size table to avoid growth during insert
+        self.ensure_capacity(n);
 
         // Pass 1: Count points per voxel
         for i in 0..n {
@@ -511,10 +572,11 @@ impl FlatSpatialHash {
         &self.point_indices[offset..offset + count]
     }
 
-    /// Reverse-lookup: find the dirty_bucket index for a given table slot.
+    /// Reverse-lookup: find the dirty_bucket index for a given table slot. O(1).
+    #[inline(always)]
     fn dirty_bucket_index(&self, slot: usize) -> Option<usize> {
-        let slot_u32 = slot as u32;
-        self.dirty_buckets.iter().position(|&s| s == slot_u32)
+        let idx = self.slot_to_dirty[slot];
+        if idx == SLOT_EMPTY { None } else { Some(idx as usize) }
     }
 }
 
@@ -577,6 +639,7 @@ pub struct ClusterData {
     spatial_hash: SpatialHashKind,
     queue: Vec<usize>,
     neighbors: Vec<usize>,
+    valid: Vec<bool>,
 }
 
 impl ClusterData {
@@ -589,6 +652,7 @@ impl ClusterData {
             spatial_hash: SpatialHashKind::HashMap(SpatialHash::new(eps_m)),
             queue: Vec::new(),
             neighbors: Vec::new(),
+            valid: Vec::new(),
         }
     }
 
@@ -604,6 +668,7 @@ impl ClusterData {
             spatial_hash: SpatialHashKind::Flat(FlatSpatialHash::new(eps_m)),
             queue: Vec::new(),
             neighbors: Vec::new(),
+            valid: Vec::new(),
         }
     }
 }
@@ -638,14 +703,15 @@ pub fn cluster_(data: &mut ClusterData, x: &[f32], y: &[f32], z: &[f32]) -> Vec<
         }
         SpatialHashKind::Flat(_) => {
             // Mark invalid points, then batch-build
-            let mut valid = vec![true; n];
+            data.valid.clear();
+            data.valid.resize(n, true);
             for i in 0..n {
                 if x[i] == 0.0 && y[i] == 0.0 && z[i] == 0.0 {
                     data.cluster_ids[i] = VISITED;
-                    valid[i] = false;
+                    data.valid[i] = false;
                 }
             }
-            data.spatial_hash.build_flat(x, y, z, &valid);
+            data.spatial_hash.build_flat(x, y, z, &data.valid);
         }
     }
 
@@ -757,6 +823,7 @@ pub struct VoxelClusterData {
     /// BFS queue storing dirty_bucket indices (not table slots).
     voxel_queue: Vec<usize>,
     min_pts: usize,
+    valid: Vec<bool>,
 }
 
 impl VoxelClusterData {
@@ -767,6 +834,7 @@ impl VoxelClusterData {
             voxel_visited: Vec::new(),
             voxel_queue: Vec::new(),
             min_pts,
+            valid: Vec::new(),
         }
     }
 }
@@ -791,13 +859,14 @@ pub fn voxel_cluster(
 
     // Build spatial hash (marks invalid origin points)
     data.flat_hash.clear();
-    let mut valid = vec![true; n];
+    data.valid.clear();
+    data.valid.resize(n, true);
     for i in 0..n {
         if x[i] == 0.0 && y[i] == 0.0 && z[i] == 0.0 {
-            valid[i] = false;
+            data.valid[i] = false;
         }
     }
-    data.flat_hash.build(x, y, z, &valid);
+    data.flat_hash.build(x, y, z, &data.valid);
 
     let n_occupied = data.flat_hash.occupied_count();
     if n_occupied == 0 {
@@ -1149,6 +1218,40 @@ mod tests {
     }
 
     #[test]
+    fn test_voxel_cluster_reuse_second_call() {
+        // Reproduce bug: voxel_cluster works on first call but crashes on second
+        let x1 = vec![1.0, 1.05, 1.1, 5.0, 5.05, 5.1, 0.0];
+        let y1 = vec![0.0, 0.05, 0.0, 0.0, 0.05, 0.0, 0.0];
+        let z1 = vec![0.0, 0.0, 0.05, 0.0, 0.0, 0.05, 0.0];
+
+        let mut data = VoxelClusterData::new(0.2, 2);
+
+        // First call should work
+        let c1 = voxel_cluster(&mut data, &x1, &y1, &z1);
+        assert!(c1[0] > 0, "First call: point 0 should be clustered");
+
+        // Second call with different data should also work
+        let x2 = vec![2.0, 2.01, 2.02, 2.0, 2.01, 10.0, 20.0, 30.0];
+        let y2 = vec![3.0, 3.01, 3.0, 3.02, 3.01, 10.0, 20.0, 30.0];
+        let z2 = vec![1.0, 1.0, 1.01, 1.0, 1.01, 10.0, 20.0, 30.0];
+
+        let c2 = voxel_cluster(&mut data, &x2, &y2, &z2);
+        assert!(c2[0] > 0, "Second call: point 0 should be clustered");
+        for i in 1..5 {
+            assert_eq!(c2[0], c2[i], "Second call: points 0..5 same cluster");
+        }
+        for i in 5..8 {
+            assert_eq!(c2[i], 0, "Second call: point {} should be noise", i);
+        }
+
+        // Third call with same data as first
+        let c3 = voxel_cluster(&mut data, &x1, &y1, &z1);
+        assert!(c3[0] > 0, "Third call: point 0 should be clustered");
+        assert_eq!(c3[0], c3[1]);
+        assert_eq!(c3[0], c3[2]);
+    }
+
+    #[test]
     fn test_voxel_vs_dbscan_agreement() {
         let x = vec![
             1.0, 1.05, 1.1, 1.02, 1.08,
@@ -1189,4 +1292,130 @@ mod tests {
                 "Point {} noise mismatch", i);
         }
     }
+
+    /// Load a binary PCD file (FIELDS x y z intensity, 13 bytes/point).
+    /// Returns (x, y, z) coordinate vectors. Skips origin (0,0,0) points.
+    fn load_pcd(path: &str) -> Option<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+        let data = std::fs::read(path).ok()?;
+
+        // Find end of header ("DATA binary\n")
+        let header_end = data.windows(12)
+            .position(|w| w == b"DATA binary\n")?
+            + 12;
+
+        let body = &data[header_end..];
+        let point_size = 13; // 4+4+4+1
+        if body.len() % point_size != 0 {
+            return None;
+        }
+        let n = body.len() / point_size;
+
+        let mut x = Vec::with_capacity(n);
+        let mut y = Vec::with_capacity(n);
+        let mut z = Vec::with_capacity(n);
+
+        for i in 0..n {
+            let off = i * point_size;
+            let px = f32::from_le_bytes(body[off..off + 4].try_into().ok()?);
+            let py = f32::from_le_bytes(body[off + 4..off + 8].try_into().ok()?);
+            let pz = f32::from_le_bytes(body[off + 8..off + 12].try_into().ok()?);
+            x.push(px);
+            y.push(py);
+            z.push(pz);
+        }
+
+        Some((x, y, z))
+    }
+
+    macro_rules! require_pcd {
+        ($path:expr) => {
+            match load_pcd($path) {
+                Some(v) => v,
+                None => {
+                    eprintln!("Skipping: {} not found", $path);
+                    return;
+                }
+            }
+        };
+    }
+
+    #[test]
+    fn test_voxel_cluster_e1r_real_data() {
+        let (x, y, z) = require_pcd!("testdata/e1r_frame0.pcd");
+        assert!(x.len() > 10_000, "E1R frame should have >10k points");
+
+        let mut data = VoxelClusterData::new(0.256, 4);
+
+        let t = std::time::Instant::now();
+        let clusters = voxel_cluster(&mut data, &x, &y, &z);
+        let elapsed = t.elapsed();
+        assert_eq!(clusters.len(), x.len());
+
+        let max_id = clusters.iter().max().copied().unwrap_or(0);
+        let n_clustered = clusters.iter().filter(|c| **c > 0).count();
+        println!(
+            "E1R voxel: {} points, {} clustered, {} clusters in {:.2?}",
+            x.len(), n_clustered, max_id, elapsed
+        );
+        assert!(max_id > 0, "Should produce at least 1 cluster");
+
+        // Second call with different frame to verify state reuse
+        let (x2, y2, z2) = require_pcd!("testdata/e1r_frame5.pcd");
+        let t = std::time::Instant::now();
+        let clusters2 = voxel_cluster(&mut data, &x2, &y2, &z2);
+        let elapsed2 = t.elapsed();
+        assert_eq!(clusters2.len(), x2.len());
+        let max_id2 = clusters2.iter().max().copied().unwrap_or(0);
+        println!(
+            "E1R voxel (reuse): {} points, {} clusters in {:.2?}",
+            x2.len(), max_id2, elapsed2
+        );
+        assert!(max_id2 > 0, "Second call should also produce clusters");
+    }
+
+    #[test]
+    fn test_dbscan_cluster_e1r_real_data() {
+        let (x, y, z) = require_pcd!("testdata/e1r_frame0.pcd");
+        assert!(x.len() > 10_000);
+
+        let mut data = ClusterData::new_flat(0.256, 4);
+
+        let t = std::time::Instant::now();
+        let clusters = cluster_(&mut data, &x, &y, &z);
+        let elapsed = t.elapsed();
+        assert_eq!(clusters.len(), x.len());
+
+        let max_id = clusters.iter().max().copied().unwrap_or(0);
+        let n_clustered = clusters.iter().filter(|c| **c > 0).count();
+        println!(
+            "E1R DBSCAN: {} points, {} clustered, {} clusters in {:.2?}",
+            x.len(), n_clustered, max_id, elapsed
+        );
+        assert!(max_id > 0, "Should produce at least 1 cluster");
+    }
+
+    #[test]
+    fn test_voxel_cluster_ouster_real_data() {
+        let (x, y, z) = require_pcd!("testdata/os1_frame0.pcd");
+        assert!(x.len() > 50_000, "Ouster frame should have >50k points");
+
+        let mut data = VoxelClusterData::new(0.256, 4);
+
+        let t = std::time::Instant::now();
+        let clusters = voxel_cluster(&mut data, &x, &y, &z);
+        let elapsed = t.elapsed();
+        assert_eq!(clusters.len(), x.len());
+
+        let max_id = clusters.iter().max().copied().unwrap_or(0);
+        let n_clustered = clusters.iter().filter(|c| **c > 0).count();
+        println!(
+            "Ouster voxel: {} points, {} clustered, {} clusters in {:.2?}",
+            x.len(), n_clustered, max_id, elapsed
+        );
+        assert!(max_id > 0, "Should produce at least 1 cluster");
+    }
+
+    // Note: DBSCAN on Ouster 128k points takes ~375s on x86_64 in debug — too slow
+    // for a unit test. Use voxel clustering for Ouster-scale point clouds.
+    // The DBSCAN algorithm is O(n * neighbors) and doesn't scale well past ~30k.
 }

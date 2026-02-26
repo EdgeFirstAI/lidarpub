@@ -9,6 +9,7 @@
 #![cfg(feature = "pcap")]
 
 use edgefirst_lidarpub::{
+    cluster::{ClusterData, VoxelClusterData, cluster_, voxel_cluster},
     lidar::{LidarDriver, LidarFrame},
     packet_source::PacketSource,
     pcap_source::PcapSource,
@@ -233,4 +234,76 @@ async fn test_e1r_frame_timestamps() {
         frames_with_timestamp > 0,
         "Expected frames with valid timestamps"
     );
+}
+
+/// Test voxel and DBSCAN clustering on real E1R point cloud data.
+///
+/// Verifies that both algorithms handle realistic point distributions
+/// (>20k points, wide spatial spread) without hanging or panicking,
+/// and that they can be called repeatedly with state reuse.
+#[tokio::test]
+async fn test_e1r_clustering_real_data() {
+    require_test_data!();
+
+    let mut source =
+        PcapSource::from_file(E1R_PCAP, Some(MSOP_PORT)).expect("Failed to load PCAP file");
+
+    let mut driver = RobosenseDriver::new();
+    let mut frame = RobosenseLidarFrame::new();
+    let mut buf = [0u8; 2048];
+
+    // Collect all complete frames
+    let mut frames: Vec<(Vec<f32>, Vec<f32>, Vec<f32>)> = Vec::new();
+
+    while source.has_more() {
+        let len = source.recv(&mut buf).await.expect("Failed to read packet");
+
+        if let Ok(true) = driver.process(&mut frame, &buf[..len]) {
+            frames.push((
+                frame.x().to_vec(),
+                frame.y().to_vec(),
+                frame.z().to_vec(),
+            ));
+        }
+    }
+
+    assert!(!frames.is_empty(), "Expected at least one frame from pcap");
+
+    let eps_m = 0.256; // 256mm default
+    let min_pts = 4;
+
+    // Test voxel clustering on all frames with state reuse
+    let mut voxel_data = VoxelClusterData::new(eps_m, min_pts);
+    for (i, (x, y, z)) in frames.iter().enumerate() {
+        let clusters = voxel_cluster(&mut voxel_data, x, y, z);
+        assert_eq!(clusters.len(), x.len());
+
+        let n_clustered = clusters.iter().filter(|&&c| c > 0).count();
+        let max_id = clusters.iter().max().copied().unwrap_or(0);
+        println!(
+            "Voxel frame {}: {} points, {} clustered, {} clusters",
+            i,
+            x.len(),
+            n_clustered,
+            max_id
+        );
+        // Sanity: real data should produce at least some clusters
+        assert!(max_id > 0, "Frame {} should have at least 1 cluster", i);
+    }
+
+    // Test DBSCAN (flat) clustering on all frames with state reuse
+    let mut dbscan_data = ClusterData::new_flat(eps_m, min_pts);
+    for (i, (x, y, z)) in frames.iter().enumerate() {
+        let clusters = cluster_(&mut dbscan_data, x, y, z);
+        assert_eq!(clusters.len(), x.len());
+
+        let max_id = clusters.iter().max().copied().unwrap_or(0);
+        println!(
+            "DBSCAN frame {}: {} points, {} clusters",
+            i,
+            x.len(),
+            max_id
+        );
+        assert!(max_id > 0, "Frame {} should have at least 1 cluster", i);
+    }
 }
