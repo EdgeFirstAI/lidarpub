@@ -70,6 +70,7 @@
 pub mod cluster;
 pub mod common;
 pub mod formats;
+pub mod ground;
 pub mod lidar;
 pub mod ouster;
 pub mod packet_source;

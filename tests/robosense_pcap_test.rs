@@ -9,7 +9,7 @@
 #![cfg(feature = "pcap")]
 
 use edgefirst_lidarpub::{
-    cluster::{ClusterData, VoxelClusterData, cluster_, voxel_cluster},
+    cluster::{ClusterData, VoxelClusterData, cluster_, compute_valid, voxel_cluster},
     lidar::{LidarDriver, LidarFrame},
     packet_source::PacketSource,
     pcap_source::PcapSource,
@@ -259,11 +259,7 @@ async fn test_e1r_clustering_real_data() {
         let len = source.recv(&mut buf).await.expect("Failed to read packet");
 
         if let Ok(true) = driver.process(&mut frame, &buf[..len]) {
-            frames.push((
-                frame.x().to_vec(),
-                frame.y().to_vec(),
-                frame.z().to_vec(),
-            ));
+            frames.push((frame.x().to_vec(), frame.y().to_vec(), frame.z().to_vec()));
         }
     }
 
@@ -275,7 +271,8 @@ async fn test_e1r_clustering_real_data() {
     // Test voxel clustering on all frames with state reuse
     let mut voxel_data = VoxelClusterData::new(eps_m, min_pts);
     for (i, (x, y, z)) in frames.iter().enumerate() {
-        let clusters = voxel_cluster(&mut voxel_data, x, y, z);
+        let valid = compute_valid(x, y, z);
+        let clusters = voxel_cluster(&mut voxel_data, x, y, z, &valid);
         assert_eq!(clusters.len(), x.len());
 
         let n_clustered = clusters.iter().filter(|&&c| c > 0).count();
@@ -294,7 +291,8 @@ async fn test_e1r_clustering_real_data() {
     // Test DBSCAN (flat) clustering on all frames with state reuse
     let mut dbscan_data = ClusterData::new_flat(eps_m, min_pts);
     for (i, (x, y, z)) in frames.iter().enumerate() {
-        let clusters = cluster_(&mut dbscan_data, x, y, z);
+        let valid = compute_valid(x, y, z);
+        let clusters = cluster_(&mut dbscan_data, x, y, z, &valid);
         assert_eq!(clusters.len(), x.len());
 
         let max_id = clusters.iter().max().copied().unwrap_or(0);

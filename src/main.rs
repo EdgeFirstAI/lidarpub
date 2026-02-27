@@ -195,7 +195,9 @@ async fn run_ouster(session: Session, args: Args) -> Result<(), Box<dyn std::err
         false => format!("[::]:{}", config.udp_port_lidar),
     };
 
-    run_lidar_loop(session, args, driver, frame, &bind_addr, None).await
+    // Ouster has no built-in IMU plumbing — no ground filter IMU source
+    let no_imu: Arc<Mutex<Option<(f32, f32, f32)>>> = Arc::new(Mutex::new(None));
+    run_lidar_loop(session, args, driver, frame, &bind_addr, None, no_imu).await
 }
 
 /// Run the Robosense E1R LiDAR sensor
@@ -217,6 +219,10 @@ async fn run_robosense(session: Session, args: Args) -> Result<(), Box<dyn std::
         .await
         .unwrap();
 
+    // Shared latest IMU reading for ground plane filtering
+    let latest_imu: Arc<Mutex<Option<(f32, f32, f32)>>> = Arc::new(Mutex::new(None));
+    let imu_writer = latest_imu.clone();
+
     // Use oneshot channel to confirm DIFOP startup (PR #7 fix)
     let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
 
@@ -234,6 +240,7 @@ async fn run_robosense(session: Session, args: Args) -> Result<(), Box<dyn std::
         };
         info!("Listening for DIFOP packets on port {}", difop_port);
 
+        let mut logged_imu_raw = false;
         let mut buf = [0u8; 512];
         let mut logged_device_info = false;
         let mut last_device_info: Option<robosense::DeviceInfo> = None;
@@ -269,6 +276,32 @@ async fn run_robosense(session: Session, args: Args) -> Result<(), Box<dyn std::
                             firmware = %info.version_string(),
                             "DIFOP device info updated"
                         );
+                    }
+
+                    // Store latest IMU accel for ground plane filtering.
+                    // The E1R IMU axes (from DIFOP) vs LiDAR point cloud frame:
+                    //   IMU +Y = gravity (down)  → LiDAR -Z
+                    //   IMU +X = LiDAR left      → LiDAR -X (or similar horizontal)
+                    //   IMU +Z = LiDAR forward   → LiDAR +Y? or +X?
+                    // Previous remap (imu_x, imu_z, -imu_y) put tilt in LiDAR Y
+                    // but visual test showed 90° CW error → swap X/Y:
+                    //   LiDAR = (imu_z, -imu_x, -imu_y)
+                    if let Some(imu) = &info.imu {
+                        if !logged_imu_raw {
+                            info!(
+                                "IMU raw sensor: accel=({:.3}, {:.3}, {:.3}) gyro=({:.3}, {:.3}, {:.3})",
+                                imu.accel_x,
+                                imu.accel_y,
+                                imu.accel_z,
+                                imu.gyro_x,
+                                imu.gyro_y,
+                                imu.gyro_z
+                            );
+                            logged_imu_raw = true;
+                        }
+                        if let Ok(mut lock) = imu_writer.lock() {
+                            *lock = Some((imu.accel_z, -imu.accel_x, -imu.accel_y));
+                        }
                     }
 
                     // Publish IMU data if present
@@ -350,7 +383,16 @@ async fn run_robosense(session: Session, args: Args) -> Result<(), Box<dyn std::
         logged_return_mode: false,
     };
 
-    run_lidar_loop(session, args, driver, frame, &bind_addr, source_filter).await
+    run_lidar_loop(
+        session,
+        args,
+        driver,
+        frame,
+        &bind_addr,
+        source_filter,
+        latest_imu,
+    )
+    .await
 }
 
 /// Discover LiDAR sensors on the network.
@@ -598,6 +640,7 @@ async fn run_lidar_loop<D: LidarDriver, F: lidar::LidarFrameWriter + LidarFrame>
     mut frame: F,
     bind_addr: &str,
     source_filter: Option<std::net::IpAddr>,
+    latest_imu: Arc<Mutex<Option<(f32, f32, f32)>>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let points_publisher = session
         .declare_publisher(format!("{}/points", args.lidar_topic))
@@ -620,26 +663,17 @@ async fn run_lidar_loop<D: LidarDriver, F: lidar::LidarFrameWriter + LidarFrame>
         match std::thread::Builder::new()
             .name("cluster".to_string())
             .spawn(move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    tokio::runtime::Builder::new_multi_thread()
-                        .enable_all()
-                        .build()
-                        .unwrap()
-                        .block_on(cluster_thread(rx_cluster, cluster_publisher, args_));
-                }));
-                if let Err(e) = result {
-                    let msg = if let Some(s) = e.downcast_ref::<&str>() {
-                        s.to_string()
-                    } else if let Some(s) = e.downcast_ref::<String>() {
-                        s.clone()
-                    } else {
-                        "unknown panic".to_string()
-                    };
-                    error!("Clustering thread panicked: {}", msg);
-                }
+                tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .expect("Failed to create clustering runtime")
+                    .block_on(cluster_thread(rx_cluster, cluster_publisher, args_));
             }) {
             Ok(_) => info!("Clustering thread started"),
-            Err(e) => error!("Could not start clustering thread: {:?}", e),
+            Err(e) => {
+                error!("Could not start clustering thread: {:?}", e);
+                std::process::exit(1);
+            }
         };
     }
 
@@ -698,7 +732,12 @@ async fn run_lidar_loop<D: LidarDriver, F: lidar::LidarFrameWriter + LidarFrame>
                         z: frame.z().to_vec(),
                         intensity: frame.intensity().to_vec(),
                     };
-                    let _ = tx_cluster.send((ranges, points, timestamp.clone()));
+                    let imu_accel = if args.ground_filter {
+                        latest_imu.lock().ok().and_then(|lock| *lock)
+                    } else {
+                        None
+                    };
+                    let _ = tx_cluster.send((ranges, points, timestamp.clone(), imu_accel));
                 }
 
                 // Format and publish point cloud

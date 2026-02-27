@@ -14,7 +14,9 @@
 //!   cargo bench --bench cluster_bench --target aarch64-unknown-linux-gnu
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use edgefirst_lidarpub::cluster::{ClusterData, VoxelClusterData, cluster_, voxel_cluster};
+use edgefirst_lidarpub::cluster::{
+    ClusterData, VoxelClusterData, cluster_, compute_valid, voxel_cluster,
+};
 
 /// Generate a synthetic point cloud with clustered structure.
 ///
@@ -69,17 +71,14 @@ fn bench_cluster_sizes(c: &mut Criterion) {
         let scene = generate_scene(n_points, n_clusters, pts_per_cluster);
 
         group.throughput(Throughput::Elements(n_points as u64));
-        group.bench_with_input(
-            BenchmarkId::new("points", n_points),
-            &scene,
-            |b, scene| {
-                let mut data = ClusterData::new(0.256, 4);
-                // Warmup: one call to allocate buffers
-                let _ = cluster_(&mut data, &scene.x, &scene.y, &scene.z);
+        group.bench_with_input(BenchmarkId::new("points", n_points), &scene, |b, scene| {
+            let mut data = ClusterData::new(0.256, 4);
+            let valid = compute_valid(&scene.x, &scene.y, &scene.z);
+            // Warmup: one call to allocate buffers
+            let _ = cluster_(&mut data, &scene.x, &scene.y, &scene.z, &valid);
 
-                b.iter(|| cluster_(&mut data, &scene.x, &scene.y, &scene.z));
-            },
-        );
+            b.iter(|| cluster_(&mut data, &scene.x, &scene.y, &scene.z, &valid));
+        });
     }
 
     group.finish();
@@ -109,8 +108,9 @@ fn bench_dense_cluster(c: &mut Criterion) {
             &(x.clone(), y.clone(), z.clone()),
             |b, (x, y, z)| {
                 let mut data = ClusterData::new(0.256, 4);
-                let _ = cluster_(&mut data, x, y, z);
-                b.iter(|| cluster_(&mut data, x, y, z));
+                let valid = compute_valid(x, y, z);
+                let _ = cluster_(&mut data, x, y, z, &valid);
+                b.iter(|| cluster_(&mut data, x, y, z, &valid));
             },
         );
     }
@@ -133,8 +133,9 @@ fn bench_all_noise(c: &mut Criterion) {
             &(x.clone(), y.clone(), z.clone()),
             |b, (x, y, z)| {
                 let mut data = ClusterData::new(0.256, 4);
-                let _ = cluster_(&mut data, x, y, z);
-                b.iter(|| cluster_(&mut data, x, y, z));
+                let valid = compute_valid(x, y, z);
+                let _ = cluster_(&mut data, x, y, z, &valid);
+                b.iter(|| cluster_(&mut data, x, y, z, &valid));
             },
         );
     }
@@ -157,37 +158,28 @@ fn bench_hash_comparison(c: &mut Criterion) {
         group.throughput(Throughput::Elements(n_points as u64));
 
         // HashMap variant
-        group.bench_with_input(
-            BenchmarkId::new("hashmap", n_points),
-            &scene,
-            |b, scene| {
-                let mut data = ClusterData::new(0.256, 4);
-                let _ = cluster_(&mut data, &scene.x, &scene.y, &scene.z);
-                b.iter(|| cluster_(&mut data, &scene.x, &scene.y, &scene.z));
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("hashmap", n_points), &scene, |b, scene| {
+            let mut data = ClusterData::new(0.256, 4);
+            let valid = compute_valid(&scene.x, &scene.y, &scene.z);
+            let _ = cluster_(&mut data, &scene.x, &scene.y, &scene.z, &valid);
+            b.iter(|| cluster_(&mut data, &scene.x, &scene.y, &scene.z, &valid));
+        });
 
         // Flat variant
-        group.bench_with_input(
-            BenchmarkId::new("flat", n_points),
-            &scene,
-            |b, scene| {
-                let mut data = ClusterData::new_flat(0.256, 4);
-                let _ = cluster_(&mut data, &scene.x, &scene.y, &scene.z);
-                b.iter(|| cluster_(&mut data, &scene.x, &scene.y, &scene.z));
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("flat", n_points), &scene, |b, scene| {
+            let mut data = ClusterData::new_flat(0.256, 4);
+            let valid = compute_valid(&scene.x, &scene.y, &scene.z);
+            let _ = cluster_(&mut data, &scene.x, &scene.y, &scene.z, &valid);
+            b.iter(|| cluster_(&mut data, &scene.x, &scene.y, &scene.z, &valid));
+        });
 
         // Voxel connected-component variant
-        group.bench_with_input(
-            BenchmarkId::new("voxel", n_points),
-            &scene,
-            |b, scene| {
-                let mut data = VoxelClusterData::new(0.256, 4);
-                let _ = voxel_cluster(&mut data, &scene.x, &scene.y, &scene.z);
-                b.iter(|| voxel_cluster(&mut data, &scene.x, &scene.y, &scene.z));
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("voxel", n_points), &scene, |b, scene| {
+            let mut data = VoxelClusterData::new(0.256, 4);
+            let valid = compute_valid(&scene.x, &scene.y, &scene.z);
+            let _ = voxel_cluster(&mut data, &scene.x, &scene.y, &scene.z, &valid);
+            b.iter(|| voxel_cluster(&mut data, &scene.x, &scene.y, &scene.z, &valid));
+        });
     }
 
     group.finish();
@@ -200,20 +192,22 @@ fn bench_warmup(c: &mut Criterion) {
     let n_points = 26_000;
     let scene = generate_scene(n_points, 30, 170);
 
+    let valid = compute_valid(&scene.x, &scene.y, &scene.z);
+
     // Cold start: fresh ClusterData each iteration
     group.throughput(Throughput::Elements(n_points as u64));
     group.bench_function("cold", |b| {
         b.iter(|| {
             let mut data = ClusterData::new(0.256, 4);
-            cluster_(&mut data, &scene.x, &scene.y, &scene.z)
+            cluster_(&mut data, &scene.x, &scene.y, &scene.z, &valid)
         });
     });
 
     // Warm: reuse ClusterData across iterations
     group.bench_function("warm", |b| {
         let mut data = ClusterData::new(0.256, 4);
-        let _ = cluster_(&mut data, &scene.x, &scene.y, &scene.z);
-        b.iter(|| cluster_(&mut data, &scene.x, &scene.y, &scene.z));
+        let _ = cluster_(&mut data, &scene.x, &scene.y, &scene.z, &valid);
+        b.iter(|| cluster_(&mut data, &scene.x, &scene.y, &scene.z, &valid));
     });
 
     group.finish();
@@ -251,29 +245,31 @@ fn bench_real_data(c: &mut Criterion) {
 
     if let Some(scene) = load_pcd("testdata/e1r_frame0.pcd") {
         let n = scene.x.len();
+        let valid = compute_valid(&scene.x, &scene.y, &scene.z);
         group.throughput(Throughput::Elements(n as u64));
 
         group.bench_function("e1r_voxel", |b| {
             let mut data = VoxelClusterData::new(0.256, 4);
-            let _ = voxel_cluster(&mut data, &scene.x, &scene.y, &scene.z);
-            b.iter(|| voxel_cluster(&mut data, &scene.x, &scene.y, &scene.z));
+            let _ = voxel_cluster(&mut data, &scene.x, &scene.y, &scene.z, &valid);
+            b.iter(|| voxel_cluster(&mut data, &scene.x, &scene.y, &scene.z, &valid));
         });
 
         group.bench_function("e1r_flat_dbscan", |b| {
             let mut data = ClusterData::new_flat(0.256, 4);
-            let _ = cluster_(&mut data, &scene.x, &scene.y, &scene.z);
-            b.iter(|| cluster_(&mut data, &scene.x, &scene.y, &scene.z));
+            let _ = cluster_(&mut data, &scene.x, &scene.y, &scene.z, &valid);
+            b.iter(|| cluster_(&mut data, &scene.x, &scene.y, &scene.z, &valid));
         });
     }
 
     if let Some(scene) = load_pcd("testdata/os1_frame0.pcd") {
         let n = scene.x.len();
+        let valid = compute_valid(&scene.x, &scene.y, &scene.z);
         group.throughput(Throughput::Elements(n as u64));
 
         group.bench_function("ouster_voxel", |b| {
             let mut data = VoxelClusterData::new(0.256, 4);
-            let _ = voxel_cluster(&mut data, &scene.x, &scene.y, &scene.z);
-            b.iter(|| voxel_cluster(&mut data, &scene.x, &scene.y, &scene.z));
+            let _ = voxel_cluster(&mut data, &scene.x, &scene.y, &scene.z, &valid);
+            b.iter(|| voxel_cluster(&mut data, &scene.x, &scene.y, &scene.z, &valid));
         });
     }
 

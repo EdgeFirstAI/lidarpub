@@ -10,30 +10,32 @@ High-performance LiDAR point cloud publisher connecting Ouster sensors to the Ze
 
 ## Features
 
-- ✨ **Ouster LiDAR Support** - Native integration with Ouster OS1-64 (firmware 2.5.3, RNG15_RFL8_NIR8 packet format)
-- 🚀 **Zenoh Messaging** - Low-latency pub/sub with configurable QoS (priority, congestion control)
-- 📊 **ROS2 Compatible** - CDR-serialized sensor_msgs/PointCloud2, sensor_msgs/Image, geometry_msgs/TransformStamped
-- 🎯 **Point Cloud Clustering** - Built-in spatial clustering for object detection
-- ⚡ **Hardware Optimized** - SIMD-accelerated processing for edge platforms
-- 🔌 **EdgeFirst Studio Integration** - Seamless deployment and monitoring
-- 🔍 **Rerun Visualization** - Optional real-time 3D visualization support
-- 📈 **Performance Profiling** - Tracy profiler integration for optimization
+- **Multi-Sensor Support** - Ouster OS1-64 and Robosense E1R with native UDP protocol implementations
+- **Zenoh Messaging** - Low-latency pub/sub with configurable QoS (priority, congestion control)
+- **ROS2 Compatible** - CDR-serialized sensor_msgs/PointCloud2, sensor_msgs/Image, geometry_msgs/TransformStamped
+- **Point Cloud Clustering** - DBSCAN (accurate) and voxel (fast) spatial clustering with NEON SIMD acceleration
+- **Ground Plane Removal** - IMU-guided PCA ground filter prevents floor from merging nearby objects
+- **Bridge Threshold** - Prevents thin structures (ropes, wires, railings) from merging separate clusters
+- **Pipeline Instrumentation** - Per-stage timing logs and Tracy profiler integration for performance analysis
+- **Hardware Optimized** - NEON SIMD on aarch64 for distance checks and point formatting
+- **EdgeFirst Studio Integration** - Seamless deployment and monitoring
+- **Performance Profiling** - Tracy profiler integration for optimization
 
 ## Sensor Support
 
-**Current:**
-- Ouster OS1-64 RevD (firmware 2.5.3)
+**Ouster:**
+- OS1-64 RevD (firmware 2.5.3)
 - Packet format: RNG15_RFL8_NIR8 (15-bit range, 8-bit reflectivity, 8-bit NIR)
+- HTTP API for configuration and calibration
 
-**Future:**
-- Additional Ouster packet formats (RNG19_RFL8_SIG16_NIR16, LEGACY)
-- Newer Ouster firmware (3.x)
-- Multi-vendor support (Velodyne, Livox)
+**Robosense:**
+- E1R solid-state LiDAR (~20k points per frame at 10Hz)
+- MSOP (point cloud data) and DIFOP (device info + IMU) UDP protocols
+- Built-in IMU for ground plane detection
 
 **References:**
 - [Ouster HTTP API v1](https://static.ouster.dev/sensor-docs/image_route1/image_route2/common_sections/API/http-api-v1.html)
 - [Ouster Sensor Data](https://static.ouster.dev/sensor-docs/image_route1/image_route2/sensor_data/sensor-data.html)
-- [Lidar Packet Format](https://static.ouster.dev/sensor-docs/image_route1/image_route2/sensor_data/sensor-data.html#lidar-data-packet-format)
 
 ## Quick Start
 
@@ -60,31 +62,78 @@ cargo build --release
 ### Basic Usage
 
 ```bash
-# Connect to Ouster sensor and publish point clouds
-lidarpub --target <SENSOR_IP>
+# Ouster: connect to sensor and publish point clouds
+lidarpub --sensor-type ouster <SENSOR_IP>
 
-# Specify custom lidar mode
-lidarpub --target <SENSOR_IP> --lidar-mode 1024x10
+# Robosense E1R: listen for broadcast UDP packets
+lidarpub --sensor-type robosense
 
-# Enable clustering
-lidarpub --target <SENSOR_IP> --cluster
+# Enable voxel clustering (fast, recommended for real-time)
+lidarpub --sensor-type robosense --clustering voxel
 
-# With Rerun visualization (example)
-cargo run --example lidar_rerun --features rerun -- --target <SENSOR_IP>
+# Enable DBSCAN clustering (accurate, higher CPU)
+lidarpub --sensor-type robosense --clustering dbscan
+
+# Full pipeline: ground filter + voxel clustering with bridge separation
+lidarpub --sensor-type robosense \
+    --clustering voxel \
+    --ground-filter \
+    --ground-thickness 300 \
+    --clustering-bridge 10
 ```
 
 ### Configuration Options
+
+All parameters can be set via CLI arguments or environment variables:
 
 ```bash
 # View all options
 lidarpub --help
 
-# Common parameters:
-# --target <IP>           Ouster sensor IP address
-# --lidar-mode <MODE>     Sensor resolution mode (512x10, 1024x10, 2048x10)
-# --timestamp-mode <MODE> TIME_FROM_INTERNAL_OSC, TIME_FROM_SYNC_PULSE_IN, etc.
-# --cluster               Enable point cloud clustering
-# --cluster-threshold <M> Distance threshold for clustering (default: 0.5m)
+# Clustering parameters:
+# --clustering <ALG>        Algorithm: "" (disabled), "dbscan", "voxel"
+# --clustering-eps <MM>     Distance threshold in mm (default: 200)
+# --clustering-minpts <N>   Min points per cluster (default: 4)
+# --clustering-bridge <N>   Bridge threshold (default: 0, see below)
+
+# Ground filter parameters:
+# --ground-filter           Enable IMU-guided ground plane removal
+# --ground-thickness <MM>   Slab thickness above ground to remove (default: 150)
+# --sensor-height <MM>      Fixed sensor height (skips auto-detection)
+
+# Or use environment variables (useful for systemd services):
+SENSOR_TYPE=robosense CLUSTERING=voxel GROUND_FILTER=true lidarpub
+```
+
+### Understanding Bridge Threshold
+
+The `--clustering-bridge` parameter controls how easily thin structures can connect
+two separate clusters. When set higher than `--clustering-minpts`:
+
+- Points/voxels with fewer than `bridge` neighbors are **labeled** as part of a
+  cluster but don't **expand** it further
+- This prevents ropes, wires, railings, and other thin structures from merging
+  two dense objects into one cluster
+- Recommended starting value: 8-12 for indoor scenes
+
+### Ground Filter
+
+The `--ground-filter` flag enables automatic floor removal using the sensor's IMU.
+This is important for clustering because without it, nearby objects standing on the
+same floor will be connected through shared floor points and merged into one cluster.
+
+The filter uses the IMU accelerometer to determine which direction is "down", then
+applies PCA-based ground detection on a polar grid to find the floor surface. Points
+at or below the floor (plus a configurable thickness margin) are removed.
+
+**First-frame diagnostics** are logged at INFO level showing the detected gravity
+vector, ground height, and number of ground points removed — useful for verifying
+correct operation.
+
+**Pipeline timing** is logged every 100 frames showing average per-stage milliseconds.
+Example:
+```
+pipeline avg over 100 frames (24967 pts): valid=0.2ms ground=9.3ms cluster=13.2ms relabel=0.5ms format=3.4ms publish=2.6ms total=29.1ms
 ```
 
 ## Documentation
@@ -287,7 +336,7 @@ This project follows our [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ### Sensor Connection Issues
 
-**Sensor not reachable:**
+**Ouster sensor not reachable:**
 ```bash
 # Verify network connectivity
 ping 192.168.1.100
@@ -299,57 +348,81 @@ curl http://192.168.1.100/api/v1/sensor/metadata
 sudo iptables -L | grep 750
 ```
 
+**Robosense E1R not receiving data:**
+- The E1R broadcasts UDP packets — no `TARGET` is needed
+- Verify MSOP port (default 6699) and DIFOP port (default 7788) are not blocked
+- Use `--discover` to confirm the sensor is visible on the network
+- If DIFOP bind fails ("Address already in use"), kill the stale process:
+  `sudo fuser -k 7788/udp`
+
 **No point cloud data:**
-- Ensure sensor is powered and fully booted (LED indicators)
-- Verify UDP ports 7502 (LiDAR data) and 7503 (IMU) are accessible
-- Check lidar mode matches sensor configuration
-- Try resetting sensor via HTTP API: `curl -X POST http://192.168.1.100/api/v1/system/reset`
+- Ensure sensor is powered and fully booted
+- For Ouster: verify UDP ports 7502/7503 are accessible and lidar mode matches
+- For Robosense: check that no other process is bound to the MSOP/DIFOP ports
+
+### Ground Filter Issues
+
+**Floor still visible after enabling `--ground-filter`:**
+- Check the first-frame IMU diagnostic log for `ground_removed` count
+- If `ground_removed` is low, increase `--ground-thickness` (try 300mm)
+- If the gravity vector looks wrong, the IMU axis remap may need adjustment
+- Near-field floor should be caught — the filter has no range gate on classification
+
+**Ground filter removing too many points (low objects disappearing):**
+- Decrease `--ground-thickness` (e.g. 100mm)
+- Objects shorter than the thickness above the floor will be removed
+
+**Wrong region being cleared (e.g. wall instead of floor):**
+- Check the `gravity=` values in the first-frame diagnostic log
+- Gravity should point toward the floor (largest component in the expected axis)
+- If 90° off, the IMU axis remap in `src/main.rs` may need correction
+
+**Delay in floor detection during fast motion:**
+- The IMU updates at ~10Hz (DIFOP packet rate)
+- EMA smoothing (alpha=0.5) adds ~300ms convergence time
+- For fixed mounts this is not an issue; for moving platforms consider
+  reducing `EMA_ALPHA` in `src/ground.rs`
+
+### Clustering Issues
+
+**Objects merging that should be separate:**
+- Increase `--clustering-bridge` (try 8-12) to prevent thin connections
+- Decrease `--clustering-eps` for tighter distance threshold
+- Enable `--ground-filter` if floor points are connecting objects
+
+**Too many small clusters (fragmentation):**
+- Increase `--clustering-eps` for more aggressive merging
+- Decrease `--clustering-minpts` to accept smaller groups
+
+**Clustering too slow (frame budget exceeded):**
+- Switch from `dbscan` to `voxel` (~5x faster on typical scenes)
+- Check the pipeline timing log for the `cluster=` value
+- DBSCAN on E1R ~25k points: ~70ms; Voxel: ~13ms (aarch64)
 
 ### Performance Issues
 
 **High CPU usage:**
-- Disable clustering if not needed (remove `--cluster` flag)
-- Reduce sensor resolution (use 512x10 instead of 2048x10)
-- Check for other processes consuming CPU
-- Verify SIMD optimizations compiled (check `portable_simd` feature)
+- Use `--clustering=voxel` instead of `dbscan`
+- Disable clustering entirely if not needed (`--clustering=""`)
+- Check pipeline timing log for bottleneck identification
+- Enable Tracy (`--tracy`) for detailed profiling
 
 **Frame drops:**
 - Increase network buffer size: `sudo sysctl -w net.core.rmem_max=8388608`
-- Ensure Gigabit Ethernet connection (not 100Mbps)
+- Ensure Gigabit Ethernet connection
 - Check Zenoh subscriber backpressure
-- Monitor with `--log-level debug` for diagnostics
-
-### Zenoh Communication Issues
-
-**Messages not received by subscribers:**
-```bash
-# Test Zenoh connectivity
-zenoh-ping -l tcp/127.0.0.1:7447
-
-# Check if messages are being published
-zenoh-cli --mode client --connect tcp/127.0.0.1:7447 subscribe '/lidar/*'
-```
-
-**ROS2 bridge not working:**
-- Verify Zenoh-DDS bridge is running
-- Check topic name mapping configuration
-- Validate CDR serialization with ROS2 tools: `ros2 topic echo /lidar/points`
 
 ### Build Issues
 
-**Cross-compilation fails:**
+**Cross-compilation for aarch64:**
 ```bash
-# Ensure cross tool is up to date
-cargo install cross --force
+# Using cargo-zigbuild (recommended)
+cargo install cargo-zigbuild
+cargo zigbuild --target aarch64-unknown-linux-gnu.2.35 --release
 
-# Use Docker-based cross-compilation
-cross build --release --target aarch64-unknown-linux-gnu
+# Deploy to target
+scp target/aarch64-unknown-linux-gnu/release/edgefirst-lidarpub user@target:~/
 ```
-
-**SIMD compilation errors:**
-- Ensure nightly Rust toolchain: `rustup default nightly`
-- Check `portable_simd` feature is enabled in Cargo.toml
-- Fallback to scalar implementation by disabling feature (reduced performance)
 
 ### Getting Help
 

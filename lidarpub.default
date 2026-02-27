@@ -9,7 +9,7 @@
 # ---------------------------------------------------------------------------
 
 # Log level for the application. Refer to RUST_LOG / tracing documentation.
-# Examples: "info", "debug", "warn", "lidarpub=debug,info"
+# Examples: "info", "debug", "warn", "edgefirst_lidarpub=debug,info"
 RUST_LOG="info"
 
 # Sensor type: "ouster" or "robosense"
@@ -52,14 +52,67 @@ SENSOR_TYPE="ouster"
 # Published topics: {LIDAR_TOPIC}/points, {LIDAR_TOPIC}/clusters, etc.
 #LIDAR_TOPIC="rt/lidar"
 
-# Enable point cloud clustering.
-#CLUSTERING="false"
+# Enable Tracy profiler broadcast. Requires the binary to be built with
+# the "tracy" or "profiling" feature. Connect with the Tracy GUI to
+# visualize per-frame pipeline timing (ground_filter, clustering, etc.).
+#TRACY="false"
+
+# ---------------------------------------------------------------------------
+# Clustering settings
+# ---------------------------------------------------------------------------
+
+# Clustering algorithm. Leave empty to disable clustering.
+#   ""       - Disabled (default). Only raw point clouds are published.
+#   "dbscan" - Point-level DBSCAN with spatial hash neighbor search.
+#              Most accurate but slower (~70ms on E1R 25k points, aarch64).
+#   "voxel"  - Voxel connected-component clustering via BFS over occupied
+#              voxels. Faster (~13ms on E1R 25k points) but coarser: objects
+#              within one voxel width are always merged.
+#CLUSTERING=""
 
 # Clustering distance threshold in millimeters.
-#CLUSTERING_EPS="256"
+# For DBSCAN: 3D Euclidean radius for neighbor queries (eps parameter).
+# For voxel:  Voxel cell size; adjacent occupied voxels are 26-connected.
+# Typical range: 150-300. Smaller = more clusters, larger = more merging.
+#CLUSTERING_EPS="200"
 
-# Minimum points per cluster.
+# Minimum number of points to form a cluster.
+# Voxels or neighborhoods with fewer points are classified as noise (ID=0).
 #CLUSTERING_MINPTS="4"
+
+# Bridge threshold: minimum neighbors for a point/voxel to propagate
+# during cluster expansion. When set higher than CLUSTERING_MINPTS,
+# thin structures (ropes, wires, railings) won't merge separate objects.
+# Points/voxels with MINPTS <= neighbors < BRIDGE are labeled as part of
+# a cluster but don't expand it further — they act as border points.
+# Set to 0 (default) for standard behavior (same as CLUSTERING_MINPTS).
+# Recommended starting value: 8-12 for indoor scenes with thin obstacles.
+#CLUSTERING_BRIDGE="0"
+
+# ---------------------------------------------------------------------------
+# Ground plane filter settings
+# ---------------------------------------------------------------------------
+
+# Enable IMU-guided ground plane removal before clustering.
+# Uses the sensor's IMU to determine the gravity vector, then applies
+# region-wise PCA to detect the ground surface and remove floor points.
+# This prevents nearby objects from being merged via shared floor points.
+# Requires IMU data: Robosense E1R has a built-in IMU via DIFOP packets.
+#GROUND_FILTER="false"
+
+# Ground slab thickness in millimeters.
+# Points within this distance above the detected ground plane (and anything
+# below it) are classified as ground and removed before clustering.
+# Increase if floor points are still visible; decrease if low objects
+# (e.g. shoes, cables on the floor) are being incorrectly removed.
+# Typical range: 100-400. Default 150 is conservative.
+#GROUND_THICKNESS="150"
+
+# Known sensor height above ground in millimeters.
+# When set, skips automatic PCA ground detection and uses this fixed height.
+# Useful when auto-detection is unreliable (e.g. sensor looking straight
+# down, or very few ground points visible). Leave unset for auto-detection.
+#SENSOR_HEIGHT=
 
 # ---------------------------------------------------------------------------
 # Ouster settings (ignored when SENSOR_TYPE="robosense")
@@ -86,8 +139,14 @@ TIMESTAMP_MODE="internal"
 #MSOP_PORT="6699"
 
 # DIFOP (Device Information Output Protocol) UDP port.
+# Also carries IMU data used by the ground filter.
 #DIFOP_PORT="7788"
 
 # Include noisy points (PointAttribute == 2) in the point cloud.
 # By default noisy points are filtered out.
 #INCLUDE_NOISY="false"
+
+# Discover Robosense sensors on the network and exit.
+# Listens for DIFOP packets and prints device information (serial,
+# firmware version, time sync status). Useful for initial setup.
+#DISCOVER="false"

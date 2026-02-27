@@ -79,9 +79,7 @@ impl SpatialHash {
                     let key = (cx + dx, cy + dy, cz + dz);
                     if let Some(indices) = self.cells.get(&key) {
                         #[cfg(target_arch = "aarch64")]
-                        Self::query_neighbors_neon(
-                            indices, qx, qy, qz, x, y, z, eps_sq, neighbors,
-                        );
+                        Self::query_neighbors_neon(indices, qx, qy, qz, x, y, z, eps_sq, neighbors);
                         #[cfg(not(target_arch = "aarch64"))]
                         Self::query_neighbors_scalar(
                             indices, qx, qy, qz, x, y, z, eps_sq, neighbors,
@@ -110,7 +108,7 @@ impl SpatialHash {
             let ddy = y[idx] - qy;
             let ddz = z[idx] - qz;
             let dist_sq = ddx * ddx + ddy * ddy + ddz * ddz;
-            if dist_sq < eps_sq {
+            if dist_sq <= eps_sq {
                 neighbors.push(idx);
             }
         }
@@ -164,11 +162,10 @@ impl SpatialHash {
                 let ddx = vsubq_f32(xv, qx_v);
                 let ddy = vsubq_f32(yv, qy_v);
                 let ddz = vsubq_f32(zv, qz_v);
-                let dist_sq =
-                    vfmaq_f32(vfmaq_f32(vmulq_f32(ddx, ddx), ddy, ddy), ddz, ddz);
+                let dist_sq = vfmaq_f32(vfmaq_f32(vmulq_f32(ddx, ddx), ddy, ddy), ddz, ddz);
 
-                // Compare: dist_sq < eps_sq → 0xFFFFFFFF per lane
-                let mask = vcltq_f32(dist_sq, eps_sq_v);
+                // Compare: dist_sq <= eps_sq → 0xFFFFFFFF per lane
+                let mask = vcleq_f32(dist_sq, eps_sq_v);
                 let mask_u32 = vreinterpretq_u32_f32(vreinterpretq_f32_u32(mask));
 
                 if vgetq_lane_u32::<0>(mask_u32) != 0 {
@@ -192,7 +189,7 @@ impl SpatialHash {
             let ddy = y[idx] - qy;
             let ddz = z[idx] - qz;
             let dist_sq = ddx * ddx + ddy * ddy + ddz * ddz;
-            if dist_sq < eps_sq {
+            if dist_sq <= eps_sq {
                 neighbors.push(idx);
             }
         }
@@ -427,9 +424,7 @@ impl FlatSpatialHash {
                         let indices = &self.point_indices[offset..offset + count];
 
                         #[cfg(target_arch = "aarch64")]
-                        Self::query_neighbors_neon(
-                            indices, qx, qy, qz, x, y, z, eps_sq, neighbors,
-                        );
+                        Self::query_neighbors_neon(indices, qx, qy, qz, x, y, z, eps_sq, neighbors);
                         #[cfg(not(target_arch = "aarch64"))]
                         Self::query_neighbors_scalar(
                             indices, qx, qy, qz, x, y, z, eps_sq, neighbors,
@@ -459,7 +454,7 @@ impl FlatSpatialHash {
             let ddy = y[idx] - qy;
             let ddz = z[idx] - qz;
             let dist_sq = ddx * ddx + ddy * ddy + ddz * ddz;
-            if dist_sq < eps_sq {
+            if dist_sq <= eps_sq {
                 neighbors.push(idx);
             }
         }
@@ -510,11 +505,10 @@ impl FlatSpatialHash {
                 let ddx = vsubq_f32(xv, qx_v);
                 let ddy = vsubq_f32(yv, qy_v);
                 let ddz = vsubq_f32(zv, qz_v);
-                let dist_sq =
-                    vfmaq_f32(vfmaq_f32(vmulq_f32(ddx, ddx), ddy, ddy), ddz, ddz);
+                let dist_sq = vfmaq_f32(vfmaq_f32(vmulq_f32(ddx, ddx), ddy, ddy), ddz, ddz);
 
-                // Compare: dist_sq < eps_sq → 0xFFFFFFFF per lane
-                let mask = vcltq_f32(dist_sq, eps_sq_v);
+                // Compare: dist_sq <= eps_sq → 0xFFFFFFFF per lane
+                let mask = vcleq_f32(dist_sq, eps_sq_v);
                 let mask_u32 = vreinterpretq_u32_f32(vreinterpretq_f32_u32(mask));
 
                 if vgetq_lane_u32::<0>(mask_u32) != 0 {
@@ -539,7 +533,7 @@ impl FlatSpatialHash {
             let ddy = y[idx] - qy;
             let ddz = z[idx] - qz;
             let dist_sq = ddx * ddx + ddy * ddy + ddz * ddz;
-            if dist_sq < eps_sq {
+            if dist_sq <= eps_sq {
                 neighbors.push(idx);
             }
         }
@@ -576,7 +570,11 @@ impl FlatSpatialHash {
     #[inline(always)]
     fn dirty_bucket_index(&self, slot: usize) -> Option<usize> {
         let idx = self.slot_to_dirty[slot];
-        if idx == SLOT_EMPTY { None } else { Some(idx as usize) }
+        if idx == SLOT_EMPTY {
+            None
+        } else {
+            Some(idx as usize)
+        }
     }
 }
 
@@ -636,10 +634,12 @@ pub struct ClusterData {
     cluster_ids: Vec<u32>,
     eps_sq: f32,
     min_pts: usize,
+    /// Minimum neighbors for a point to propagate (expand) the cluster.
+    /// When > min_pts, thin bridges (ropes, wires) won't merge clusters.
+    bridge_pts: usize,
     spatial_hash: SpatialHashKind,
     queue: Vec<usize>,
     neighbors: Vec<usize>,
-    valid: Vec<bool>,
 }
 
 impl ClusterData {
@@ -649,10 +649,10 @@ impl ClusterData {
             cluster_ids: Vec::new(),
             eps_sq: eps_m * eps_m,
             min_pts,
+            bridge_pts: min_pts,
             spatial_hash: SpatialHashKind::HashMap(SpatialHash::new(eps_m)),
             queue: Vec::new(),
             neighbors: Vec::new(),
-            valid: Vec::new(),
         }
     }
 
@@ -665,11 +665,18 @@ impl ClusterData {
             cluster_ids: Vec::new(),
             eps_sq: eps_m * eps_m,
             min_pts,
+            bridge_pts: min_pts,
             spatial_hash: SpatialHashKind::Flat(FlatSpatialHash::new(eps_m)),
             queue: Vec::new(),
             neighbors: Vec::new(),
-            valid: Vec::new(),
         }
+    }
+
+    /// Set the bridge threshold — minimum neighbors for a core point to
+    /// propagate during cluster expansion. Points with fewer neighbors
+    /// are still assigned to the cluster but don't expand it further.
+    pub fn set_bridge_pts(&mut self, bridge_pts: usize) {
+        self.bridge_pts = bridge_pts;
     }
 }
 
@@ -681,20 +688,26 @@ const UNVISITED: u32 = 0;
 /// Returns a `Vec<u32>` where 0 = noise and non-zero values are cluster IDs.
 /// Origin points (0,0,0) are treated as invalid sensor returns and marked as
 /// noise.
-pub fn cluster_(data: &mut ClusterData, x: &[f32], y: &[f32], z: &[f32]) -> Vec<u32> {
+pub fn cluster_(
+    data: &mut ClusterData,
+    x: &[f32],
+    y: &[f32],
+    z: &[f32],
+    valid: &[bool],
+) -> Vec<u32> {
     let n = x.len();
 
     // Reset cluster IDs
     data.cluster_ids.clear();
     data.cluster_ids.resize(n, UNVISITED);
 
-    // Build spatial hash — skip origin points (invalid sensor returns)
+    // Build spatial hash — skip invalid points
     data.spatial_hash.clear();
 
     match &mut data.spatial_hash {
         SpatialHashKind::HashMap(_) => {
             for i in 0..n {
-                if x[i] == 0.0 && y[i] == 0.0 && z[i] == 0.0 {
+                if !valid[i] {
                     data.cluster_ids[i] = VISITED;
                     continue;
                 }
@@ -702,16 +715,13 @@ pub fn cluster_(data: &mut ClusterData, x: &[f32], y: &[f32], z: &[f32]) -> Vec<
             }
         }
         SpatialHashKind::Flat(_) => {
-            // Mark invalid points, then batch-build
-            data.valid.clear();
-            data.valid.resize(n, true);
-            for i in 0..n {
-                if x[i] == 0.0 && y[i] == 0.0 && z[i] == 0.0 {
-                    data.cluster_ids[i] = VISITED;
-                    data.valid[i] = false;
+            // Mark invalid points in cluster_ids, then batch-build
+            for (cid, v) in data.cluster_ids.iter_mut().zip(valid.iter()).take(n) {
+                if !v {
+                    *cid = VISITED;
                 }
             }
-            data.spatial_hash.build_flat(x, y, z, &data.valid);
+            data.spatial_hash.build_flat(x, y, z, valid);
         }
     }
 
@@ -755,14 +765,7 @@ pub fn cluster_(data: &mut ClusterData, x: &[f32], y: &[f32], z: &[f32]) -> Vec<
     result
 }
 
-fn expand_cluster(
-    data: &mut ClusterData,
-    seed: usize,
-    id: u32,
-    x: &[f32],
-    y: &[f32],
-    z: &[f32],
-) {
+fn expand_cluster(data: &mut ClusterData, seed: usize, id: u32, x: &[f32], y: &[f32], z: &[f32]) {
     data.cluster_ids[seed] = id;
 
     // Seed the queue from the current neighbors buffer
@@ -794,7 +797,10 @@ fn expand_cluster(
             &mut data.neighbors,
         );
 
-        if data.neighbors.len() < data.min_pts {
+        if data.neighbors.len() < data.bridge_pts {
+            // Not enough neighbors to propagate — this point is a border
+            // point of the cluster but won't expand it further. This prevents
+            // thin bridges (ropes, wires) from merging distinct clusters.
             continue;
         }
 
@@ -823,7 +829,10 @@ pub struct VoxelClusterData {
     /// BFS queue storing dirty_bucket indices (not table slots).
     voxel_queue: Vec<usize>,
     min_pts: usize,
-    valid: Vec<bool>,
+    /// Minimum points for a voxel to propagate during BFS expansion.
+    /// Voxels with >= min_pts but < bridge_pts are labeled but don't propagate,
+    /// preventing thin structures (ropes, wires) from merging clusters.
+    bridge_pts: usize,
 }
 
 impl VoxelClusterData {
@@ -834,9 +843,32 @@ impl VoxelClusterData {
             voxel_visited: Vec::new(),
             voxel_queue: Vec::new(),
             min_pts,
-            valid: Vec::new(),
+            bridge_pts: min_pts,
         }
     }
+
+    pub fn set_bridge_pts(&mut self, bridge_pts: usize) {
+        self.bridge_pts = bridge_pts;
+    }
+}
+
+/// Reserved cluster ID for noise (invalid returns, too-few-neighbors).
+pub const CLUSTER_ID_NOISE: u32 = 0;
+/// Reserved cluster ID for ground plane points.
+pub const CLUSTER_ID_GROUND: u32 = 1;
+/// First cluster ID available for real clusters (2, 3, 4, ...).
+pub const CLUSTER_ID_FIRST: u32 = 2;
+
+/// Compute default validity mask: marks (0,0,0) origin points as invalid.
+pub fn compute_valid(x: &[f32], y: &[f32], z: &[f32]) -> Vec<bool> {
+    let n = x.len();
+    let mut valid = vec![true; n];
+    for i in 0..n {
+        if x[i] == 0.0 && y[i] == 0.0 && z[i] == 0.0 {
+            valid[i] = false;
+        }
+    }
+    valid
 }
 
 /// Run voxel connected-component clustering on the given point cloud.
@@ -844,12 +876,18 @@ impl VoxelClusterData {
 /// Returns a `Vec<u32>` where 0 = noise and non-zero values are cluster IDs.
 /// Points are binned into voxels of size `cell_size_m`. Adjacent occupied
 /// voxels (26-connected) with >= `min_pts` points are merged into clusters.
+///
+/// When `bridge_pts > min_pts`, voxels with fewer than `bridge_pts` points are
+/// labeled (assigned to the cluster) but do not propagate BFS expansion. This
+/// prevents thin structures (ropes, wires) from merging separate dense clusters.
+///
 /// Origin points (0,0,0) are treated as invalid sensor returns and marked noise.
 pub fn voxel_cluster(
     data: &mut VoxelClusterData,
     x: &[f32],
     y: &[f32],
     z: &[f32],
+    valid: &[bool],
 ) -> Vec<u32> {
     let n = x.len();
 
@@ -857,16 +895,9 @@ pub fn voxel_cluster(
     data.cluster_ids.clear();
     data.cluster_ids.resize(n, 0);
 
-    // Build spatial hash (marks invalid origin points)
+    // Build spatial hash using caller-provided validity mask
     data.flat_hash.clear();
-    data.valid.clear();
-    data.valid.resize(n, true);
-    for i in 0..n {
-        if x[i] == 0.0 && y[i] == 0.0 && z[i] == 0.0 {
-            data.valid[i] = false;
-        }
-    }
-    data.flat_hash.build(x, y, z, &data.valid);
+    data.flat_hash.build(x, y, z, valid);
 
     let n_occupied = data.flat_hash.occupied_count();
     if n_occupied == 0 {
@@ -886,10 +917,18 @@ pub fn voxel_cluster(
         }
 
         let start_slot = data.flat_hash.dirty_bucket_slot(start);
+        let start_count = data.flat_hash.count_at_slot(start_slot);
 
         // Skip voxels below min_pts threshold
-        if data.flat_hash.count_at_slot(start_slot) < data.min_pts {
+        if start_count < data.min_pts {
             data.voxel_visited[start] = true;
+            continue;
+        }
+
+        // Only seed new clusters from voxels meeting the bridge threshold.
+        // Sparse voxels (min_pts <= count < bridge_pts) can join existing
+        // clusters but cannot seed or propagate them.
+        if start_count < data.bridge_pts {
             continue;
         }
 
@@ -920,23 +959,73 @@ pub fn voxel_cluster(
                             continue;
                         }
                         let neighbor_key = (cx + dx, cy + dy, cz + dz);
-                        if let Some(neighbor_slot) = data.flat_hash.find_slot(neighbor_key) {
-                            if let Some(nb_idx) = data.flat_hash.dirty_bucket_index(neighbor_slot) {
-                                if !data.voxel_visited[nb_idx]
-                                    && data.flat_hash.count_at_slot(neighbor_slot)
-                                        >= data.min_pts
-                                {
-                                    data.voxel_visited[nb_idx] = true;
-                                    data.voxel_queue.push(nb_idx);
+                        if let Some(neighbor_slot) = data.flat_hash.find_slot(neighbor_key)
+                            && let Some(nb_idx) = data.flat_hash.dirty_bucket_index(neighbor_slot)
+                        {
+                            let nb_count = data.flat_hash.count_at_slot(neighbor_slot);
+                            if !data.voxel_visited[nb_idx] && nb_count >= data.min_pts {
+                                data.voxel_visited[nb_idx] = true;
 
-                                    for &pt in data.flat_hash.indices_at_slot(neighbor_slot) {
-                                        data.cluster_ids[pt as usize] = cluster_id;
-                                    }
+                                // Label this voxel's points
+                                for &pt in data.flat_hash.indices_at_slot(neighbor_slot) {
+                                    data.cluster_ids[pt as usize] = cluster_id;
+                                }
+
+                                // Only propagate BFS from dense voxels
+                                if nb_count >= data.bridge_pts {
+                                    data.voxel_queue.push(nb_idx);
                                 }
                             }
                         }
                     }
                 }
+            }
+        }
+    }
+
+    // Second pass: sparse voxels that weren't reached by BFS may be adjacent
+    // to a labeled cluster. Absorb them as border voxels (like DBSCAN noise
+    // absorption). This handles the case where a sparse voxel sits between
+    // two dense voxels of the same cluster but wasn't visited because neither
+    // side propagated through it.
+    for vi in 0..n_occupied {
+        if data.voxel_visited[vi] {
+            continue;
+        }
+        let slot = data.flat_hash.dirty_bucket_slot(vi);
+        if data.flat_hash.count_at_slot(slot) < data.min_pts {
+            data.voxel_visited[vi] = true;
+            continue;
+        }
+        // This is a sparse (min_pts <= count < bridge_pts) unvisited voxel.
+        // Check if any 26-neighbor belongs to a cluster and adopt that ID.
+        let (cx, cy, cz) = data.flat_hash.key_at_slot(slot);
+        let mut adopted_id = 0u32;
+        'outer: for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    if dx == 0 && dy == 0 && dz == 0 {
+                        continue;
+                    }
+                    let nk = (cx + dx, cy + dy, cz + dz);
+                    if let Some(ns) = data.flat_hash.find_slot(nk)
+                        && let Some(ni) = data.flat_hash.dirty_bucket_index(ns)
+                        && data.voxel_visited[ni]
+                        && let Some(&pt) = data.flat_hash.indices_at_slot(ns).first()
+                    {
+                        let cid = data.cluster_ids[pt as usize];
+                        if cid > 0 {
+                            adopted_id = cid;
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
+        if adopted_id > 0 {
+            data.voxel_visited[vi] = true;
+            for &pt in data.flat_hash.indices_at_slot(slot) {
+                data.cluster_ids[pt as usize] = adopted_id;
             }
         }
     }
@@ -949,7 +1038,7 @@ pub fn voxel_cluster(
 #[cfg(test)]
 #[allow(clippy::needless_range_loop)]
 mod tests {
-    use super::{ClusterData, VoxelClusterData, cluster_, voxel_cluster};
+    use super::{ClusterData, VoxelClusterData, cluster_, compute_valid, voxel_cluster};
 
     #[test]
     fn test_cluster_spatial() {
@@ -962,8 +1051,9 @@ mod tests {
         let z = vec![0.0, 0.0, 0.05, 0.0, 0.0, 0.05, 0.0];
 
         let mut data = ClusterData::new(0.2, 2);
+        let point_valid = compute_valid(&x, &y, &z);
 
-        let clusters = cluster_(&mut data, &x, &y, &z);
+        let clusters = cluster_(&mut data, &x, &y, &z, &point_valid);
 
         // Origin point should be noise (0)
         assert_eq!(clusters[6], 0, "Origin point should be noise");
@@ -992,8 +1082,9 @@ mod tests {
         let z = vec![0.0, 0.0, 0.05, 0.0, 0.0, 0.05, 0.0];
 
         let mut data = ClusterData::new_flat(0.2, 2);
+        let point_valid = compute_valid(&x, &y, &z);
 
-        let clusters = cluster_(&mut data, &x, &y, &z);
+        let clusters = cluster_(&mut data, &x, &y, &z, &point_valid);
 
         assert_eq!(clusters[6], 0, "Origin point should be noise");
         assert!(clusters[0] > 0, "Point 0 should be in a cluster");
@@ -1017,9 +1108,10 @@ mod tests {
         let z = vec![0.0f32; n];
 
         let mut data = ClusterData::new(0.256, 4);
+        let point_valid = compute_valid(&x, &y, &z);
 
         let start = std::time::Instant::now();
-        let clusters = cluster_(&mut data, &x, &y, &z);
+        let clusters = cluster_(&mut data, &x, &y, &z, &point_valid);
         let elapsed = start.elapsed();
         println!("Clustering 25k all-zero points took: {:?}", elapsed);
 
@@ -1036,8 +1128,9 @@ mod tests {
         let z = vec![0.0f32; n];
 
         let mut data = ClusterData::new_flat(0.256, 4);
+        let point_valid = compute_valid(&x, &y, &z);
 
-        let clusters = cluster_(&mut data, &x, &y, &z);
+        let clusters = cluster_(&mut data, &x, &y, &z, &point_valid);
 
         for c in clusters {
             assert_eq!(c, 0, "All-zero points should be noise (cluster ID 0)");
@@ -1053,8 +1146,9 @@ mod tests {
         let z = vec![1.0, 1.0, 1.01, 1.0, 1.01, 10.0, 20.0, 30.0];
 
         let mut data = ClusterData::new(0.1, 3);
+        let point_valid = compute_valid(&x, &y, &z);
 
-        let clusters = cluster_(&mut data, &x, &y, &z);
+        let clusters = cluster_(&mut data, &x, &y, &z, &point_valid);
 
         // First 5 points should form one cluster
         assert!(clusters[0] > 0, "Dense points should be clustered");
@@ -1078,8 +1172,9 @@ mod tests {
         let z = vec![1.0, 1.0, 1.01, 1.0, 1.01, 10.0, 20.0, 30.0];
 
         let mut data = ClusterData::new_flat(0.1, 3);
+        let point_valid = compute_valid(&x, &y, &z);
 
-        let clusters = cluster_(&mut data, &x, &y, &z);
+        let clusters = cluster_(&mut data, &x, &y, &z, &point_valid);
 
         assert!(clusters[0] > 0, "Dense points should be clustered");
         for i in 1..5 {
@@ -1110,9 +1205,10 @@ mod tests {
 
         let mut data_hashmap = ClusterData::new(0.2, 3);
         let mut data_flat = ClusterData::new_flat(0.2, 3);
+        let point_valid = compute_valid(&x, &y, &z);
 
-        let clusters_hashmap = cluster_(&mut data_hashmap, &x, &y, &z);
-        let clusters_flat = cluster_(&mut data_flat, &x, &y, &z);
+        let clusters_hashmap = cluster_(&mut data_hashmap, &x, &y, &z, &point_valid);
+        let clusters_flat = cluster_(&mut data_flat, &x, &y, &z, &point_valid);
 
         assert_eq!(
             clusters_hashmap.len(),
@@ -1155,7 +1251,8 @@ mod tests {
         let z = vec![0.0, 0.0, 0.05, 0.0, 0.0, 0.05, 0.0];
 
         let mut data = VoxelClusterData::new(0.2, 2);
-        let clusters = voxel_cluster(&mut data, &x, &y, &z);
+        let point_valid = compute_valid(&x, &y, &z);
+        let clusters = voxel_cluster(&mut data, &x, &y, &z, &point_valid);
 
         assert_eq!(clusters[6], 0, "Origin point should be noise");
         assert!(clusters[0] > 0, "Point 0 should be in a cluster");
@@ -1175,7 +1272,8 @@ mod tests {
         let z = vec![0.0f32; n];
 
         let mut data = VoxelClusterData::new(0.256, 4);
-        let clusters = voxel_cluster(&mut data, &x, &y, &z);
+        let point_valid = compute_valid(&x, &y, &z);
+        let clusters = voxel_cluster(&mut data, &x, &y, &z, &point_valid);
 
         for c in clusters {
             assert_eq!(c, 0, "All-zero points should be noise");
@@ -1189,7 +1287,8 @@ mod tests {
         let z = vec![1.0, 1.0, 1.01, 1.0, 1.01, 10.0, 20.0, 30.0];
 
         let mut data = VoxelClusterData::new(0.1, 3);
-        let clusters = voxel_cluster(&mut data, &x, &y, &z);
+        let point_valid = compute_valid(&x, &y, &z);
+        let clusters = voxel_cluster(&mut data, &x, &y, &z, &point_valid);
 
         assert!(clusters[0] > 0, "Dense points should be clustered");
         for i in 1..5 {
@@ -1209,7 +1308,8 @@ mod tests {
         let z = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
 
         let mut data = VoxelClusterData::new(0.5, 2);
-        let clusters = voxel_cluster(&mut data, &x, &y, &z);
+        let point_valid = compute_valid(&x, &y, &z);
+        let clusters = voxel_cluster(&mut data, &x, &y, &z, &point_valid);
 
         assert!(clusters[0] > 0, "Should be clustered");
         for i in 1..6 {
@@ -1227,7 +1327,8 @@ mod tests {
         let mut data = VoxelClusterData::new(0.2, 2);
 
         // First call should work
-        let c1 = voxel_cluster(&mut data, &x1, &y1, &z1);
+        let valid1 = compute_valid(&x1, &y1, &z1);
+        let c1 = voxel_cluster(&mut data, &x1, &y1, &z1, &valid1);
         assert!(c1[0] > 0, "First call: point 0 should be clustered");
 
         // Second call with different data should also work
@@ -1235,7 +1336,8 @@ mod tests {
         let y2 = vec![3.0, 3.01, 3.0, 3.02, 3.01, 10.0, 20.0, 30.0];
         let z2 = vec![1.0, 1.0, 1.01, 1.0, 1.01, 10.0, 20.0, 30.0];
 
-        let c2 = voxel_cluster(&mut data, &x2, &y2, &z2);
+        let valid2 = compute_valid(&x2, &y2, &z2);
+        let c2 = voxel_cluster(&mut data, &x2, &y2, &z2, &valid2);
         assert!(c2[0] > 0, "Second call: point 0 should be clustered");
         for i in 1..5 {
             assert_eq!(c2[0], c2[i], "Second call: points 0..5 same cluster");
@@ -1245,7 +1347,7 @@ mod tests {
         }
 
         // Third call with same data as first
-        let c3 = voxel_cluster(&mut data, &x1, &y1, &z1);
+        let c3 = voxel_cluster(&mut data, &x1, &y1, &z1, &valid1);
         assert!(c3[0] > 0, "Third call: point 0 should be clustered");
         assert_eq!(c3[0], c3[1]);
         assert_eq!(c3[0], c3[2]);
@@ -1254,26 +1356,21 @@ mod tests {
     #[test]
     fn test_voxel_vs_dbscan_agreement() {
         let x = vec![
-            1.0, 1.05, 1.1, 1.02, 1.08,
-            5.0, 5.05, 5.1, 5.02, 5.08,
-            0.0, 20.0, 30.0,
+            1.0, 1.05, 1.1, 1.02, 1.08, 5.0, 5.05, 5.1, 5.02, 5.08, 0.0, 20.0, 30.0,
         ];
         let y = vec![
-            0.0, 0.05, 0.0, 0.02, 0.03,
-            0.0, 0.05, 0.0, 0.02, 0.03,
-            0.0, 20.0, 30.0,
+            0.0, 0.05, 0.0, 0.02, 0.03, 0.0, 0.05, 0.0, 0.02, 0.03, 0.0, 20.0, 30.0,
         ];
         let z = vec![
-            0.0, 0.0, 0.05, 0.01, 0.02,
-            0.0, 0.0, 0.05, 0.01, 0.02,
-            0.0, 20.0, 30.0,
+            0.0, 0.0, 0.05, 0.01, 0.02, 0.0, 0.0, 0.05, 0.01, 0.02, 0.0, 20.0, 30.0,
         ];
 
         let mut dbscan = ClusterData::new_flat(0.2, 3);
         let mut voxel = VoxelClusterData::new(0.2, 3);
+        let point_valid = compute_valid(&x, &y, &z);
 
-        let c_dbscan = cluster_(&mut dbscan, &x, &y, &z);
-        let c_voxel = voxel_cluster(&mut voxel, &x, &y, &z);
+        let c_dbscan = cluster_(&mut dbscan, &x, &y, &z, &point_valid);
+        let c_voxel = voxel_cluster(&mut voxel, &x, &y, &z, &point_valid);
 
         assert_eq!(c_dbscan.len(), c_voxel.len());
 
@@ -1281,27 +1378,31 @@ mod tests {
             for j in (i + 1)..c_dbscan.len() {
                 let same_d = c_dbscan[i] == c_dbscan[j];
                 let same_v = c_voxel[i] == c_voxel[j];
-                assert_eq!(same_d, same_v,
+                assert_eq!(
+                    same_d, same_v,
                     "Points {} and {} grouping mismatch: dbscan={}, voxel={}",
-                    i, j, c_dbscan[i], c_voxel[j]);
+                    i, j, c_dbscan[i], c_voxel[j]
+                );
             }
         }
 
         for i in 0..c_dbscan.len() {
-            assert_eq!(c_dbscan[i] == 0, c_voxel[i] == 0,
-                "Point {} noise mismatch", i);
+            assert_eq!(
+                c_dbscan[i] == 0,
+                c_voxel[i] == 0,
+                "Point {} noise mismatch",
+                i
+            );
         }
     }
 
-    /// Load a binary PCD file (FIELDS x y z intensity, 13 bytes/point).
+    /// Load a binary PCD file with FIELDS x y z intensity (4+4+4+1 = 13 bytes/point).
     /// Returns (x, y, z) coordinate vectors. Skips origin (0,0,0) points.
     fn load_pcd(path: &str) -> Option<(Vec<f32>, Vec<f32>, Vec<f32>)> {
         let data = std::fs::read(path).ok()?;
 
         // Find end of header ("DATA binary\n")
-        let header_end = data.windows(12)
-            .position(|w| w == b"DATA binary\n")?
-            + 12;
+        let header_end = data.windows(12).position(|w| w == b"DATA binary\n")? + 12;
 
         let body = &data[header_end..];
         let point_size = 13; // 4+4+4+1
@@ -1345,9 +1446,10 @@ mod tests {
         assert!(x.len() > 10_000, "E1R frame should have >10k points");
 
         let mut data = VoxelClusterData::new(0.256, 4);
+        let point_valid = compute_valid(&x, &y, &z);
 
         let t = std::time::Instant::now();
-        let clusters = voxel_cluster(&mut data, &x, &y, &z);
+        let clusters = voxel_cluster(&mut data, &x, &y, &z, &point_valid);
         let elapsed = t.elapsed();
         assert_eq!(clusters.len(), x.len());
 
@@ -1355,20 +1457,26 @@ mod tests {
         let n_clustered = clusters.iter().filter(|c| **c > 0).count();
         println!(
             "E1R voxel: {} points, {} clustered, {} clusters in {:.2?}",
-            x.len(), n_clustered, max_id, elapsed
+            x.len(),
+            n_clustered,
+            max_id,
+            elapsed
         );
         assert!(max_id > 0, "Should produce at least 1 cluster");
 
         // Second call with different frame to verify state reuse
         let (x2, y2, z2) = require_pcd!("testdata/e1r_frame5.pcd");
+        let valid2 = compute_valid(&x2, &y2, &z2);
         let t = std::time::Instant::now();
-        let clusters2 = voxel_cluster(&mut data, &x2, &y2, &z2);
+        let clusters2 = voxel_cluster(&mut data, &x2, &y2, &z2, &valid2);
         let elapsed2 = t.elapsed();
         assert_eq!(clusters2.len(), x2.len());
         let max_id2 = clusters2.iter().max().copied().unwrap_or(0);
         println!(
             "E1R voxel (reuse): {} points, {} clusters in {:.2?}",
-            x2.len(), max_id2, elapsed2
+            x2.len(),
+            max_id2,
+            elapsed2
         );
         assert!(max_id2 > 0, "Second call should also produce clusters");
     }
@@ -1379,9 +1487,10 @@ mod tests {
         assert!(x.len() > 10_000);
 
         let mut data = ClusterData::new_flat(0.256, 4);
+        let point_valid = compute_valid(&x, &y, &z);
 
         let t = std::time::Instant::now();
-        let clusters = cluster_(&mut data, &x, &y, &z);
+        let clusters = cluster_(&mut data, &x, &y, &z, &point_valid);
         let elapsed = t.elapsed();
         assert_eq!(clusters.len(), x.len());
 
@@ -1389,7 +1498,10 @@ mod tests {
         let n_clustered = clusters.iter().filter(|c| **c > 0).count();
         println!(
             "E1R DBSCAN: {} points, {} clustered, {} clusters in {:.2?}",
-            x.len(), n_clustered, max_id, elapsed
+            x.len(),
+            n_clustered,
+            max_id,
+            elapsed
         );
         assert!(max_id > 0, "Should produce at least 1 cluster");
     }
@@ -1400,9 +1512,10 @@ mod tests {
         assert!(x.len() > 50_000, "Ouster frame should have >50k points");
 
         let mut data = VoxelClusterData::new(0.256, 4);
+        let point_valid = compute_valid(&x, &y, &z);
 
         let t = std::time::Instant::now();
-        let clusters = voxel_cluster(&mut data, &x, &y, &z);
+        let clusters = voxel_cluster(&mut data, &x, &y, &z, &point_valid);
         let elapsed = t.elapsed();
         assert_eq!(clusters.len(), x.len());
 
@@ -1410,7 +1523,10 @@ mod tests {
         let n_clustered = clusters.iter().filter(|c| **c > 0).count();
         println!(
             "Ouster voxel: {} points, {} clustered, {} clusters in {:.2?}",
-            x.len(), n_clustered, max_id, elapsed
+            x.len(),
+            n_clustered,
+            max_id,
+            elapsed
         );
         assert!(max_id > 0, "Should produce at least 1 cluster");
     }

@@ -111,12 +111,33 @@ pub struct Args {
     pub clustering: String,
 
     /// 3D Euclidean distance threshold for clustering, in millimeters
-    #[arg(long, env, default_value = "256")]
+    #[arg(long, env, default_value = "200")]
     pub clustering_eps: u16,
 
     /// Minimum number of points to form a cluster
     #[arg(long, env, default_value = "4")]
     pub clustering_minpts: usize,
+
+    /// Minimum neighbors for a point to propagate during cluster expansion.
+    /// Higher values prevent thin structures (ropes, wires) from merging
+    /// separate objects. 0 = same as clustering_minpts (standard DBSCAN).
+    #[arg(long, env, default_value = "0")]
+    pub clustering_bridge: usize,
+
+    /// Enable IMU-guided ground plane removal before clustering.
+    /// Requires IMU data (Robosense built-in or external).
+    #[arg(long, env, default_value = "false")]
+    pub ground_filter: bool,
+
+    /// Ground slab thickness for ground plane removal, in millimeters.
+    /// Points within this distance above the detected ground plane are removed.
+    #[arg(long, env, default_value = "150")]
+    pub ground_thickness: u16,
+
+    /// Known sensor height above ground in millimeters. When set, skips
+    /// automatic ground detection and uses this fixed height instead.
+    #[arg(long, env)]
+    pub sensor_height: Option<u16>,
 
     /// zenoh connection mode
     #[arg(long, env, default_value = "peer")]
