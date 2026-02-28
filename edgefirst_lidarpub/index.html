@@ -1,0 +1,54 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="EdgeFirst LiDAR Publisher Library"><title>edgefirst_lidarpub - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../static.files/rustdoc-ca0dd0c4.css"><meta name="rustdoc-vars" data-root-path="../" data-static-root-path="../static.files/" data-current-crate="edgefirst_lidarpub" data-themes="" data-resource-suffix="" data-rustdoc-version="1.93.1 (01f6ddf75 2026-02-11)" data-channel="1.93.1" data-search-js="search-9e2438ea.js" data-stringdex-js="stringdex-a3946164.js" data-settings-js="settings-c38705f0.js" ><script src="../static.files/storage-e2aeef58.js"></script><script defer src="../crates.js"></script><script defer src="../static.files/main-a410ff4d.js"></script><noscript><link rel="stylesheet" href="../static.files/noscript-263c88ec.css"></noscript><link rel="alternate icon" type="image/png" href="../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../static.files/favicon-044be391.svg"></head><body class="rustdoc mod crate"><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Crate edgefirst_lidarpub</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../edgefirst_lidarpub/index.html">edgefirst_<wbr>lidarpub</a><span class="version">2.1.0</span></h2></div><div class="sidebar-elems"><ul class="block"><li><a id="all-types" href="all.html">All Items</a></li></ul><section id="rustdoc-toc"><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#architecture" title="Architecture">Architecture</a></li><li><a href="#modules" title="Modules">Modules</a></li><li><a href="#example" title="Example">Example</a></li></ul><h3><a href="#reexports">Crate Items</a></h3><ul class="block"><li><a href="#reexports" title="Re-exports">Re-exports</a></li><li><a href="#modules-1" title="Modules">Modules</a></li></ul></section><div id="rustdoc-modnav"></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content"><div class="main-heading"><h1>Crate <span>edgefirst_<wbr>lidarpub</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../src/edgefirst_lidarpub/lib.rs.html#4-88">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>EdgeFirst LiDAR Publisher Library</p>
+<p>This library provides drivers and utilities for working with LiDAR sensors.</p>
+<h2 id="architecture"><a class="doc-anchor" href="#architecture">§</a>Architecture</h2>
+<p>The library uses a <strong>client-owned frame</strong> pattern for zero-allocation
+operation:</p>
+<div class="example-wrap"><pre class="language-text"><code>┌─────────────────┐     ┌───────────────┐     ┌─────────────────┐
+│  PacketSource   │ ──► │  LidarDriver  │ ──► │  LidarFrame     │
+│  (UDP/pcap/test)│     │  (Ouster/RS)  │     │  (client-owned) │
+└─────────────────┘     └───────────────┘     └─────────────────┘
+                                                      │
+                                                      ▼
+                              ┌─────────────────────────────────────┐
+                              │  formats::format_points_*           │
+                              │  (SIMD: NEON/portable_simd/scalar)  │
+                              └─────────────────────────────────────┘</code></pre></div>
+<p>The client owns all frame objects and provides mutable references to the
+driver:</p>
+<ol>
+<li>Client creates frames: <code>OusterLidarFrame::with_capacity(N)</code></li>
+<li>Client provides mutable reference: <code>driver.process(&amp;mut frame, data)</code></li>
+<li>Driver writes points and metadata into the frame</li>
+<li>When complete (returns <code>Ok(true)</code>), client owns the filled frame</li>
+<li>Client can swap to another frame for the next fill cycle</li>
+</ol>
+<h2 id="modules"><a class="doc-anchor" href="#modules">§</a>Modules</h2>
+<ul>
+<li><a href="formats/index.html" title="mod edgefirst_lidarpub::formats"><code>formats</code></a>: SIMD-optimized point cloud formatting</li>
+<li><a href="lidar/index.html" title="mod edgefirst_lidarpub::lidar"><code>lidar</code></a>: Common types, traits, and error handling</li>
+<li><a href="ouster/index.html" title="mod edgefirst_lidarpub::ouster"><code>ouster</code></a>: Ouster OS0/OS1/OS2/OSDome driver</li>
+<li><a href="robosense/index.html" title="mod edgefirst_lidarpub::robosense"><code>robosense</code></a>: Robosense E1R driver</li>
+<li><a href="packet_source/index.html" title="mod edgefirst_lidarpub::packet_source"><code>packet_source</code></a>: Packet source abstraction for testing</li>
+<li><a href="common/index.html" title="mod edgefirst_lidarpub::common"><code>common</code></a>: Shared utilities (priority, socket config)</li>
+</ul>
+<h2 id="example"><a class="doc-anchor" href="#example">§</a>Example</h2>
+<div class="example-wrap ignore"><a href="#" class="tooltip" title="This example is not tested">ⓘ</a><pre class="rust rust-example-rendered"><code><span class="kw">use </span>edgefirst_lidarpub::{
+    lidar::{LidarDriver, LidarFrame},
+    robosense::{RobosenseDriver, RobosenseLidarFrame},
+};
+
+<span class="kw">let </span><span class="kw-2">mut </span>driver = RobosenseDriver::new();
+<span class="kw">let </span><span class="kw-2">mut </span>frame = RobosenseLidarFrame::new();
+
+<span class="comment">// Process packets
+</span><span class="kw">loop </span>{
+    <span class="kw">let </span>len = socket.recv(<span class="kw-2">&amp;mut </span>buf)<span class="question-mark">?</span>;
+    <span class="kw">if </span>driver.process(<span class="kw-2">&amp;mut </span>frame, <span class="kw-2">&amp;</span>buf[..len])<span class="question-mark">? </span>{
+        <span class="comment">// Frame complete - access point data directly
+        </span><span class="kw">let </span>x = frame.x();
+        <span class="kw">let </span>y = frame.y();
+        <span class="kw">let </span>z = frame.z();
+        <span class="kw">let </span>intensity = frame.intensity();
+        <span class="kw">let </span>range = frame.range();  <span class="comment">// Pre-computed, no sqrt needed!
+    </span>}
+}</code></pre></div></div></details><h2 id="reexports" class="section-header">Re-exports<a href="#reexports" class="anchor">§</a></h2><dl class="item-table reexports"><dt id="reexport.PointFieldType"><code>pub use formats::<a class="enum" href="formats/enum.PointFieldType.html" title="enum edgefirst_lidarpub::formats::PointFieldType">PointFieldType</a>;</code></dt><dt id="reexport.Error"><code>pub use lidar::<a class="enum" href="lidar/enum.Error.html" title="enum edgefirst_lidarpub::lidar::Error">Error</a>;</code></dt><dt id="reexport.LidarDriver"><code>pub use lidar::<a class="trait" href="lidar/trait.LidarDriver.html" title="trait edgefirst_lidarpub::lidar::LidarDriver">LidarDriver</a>;</code></dt><dt id="reexport.LidarFrame"><code>pub use lidar::<a class="trait" href="lidar/trait.LidarFrame.html" title="trait edgefirst_lidarpub::lidar::LidarFrame">LidarFrame</a>;</code></dt><dt id="reexport.LidarFrameWriter"><code>pub use lidar::<a class="trait" href="lidar/trait.LidarFrameWriter.html" title="trait edgefirst_lidarpub::lidar::LidarFrameWriter">LidarFrameWriter</a>;</code></dt><dt id="reexport.Points"><code>pub use lidar::<a class="struct" href="lidar/struct.Points.html" title="struct edgefirst_lidarpub::lidar::Points">Points</a>;</code></dt><dt id="reexport.SensorType"><code>pub use lidar::<a class="enum" href="lidar/enum.SensorType.html" title="enum edgefirst_lidarpub::lidar::SensorType">SensorType</a>;</code></dt><dt id="reexport.OusterLidarFrame"><code>pub use ouster::<a class="struct" href="ouster/struct.OusterLidarFrame.html" title="struct edgefirst_lidarpub::ouster::OusterLidarFrame">OusterLidarFrame</a>;</code></dt><dt id="reexport.PacketSource"><code>pub use packet_source::<a class="trait" href="packet_source/trait.PacketSource.html" title="trait edgefirst_lidarpub::packet_source::PacketSource">PacketSource</a>;</code></dt><dt id="reexport.RobosenseLidarFrame"><code>pub use robosense::<a class="struct" href="robosense/struct.RobosenseLidarFrame.html" title="struct edgefirst_lidarpub::robosense::RobosenseLidarFrame">RobosenseLidarFrame</a>;</code></dt></dl><h2 id="modules-1" class="section-header">Modules<a href="#modules-1" class="anchor">§</a></h2><dl class="item-table"><dt><a class="mod" href="cluster/index.html" title="mod edgefirst_lidarpub::cluster">cluster</a></dt><dd>3D Spatial Hash DBSCAN clustering for point clouds.</dd><dt><a class="mod" href="common/index.html" title="mod edgefirst_lidarpub::common">common</a></dt><dt><a class="mod" href="formats/index.html" title="mod edgefirst_lidarpub::formats">formats</a></dt><dd>Point cloud formatting with architecture-specific SIMD optimizations.</dd><dt><a class="mod" href="ground/index.html" title="mod edgefirst_lidarpub::ground">ground</a></dt><dd>IMU-guided ground plane removal for LiDAR point clouds.</dd><dt><a class="mod" href="lidar/index.html" title="mod edgefirst_lidarpub::lidar">lidar</a></dt><dd>Common LiDAR types and trait abstraction for multi-sensor support.</dd><dt><a class="mod" href="ouster/index.html" title="mod edgefirst_lidarpub::ouster">ouster</a></dt><dd>Ouster LiDAR driver implementation.</dd><dt><a class="mod" href="packet_source/index.html" title="mod edgefirst_lidarpub::packet_source">packet_<wbr>source</a></dt><dd>Packet source abstraction for LiDAR drivers.</dd><dt><a class="mod" href="robosense/index.html" title="mod edgefirst_lidarpub::robosense">robosense</a></dt><dd>Robosense E1R LiDAR driver implementation.</dd></dl></section></div></main></body></html>
