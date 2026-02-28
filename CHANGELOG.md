@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-02-28
+
+### Added
+- **IMU-guided ground plane filter** (`src/ground.rs`): Region-wise PCA on a polar
+  grid (12 azimuth × 6 range sectors) detects and removes floor points before
+  clustering, preventing nearby objects from being merged via shared ground points.
+  Uses IMU accelerometer data (Robosense E1R built-in) to determine gravity vector
+  and compensate for sensor tilt. EMA smoothing for stable detection across frames.
+- **Voxel connected-component clustering**: Fast BFS over occupied voxels as an
+  alternative to point-level DBSCAN. ~5× faster on aarch64 (~13ms vs ~70ms for
+  E1R ~25k points) with coarser but adequate segmentation.
+- **Bridge threshold** for both DBSCAN and voxel clustering: Points/voxels with
+  fewer than `bridge_pts` neighbors are labeled as part of a cluster but do not
+  propagate expansion, preventing thin structures (railings, wires, ropes) from
+  merging separate objects.
+- **Pipeline instrumentation**: Per-stage timing with `std::time::Instant`
+  accumulators (logged every 100 frames) and `tracing::info_span!()` wrappers
+  for Tracy profiler visualization.
+- `--clustering` algorithm selection: `""` (disabled), `"dbscan"`, or `"voxel"`
+- `--clustering-bridge` CLI argument for bridge threshold control
+- `--ground-filter` flag to enable IMU-guided ground removal
+- `--ground-thickness` for ground slab thickness (millimeters)
+- `--sensor-height` for fixed sensor height override (skips PCA auto-detection)
+- Real-data PCD test files (`testdata/e1r_frame0.pcd`, `testdata/os1_frame0.pcd`)
+  for ground filter and clustering integration tests
+- 7 ground filter unit tests (synthetic flat floor, tilted sensor, no IMU,
+  known height, wall rejection, reuse, real E1R data)
+- 16 clustering tests covering DBSCAN, voxel, real-data, and cross-algorithm
+  agreement
+
+### Changed
+- `--clustering` changed from boolean flag to string algorithm selector
+  (`""`, `"dbscan"`, `"voxel"`) with `PossibleValuesParser` validation
+- DBSCAN distance comparison changed from `<` to `<=` to match standard
+  DBSCAN semantics (affects both scalar and NEON SIMD paths)
+- Cluster thread no longer catches panics silently; unrecoverable errors
+  terminate the process with a clear error message
+- Updated ARCHITECTURE.md with ground filter, clustering algorithms, and
+  pipeline instrumentation documentation
+- Updated README.md with user-level documentation for ground filter, clustering
+  options, bridge threshold, and troubleshooting
+- Updated TESTING.md with per-module test tables, manual test scenarios, and
+  on-target deployment instructions
+- Updated `lidarpub.default` configuration template with all new parameters
+
+### Performance
+- Ground filter: ~5-9ms on E1R ~25k points (aarch64 Cortex-A)
+- Voxel clustering: ~13ms on E1R ~25k points (aarch64 Cortex-A)
+- DBSCAN clustering: ~70ms on E1R ~25k points (aarch64 Cortex-A)
+- Full pipeline (ground + voxel): ~29ms total, well within 100ms (10Hz) budget
+
 ## [2.0.1] - 2026-02-24
 
 ### Added

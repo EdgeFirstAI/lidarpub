@@ -2813,7 +2813,7 @@ checksum = "18aade80d5e09429040243ce1143ddc08a92d7a22820ac512610410a4dd5214f"
 
 [[package]]
 name = "edgefirst-lidarpub"
-version = "2.0.1"
+version = "2.1.0"
 dependencies = [
  "clap",
  "criterion",
