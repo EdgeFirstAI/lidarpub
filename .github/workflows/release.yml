@@ -153,6 +153,11 @@ jobs:
                release-assets/edgefirst-lidarpub-v${VERSION}-sbom.json
           fi
 
+          # Copy default configuration template
+          if [ -f lidarpub.default ]; then
+            cp lidarpub.default release-assets/lidarpub.default
+          fi
+
           echo "Release assets prepared:"
           ls -lh release-assets/
 
