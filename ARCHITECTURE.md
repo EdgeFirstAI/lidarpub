@@ -1,7 +1,7 @@
 # EdgeFirst LiDAR Publisher - Architecture Documentation
 
-**Version:** 2.0  
-**Last Updated:** 2025-11-25  
+**Version:** 2.1
+**Last Updated:** 2026-02-27
 **Project:** EdgeFirst LiDAR Publisher  
 **License:** Apache-2.0
 
@@ -16,23 +16,26 @@
 5. [Threading Model](#threading-model)
 6. [Message Publishing](#message-publishing)
 7. [SIMD Optimization](#simd-optimization)
-8. [Clustering Algorithm](#clustering-algorithm)
-9. [Error Handling](#error-handling)
-10. [Configuration](#configuration)
+8. [Ground Plane Filter](#ground-plane-filter)
+9. [Clustering Algorithms](#clustering-algorithms)
+10. [Pipeline Instrumentation](#pipeline-instrumentation)
+11. [Error Handling](#error-handling)
+12. [Configuration](#configuration)
 
 ---
 
 ## Overview
 
-The EdgeFirst LiDAR Publisher is a Rust application that receives UDP packets from an Ouster OS1-64 LiDAR sensor, transforms the data into 3D point clouds, and publishes ROS2-compatible messages via Zenoh.
+The EdgeFirst LiDAR Publisher is a Rust application that receives UDP packets from Ouster or Robosense LiDAR sensors, transforms the data into 3D point clouds, optionally applies ground plane removal and spatial clustering, and publishes ROS2-compatible messages via Zenoh.
 
 ### Technology Stack
 
-- **Language:** Rust 2024 edition
+- **Language:** Rust 2024 edition (stable toolchain)
 - **Async Runtime:** Tokio (multi-threaded)
-- **Messaging:** Zenoh 1.6.2
+- **Messaging:** Zenoh 1.7
 - **Serialization:** CDR (ROS2 Common Data Representation)
-- **SIMD:** portable_simd (nightly feature)
+- **SIMD:** NEON intrinsics on aarch64 for clustering distance checks
+- **Profiling:** Tracy integration via `tracing-tracy`
 - **Dependencies:** See `Cargo.toml` for complete list
 
 ### Target Platforms
@@ -110,17 +113,24 @@ graph TB
 
 ```
 src/
-├── main.rs          (572 lines) - Entry point, publishing logic
-├── ouster.rs        (733 lines) - Ouster protocol implementation
-├── cluster.rs       (458 lines) - DBSCAN clustering
-├── args.rs          (137 lines) - CLI configuration
-├── common.rs        (81 lines)  - Shared utilities
-└── lib.rs           (69 lines)  - Library exports
+├── main.rs              - Entry point, sensor drivers, publishing logic
+├── ouster.rs            - Ouster protocol implementation
+├── robosense.rs         - Robosense E1R protocol and DIFOP/MSOP parsing
+├── cluster.rs           - DBSCAN and voxel clustering (NEON SIMD)
+├── cluster_thread.rs    - Clustering pipeline with instrumentation
+├── ground.rs            - IMU-guided PCA ground plane filter
+├── formats.rs           - PointCloud2 CDR serialization (SIMD)
+├── args.rs              - CLI configuration
+├── common.rs            - Shared utilities
+├── lidar.rs             - Sensor type abstraction
+├── packet_source.rs     - UDP/pcap packet source abstraction
+└── lib.rs               - Library exports
 
-examples/
-└── lidar_rerun/     - Rerun 3D visualization (optional)
-    ├── main.rs
-    └── common.rs
+benches/
+└── cluster_bench.rs     - Criterion benchmarks for clustering
+
+testdata/
+└── e1r_frame0.pcd       - Real E1R point cloud for testing (20,512 pts)
 ```
 
 ### Module Dependencies
@@ -221,20 +231,29 @@ graph LR
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
-| `--target` | String | (required) | Sensor IP or pcap file |
-| `--azimuth` | Vec<u32> | `[0, 360]` | FOV start/stop (degrees) |
-| `--lidar-mode` | String | `"1024x10"` | Column×Hz configuration |
-| `--timestamp-mode` | Enum | `internal` | Timestamp source |
-| `--tf-vec` | Vec<f64> | `[0,0,0]` | Transform translation |
-| `--tf-quat` | Vec<f64> | `[0,0,0,1]` | Transform rotation |
-| `--base-frame-id` | String | `"base_link"` | Base frame name |
-| `--frame-id` | String | `"lidar"` | LiDAR frame name |
-| `--lidar-topic` | String | `"rt/lidar"` | Topic prefix |
+| `--sensor-type` | Enum | `ouster` | Sensor type: `ouster` or `robosense` |
+| `TARGET` | String | (optional) | Sensor IP, hostname, or pcap file |
+| `--azimuth` | Vec<u32> | `0 360` | FOV start/stop degrees (Ouster) |
+| `--lidar-mode` | String | `1024x10` | Column×Hz configuration (Ouster) |
+| `--timestamp-mode` | Enum | `internal` | Timestamp source (Ouster) |
+| `--msop-port` | u16 | `6699` | MSOP UDP port (Robosense) |
+| `--difop-port` | u16 | `7788` | DIFOP UDP port (Robosense) |
+| `--include-noisy` | bool | `false` | Include noisy points (Robosense) |
+| `--discover` | bool | `false` | Discover sensors and exit (Robosense) |
+| `--tf-vec` | Vec<f64> | `0 0 0` | Transform translation (meters) |
+| `--tf-quat` | Vec<f64> | `0 0 0 1` | Transform rotation quaternion |
+| `--base-frame-id` | String | `base_link` | Base frame name |
+| `--frame-id` | String | `lidar` | LiDAR child frame name |
+| `--lidar-topic` | String | `rt/lidar` | Topic prefix |
 | `--rust-log` | Level | `info` | Log level |
 | `--tracy` | bool | `false` | Enable Tracy profiler |
-| `--clustering` | bool | `false` | Enable clustering |
-| `--clustering-eps` | u16 | `256` | Cluster distance (mm) |
-| `--clustering-minpts` | usize | `4` | Min cluster size |
+| `--clustering` | String | `""` | Algorithm: `""`, `dbscan`, `voxel` |
+| `--clustering-eps` | u16 | `200` | Cluster distance threshold (mm) |
+| `--clustering-minpts` | usize | `4` | Min points per cluster |
+| `--clustering-bridge` | usize | `0` | Bridge threshold (0 = same as minpts) |
+| `--ground-filter` | bool | `false` | Enable IMU ground plane removal |
+| `--ground-thickness` | u16 | `150` | Ground slab thickness (mm) |
+| `--sensor-height` | u16 | (auto) | Fixed sensor height (mm) |
 | `--mode` | WhatAmI | `peer` | Zenoh mode |
 | `--connect` | Vec<String> | `[]` | Zenoh endpoints |
 | `--listen` | Vec<String> | `[]` | Zenoh listen endpoints |
@@ -469,71 +488,162 @@ This reduces per-point computation and improves SIMD efficiency.
 
 ---
 
-## Clustering Algorithm
+## Ground Plane Filter
 
-### DBSCAN Overview
+**Implementation:** `src/ground.rs` — `GroundFilter` struct
 
-**Implementation:** `cluster_()` in `src/cluster.rs`
+The ground plane filter uses IMU data to determine the gravity direction, then applies
+region-wise PCA (inspired by the Patchwork algorithm) to detect and remove floor points
+before clustering. This prevents nearby objects from being connected through shared
+floor points.
+
+### Algorithm
+
+1. **Gravity vector** — The IMU accelerometer reading (remapped to LiDAR frame
+   coordinates) is normalized to a unit gravity vector. All subsequent height
+   calculations project points onto this axis via dot product.
+
+2. **Polar grid binning** — Valid points are binned into a polar grid of 16 azimuth
+   sectors × 8 range rings (out to 30m). Points closer than 0.5m are excluded from
+   detection to avoid sensor housing artifacts.
+
+3. **Per-patch PCA** — For each occupied patch, the lowest-K points along the gravity
+   axis (K=20) are selected as seeds. A 3×3 covariance matrix is computed from the
+   seeds and its eigenvalues are found using Cardano's closed-form formula for cubic
+   roots (no iterative solver needed). The patch is accepted as ground if:
+   - **Uprightness** > 0.85 — the smallest eigenvector aligns with gravity
+   - **Flatness** < 0.03 — the smallest eigenvalue ratio indicates a plane
+   - **Elevation** within ±1.0m of the current ground height estimate
+
+4. **Ground height** — The median seed height across all accepted patches establishes
+   the ground level. An EMA (alpha=0.5) smooths this across frames with a 0.5m jump
+   gate for fast convergence on large changes.
+
+5. **Classification** — Every point whose height along the gravity axis is at or below
+   `ground_height - thickness_m` is marked as ground. This is one-sided: anything below
+   the ground surface is always removed. No range gate is applied during classification
+   so near-field floor points are also caught.
+
+### Sensor Height Override
+
+When `--sensor-height` is set, steps 2–4 are skipped and the provided height is used
+directly. This is useful when the sensor is in a fixed mount and auto-detection is
+unreliable (e.g. looking straight down with few ground patches visible).
+
+### IMU Axis Remap (Robosense E1R)
+
+The E1R's built-in IMU axes differ from its LiDAR point cloud frame. The remap
+applied in `src/main.rs` is:
+
+```
+LiDAR = (imu_z, -imu_x, -imu_y)
+```
+
+This was empirically validated by tilting the sensor and confirming the ground filter
+removes the correct region.
+
+### Cluster ID Scheme
+
+When the ground filter is active, cluster IDs follow a reserved scheme:
+
+| ID | Meaning |
+|----|---------|
+| 0  | Noise (invalid returns, too-few-neighbors) |
+| 1  | Ground plane |
+| 2+ | Real clusters |
+
+Constants `CLUSTER_ID_NOISE`, `CLUSTER_ID_GROUND`, and `CLUSTER_ID_FIRST` are defined
+in `src/cluster.rs`.
+
+---
+
+## Clustering Algorithms
+
+Two clustering algorithms are available, selected via `--clustering`:
+
+### DBSCAN (`--clustering=dbscan`)
+
+**Implementation:** `cluster_()` and `expand_cluster()` in `src/cluster.rs`
+
+A full 3D DBSCAN using a spatial hash for O(n) average neighbor queries. Points are
+binned into voxels of size `eps`, and neighbor searches check the 27 adjacent voxels
+(3×3×3 cube). On aarch64, distance checks use NEON SIMD intrinsics to process 4
+points per iteration.
+
+**Spatial hash variants:**
+- `SpatialHash` — `HashMap<(i32,i32,i32), Vec<usize>>` (default, backward compatible)
+- `FlatSpatialHash` — Open-addressing hash table with contiguous point storage for
+  better cache locality. Used by `ClusterData::new_flat()`.
 
 **Parameters:**
-- `eps`: Distance threshold in millimeters (default: 256mm = 0.256m)
-- `min_pts`: Minimum points per cluster (default: 4)
-- `wrap`: Azimuth wrap-around (default: false)
+- `eps` (CLUSTERING_EPS): 3D Euclidean distance threshold in mm (default: 200)
+- `min_pts` (CLUSTERING_MINPTS): Minimum neighbors to be a core point (default: 4)
+- `bridge_pts` (CLUSTERING_BRIDGE): Minimum neighbors for a point to **propagate**
+  during BFS expansion. When > min_pts, border points with fewer neighbors are
+  assigned to the cluster but don't expand it, preventing thin structures (ropes,
+  wires) from merging distinct dense clusters.
 
-### Algorithm Flow
+**Performance:** ~70ms per frame on E1R 25k points (aarch64 Cortex-A).
 
-```mermaid
-flowchart TD
-    A["Input: Range Image 64 rows x 1024 cols"] --> B["Initialize cluster_ids all zeros"]
-    
-    B --> C{"For each pixel row, col"}
-    
-    C --> D{"Is visited? cluster_id != 0"}
-    D -->|Yes| C
-    D -->|No| E{"Range > 0?"}
-    E -->|No| C
-    
-    E -->|Yes| F["Get neighbors within eps"]
-    F --> G{"Count >= min_pts?"}
-    
-    G -->|No| H["Mark as noise: cluster_id = 0"]
-    H --> C
-    
-    G -->|Yes| I["Assign cluster ID: next_cluster_id++"]
-    I --> J["Expand cluster recursive"]
-    
-    J --> K["Process queue: visit neighbors"]
-    K --> L{"Neighbor unvisited?"}
-    L -->|Yes| M["Assign same ID, add to queue"]
-    L -->|No| K
-    
-    M --> K
-    K --> C
-    
-    C -->|Done| N["Output: cluster_ids Vec u32"]
-```
+### Voxel Connected-Component (`--clustering=voxel`)
 
-### Neighbor Search
+**Implementation:** `voxel_cluster()` in `src/cluster.rs`
 
-**8-Connected Region** (defined by `OFFSETS` constant in `src/cluster.rs`):
-```
-Offsets relative to current pixel (r, c):
-(-1,-1)  (-1, 0)  (-1,+1)
-( 0,-1)    *      ( 0,+1)
-(+1,-1)  (+1, 0)  (+1,+1)
-```
+A faster, coarser alternative that operates at voxel granularity rather than individual
+points. Points are binned into the same `FlatSpatialHash`, then a BFS over 26-connected
+occupied voxels merges adjacent voxels into clusters.
 
-**Distance Check** (in `get_valid_neighbours()`):
-- Computes absolute difference between range values
-- Accepts neighbor if `|range[current] - range[neighbor]| ≤ eps`
-- Efficiently operates on 2D range image (no 3D distance computation)
+**Bridge support:** When `bridge_pts > min_pts`, voxels with fewer than `bridge_pts`
+points are labeled (assigned to the nearest cluster) but don't propagate BFS expansion.
+A second pass absorbs unvisited sparse voxels that are adjacent to labeled clusters,
+analogous to DBSCAN noise absorption.
+
+**Trade-off:** Objects within one voxel width of each other will always merge (the
+algorithm cannot distinguish them). For 200mm eps, this means objects closer than
+200mm are always one cluster.
+
+**Performance:** ~13ms per frame on E1R 25k points (aarch64 Cortex-A) with bridge=10.
 
 ### Output Format
 
-**Clustered PointCloud2** (`format_points_clustered()`):
-- Fields: x (FLOAT32), y (FLOAT32), z (FLOAT32), cluster_id (UINT32), reflect (UINT8)
+**Clustered PointCloud2** (published to `{lidar_topic}/clusters`):
+- Fields: x (FLOAT32), y (FLOAT32), z (FLOAT32), cluster_id (UINT32), intensity (UINT8)
 - Point step: 17 bytes (4+4+4+4+1)
-- Cluster IDs: 0 = noise, 1+ = cluster number
+- Cluster IDs: 0 = noise, 1 = ground (when filter active), 2+ = real clusters
+
+---
+
+## Pipeline Instrumentation
+
+**Implementation:** `src/cluster_thread.rs`
+
+Each stage of the clustering pipeline is wrapped in a `tracing::info_span!()` that
+integrates with both the tracing subscriber (journald, console) and Tracy when enabled
+via `--tracy`. Additionally, `std::time::Instant` accumulators track per-stage timing
+and log an average summary every 100 frames at INFO level.
+
+### Pipeline Stages
+
+| Stage | Span Name | Description |
+|-------|-----------|-------------|
+| 1 | `valid_mask` | Mark origin (0,0,0) points as invalid |
+| 2 | `ground_filter` | PCA ground detection + classification |
+| 3 | `clustering` | DBSCAN or voxel clustering |
+| 4 | `relabel` | Remap cluster IDs (ground=1, real=2+) |
+| 5 | `format_points_clustered` | CDR serialize PointCloud2 |
+| 6 | `publish` | Zenoh put |
+
+### Example Timing Log
+
+```
+pipeline avg over 100 frames (24967 pts): valid=0.2ms ground=9.3ms cluster=13.2ms relabel=0.5ms format=3.4ms publish=2.6ms total=29.1ms
+```
+
+### Tracy Integration
+
+When running with `--tracy`, all spans appear as zones in the Tracy profiler GUI.
+Frame marks are emitted at the end of each LiDAR frame. The `profiling` build feature
+adds allocation tracking and system-level tracing.
 
 ---
 

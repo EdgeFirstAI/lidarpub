@@ -132,7 +132,7 @@ impl From<u8> for TimeSyncStatus {
     }
 }
 
-/// IMU data from DIFOP packets (bytes 200-223)
+/// IMU data from DIFOP packets (bytes 208-231)
 #[derive(Clone, Debug, PartialEq)]
 pub struct ImuData {
     /// Accelerometer X-axis (m/s²)
@@ -403,15 +403,18 @@ impl RobosenseDriver {
         // Time sync status: byte 102
         self.device_info.timesync_status = TimeSyncStatus::from(data[102]);
 
-        // IMU data: bytes 200-223, 6× big-endian f32
+        // IMU data: bytes 208-231, 6× big-endian f32
+        // Verified against rs_driver RSE1DifopPkt struct (packed):
+        //   id[8] + reserved1[93] + timeMode[1] + timeSyncStatus[1] +
+        //   timestamp[10] + reserved2[95] = 208 → acceIx starts here.
         // Order: accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z
-        if data.len() >= 224 {
-            let accel_x = f32::from_be_bytes([data[200], data[201], data[202], data[203]]);
-            let accel_y = f32::from_be_bytes([data[204], data[205], data[206], data[207]]);
-            let accel_z = f32::from_be_bytes([data[208], data[209], data[210], data[211]]);
-            let gyro_x = f32::from_be_bytes([data[212], data[213], data[214], data[215]]);
-            let gyro_y = f32::from_be_bytes([data[216], data[217], data[218], data[219]]);
-            let gyro_z = f32::from_be_bytes([data[220], data[221], data[222], data[223]]);
+        if data.len() >= 232 {
+            let accel_x = f32::from_be_bytes([data[208], data[209], data[210], data[211]]);
+            let accel_y = f32::from_be_bytes([data[212], data[213], data[214], data[215]]);
+            let accel_z = f32::from_be_bytes([data[216], data[217], data[218], data[219]]);
+            let gyro_x = f32::from_be_bytes([data[220], data[221], data[222], data[223]]);
+            let gyro_y = f32::from_be_bytes([data[224], data[225], data[226], data[227]]);
+            let gyro_z = f32::from_be_bytes([data[228], data[229], data[230], data[231]]);
 
             // Only store if values are finite (not NaN or Inf from uninitialized data)
             if accel_x.is_finite()
