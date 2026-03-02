@@ -264,14 +264,7 @@ fn format_points_clustered(
     };
 
     // Use the shared SIMD formatter from formats module
-    let data = format_clustered_17byte(
-        &points.x,
-        y,
-        z,
-        cluster_ids,
-        &points.intensity,
-        n_points,
-    );
+    let data = format_clustered_17byte(&points.x, y, z, cluster_ids, &points.intensity, n_points);
 
     let msg = PointCloud2 {
         header: Header {
