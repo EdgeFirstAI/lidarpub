@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.1] - 2026-03-01
+
+### Changed
+- Default sensor type changed from `ouster` to `robosense` in `lidarpub.default`
+- Updated Robosense E1R transform calibration values for Maivin mounting
+- Simplified transform section comments to avoid repeating configuration values
+
 ## [2.1.0] - 2026-02-28
 
 ### Added

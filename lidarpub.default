@@ -13,7 +13,7 @@
 RUST_LOG="info"
 
 # Sensor type: "ouster" or "robosense"
-SENSOR_TYPE="ouster"
+SENSOR_TYPE="robosense"
 
 # Target device hostname, IP address, or pcap file path.
 #   Ouster:    Required. IP or hostname of the sensor (e.g. "192.168.1.100").
@@ -27,18 +27,16 @@ SENSOR_TYPE="ouster"
 # TF_VEC:  Translation "X Y Z" in meters.
 # TF_QUAT: Rotation quaternion "X Y Z W".
 #
-# Uncomment ONE pair matching your hardware configuration:
+# Default is Maivin + Robosense E1R. To switch to Ouster, comment
+# the active pair and uncomment the Ouster pair below.
 #
 # --- Maivin + Robosense E1R ---
-# E1R mounted 2cm below the camera (base_link), facing forward.
-# No rotation needed: E1R native frame aligns with ROS conventions.
-#TF_VEC="0 0 -0.02"
-#TF_QUAT="0 0 0 1"
+TF_VEC="0.1 0 -0.05"
+TF_QUAT="-0.0086497 0.0088020 -0.0086497 0.9998864"
 #
 # --- Maivin + Ouster with Mounting Kit ---
-# Ouster mounted 19cm below the camera (base_link) using the Maivin
-# Ouster Mounting Kit. ~180-degree Z rotation required because the
-# Ouster 0-degree point is at the rear connector.
+# Ouster 0-degree point is at the rear connector so a ~180-degree
+# Z rotation is needed.
 #TF_VEC="0 0 -0.19"
 #TF_QUAT="0 0 -0.9998157 0.0191974"
 
