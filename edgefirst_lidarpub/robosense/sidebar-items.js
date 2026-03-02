@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["BLOCKS_PER_PACKET","BLOCK_SIZE","DIFOP_PACKET_SIZE","DIFOP_SYNC","DIRECTION_SCALE","DISTANCE_RESOLUTION","MSOP_HEADER_SIZE","MSOP_PACKET_SIZE","MSOP_SYNC","POINTS_PER_FRAME"],"enum":["ReturnMode","TimeSyncMode","TimeSyncStatus"],"struct":["DeviceInfo","ImuData","MsopHeader","RobosenseDriver","RobosenseLidarFrame"]};
