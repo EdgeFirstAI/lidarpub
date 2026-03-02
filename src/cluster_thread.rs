@@ -173,6 +173,8 @@ pub async fn cluster_thread(
             n_points,
             time,
             args.frame_id.clone(),
+            args.mirror_y(),
+            args.mirror_z(),
         ) {
             Ok(v) => v,
             Err(e) => {
@@ -241,14 +243,31 @@ fn format_points_clustered(
     n_points: usize,
     timestamp: Time,
     frame_id: String,
+    mirror_y: bool,
+    mirror_z: bool,
 ) -> Result<(ZBytes, Encoding), serde_cdr::Error> {
     let fields = clustered_xyz_fields();
+
+    let y_neg: Vec<f32>;
+    let y: &[f32] = if mirror_y {
+        y_neg = points.y.iter().map(|v| -v).collect();
+        &y_neg
+    } else {
+        &points.y
+    };
+    let z_neg: Vec<f32>;
+    let z: &[f32] = if mirror_z {
+        z_neg = points.z.iter().map(|v| -v).collect();
+        &z_neg
+    } else {
+        &points.z
+    };
 
     // Use the shared SIMD formatter from formats module
     let data = format_clustered_17byte(
         &points.x,
-        &points.y,
-        &points.z,
+        y,
+        z,
         cluster_ids,
         &points.intensity,
         n_points,

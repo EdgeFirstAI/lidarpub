@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-03-02
+
+### Added
+- `--mirror` CLI flag to mirror the point cloud output by negating Y and/or Z
+  axes. Accepts `""` (disabled), `"horizontal"` (negate Y), `"vertical"`
+  (negate Z), or `"both"`. Applied at format time to both raw and clustered
+  point cloud outputs. Configurable via `MIRROR` environment variable.
+
 ## [2.1.1] - 2026-03-01
 
 ### Changed

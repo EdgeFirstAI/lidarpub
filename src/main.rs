@@ -741,7 +741,13 @@ async fn run_lidar_loop<D: LidarDriver, F: lidar::LidarFrameWriter + LidarFrame>
                 }
 
                 // Format and publish point cloud
-                let (msg, enc) = format_points(&frame, timestamp, args.frame_id.clone())?;
+                let (msg, enc) = format_points(
+                    &frame,
+                    timestamp,
+                    args.frame_id.clone(),
+                    args.mirror_y(),
+                    args.mirror_z(),
+                )?;
 
                 if let Err(e) = points_publisher.put(msg).encoding(enc).await {
                     error!("publish points error: {:?}", e);
@@ -767,12 +773,29 @@ fn format_points<F: LidarFrame>(
     frame: &F,
     timestamp: Time,
     frame_id: String,
+    mirror_y: bool,
+    mirror_z: bool,
 ) -> Result<(ZBytes, Encoding), serde_cdr::Error> {
     let fields = standard_xyz_intensity_fields();
     let n_points = frame.len();
 
+    let y_neg: Vec<f32>;
+    let y: &[f32] = if mirror_y {
+        y_neg = frame.y().iter().map(|v| -v).collect();
+        &y_neg
+    } else {
+        frame.y()
+    };
+    let z_neg: Vec<f32>;
+    let z: &[f32] = if mirror_z {
+        z_neg = frame.z().iter().map(|v| -v).collect();
+        &z_neg
+    } else {
+        frame.z()
+    };
+
     // Use the shared SIMD formatter
-    let data = format_points_13byte(frame.x(), frame.y(), frame.z(), frame.intensity(), n_points);
+    let data = format_points_13byte(frame.x(), y, z, frame.intensity(), n_points);
 
     let msg = PointCloud2 {
         header: Header {

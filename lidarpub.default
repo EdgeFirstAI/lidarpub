@@ -55,6 +55,15 @@ TF_QUAT="-0.0086497 0.0088020 -0.0086497 0.9998864"
 # visualize per-frame pipeline timing (ground_filter, clustering, etc.).
 #TRACY="false"
 
+# Mirror the point cloud output. Applies axis negation to the published
+# point data (both raw and clustered). Useful when the sensor's native
+# coordinate frame doesn't match the expected orientation.
+#   ""           - No mirroring (default)
+#   "horizontal" - Flip left-right (negate Y)
+#   "vertical"   - Flip up-down (negate Z)
+#   "both"       - Flip both axes
+#MIRROR=""
+
 # ---------------------------------------------------------------------------
 # Clustering settings
 # ---------------------------------------------------------------------------

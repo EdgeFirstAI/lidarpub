@@ -139,6 +139,16 @@ pub struct Args {
     #[arg(long, env)]
     pub sensor_height: Option<u16>,
 
+    /// Mirror the point cloud output. Useful when the sensor's coordinate
+    /// frame doesn't match the expected orientation.
+    ///   ""           - No mirroring (default)
+    ///   "horizontal" - Flip left-right (negate Y)
+    ///   "vertical"   - Flip up-down (negate Z)
+    ///   "both"       - Flip both axes
+    #[arg(long, env, default_value = "",
+          value_parser = PossibleValuesParser::new(["", "horizontal", "vertical", "both"]))]
+    pub mirror: String,
+
     /// zenoh connection mode
     #[arg(long, env, default_value = "peer")]
     mode: WhatAmI,
@@ -159,6 +169,14 @@ pub struct Args {
 impl Args {
     pub fn clustering_enabled(&self) -> bool {
         !self.clustering.is_empty()
+    }
+
+    pub fn mirror_y(&self) -> bool {
+        self.mirror == "horizontal" || self.mirror == "both"
+    }
+
+    pub fn mirror_z(&self) -> bool {
+        self.mirror == "vertical" || self.mirror == "both"
     }
 }
 
