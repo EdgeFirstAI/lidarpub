@@ -4,11 +4,11 @@
 
 | Version | Support Status |
 |---------|----------------|
-| main    | ✅ Full support |
-| 0.x     | 🔒 Security fixes only |
-| < 0.1   | ❌ End of life |
+| 2.x     | ✅ Full support (current) |
+| 1.x     | 🔒 Security fixes only |
+| < 1.0   | ❌ End of life |
 
-This project is pre-1.0; expect rapid iteration. The `main` branch receives full support and fixes. Once 1.0 is released, versions will follow semantic versioning with defined support tiers.
+The `main` branch receives full support and fixes. This project follows semantic versioning with defined support tiers.
 
 ## Reporting a Vulnerability
 
@@ -88,4 +88,4 @@ Contact **support@au-zone.com** for enterprise security services.
 For behavior concerns, see `CODE_OF_CONDUCT.md` and email with subject "Code of Conduct".
 
 ---
-*Last updated: November 2025*
+*Last updated: March 2026*
