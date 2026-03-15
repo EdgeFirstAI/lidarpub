@@ -480,6 +480,25 @@ sensor-to-host packet latency. Default 0 (disabled).
 | `{topic}/imu` (IMU) | `SystemTime::now()` at publish time |
 | `rt/tf_static` (TransformStamped) | `SystemTime::now()` at publish time |
 
+### ROS 2 Year 2038 Limit
+
+The ROS 2 `builtin_interfaces/msg/Time` message uses `int32` for the `sec` field, which
+overflows on 2038-01-19T03:14:07Z. This is an inherent limitation of the ROS 2 message
+definition.
+
+LiDAR Publisher handles this as follows:
+
+1. The `timestamp_to_time()` function in `lidar.rs` detects when the seconds component
+   exceeds `i32::MAX` before constructing a `Time` value.
+2. On overflow, it returns a saturated timestamp (`sec = i32::MAX`, `nanosec = 999_999_999`)
+   and logs a rate-limited warning (once per 1000 conversions).
+3. All published data (point clouds, clusters, IMU, TF) continues to be delivered — only
+   the header timestamp is clamped.
+
+This ensures the service continues publishing sensor data past 2038 rather than producing
+corrupt timestamps from silent integer truncation. Downstream consumers should be aware that
+saturated timestamps indicate the Y2038 limit has been reached.
+
 ---
 
 ## SIMD Optimization

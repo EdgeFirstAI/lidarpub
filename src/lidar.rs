@@ -347,6 +347,48 @@ pub fn timestamp() -> Result<u64, Error> {
     Ok(duration.as_nanos() as u64)
 }
 
+/// Nanoseconds per second.
+const NSEC_IN_SEC: u64 = 1_000_000_000;
+
+/// Maximum seconds representable in ROS 2 `builtin_interfaces/Time.sec` (i32).
+const MAX_ROS2_SEC: u64 = i32::MAX as u64;
+
+/// Saturated timestamp for Y2038 overflow.
+/// When the wall clock exceeds `i32::MAX` seconds, timestamps are clamped to
+/// this value so that messages continue to be published rather than dropped.
+const SATURATED_TIME: edgefirst_schemas::builtin_interfaces::Time =
+    edgefirst_schemas::builtin_interfaces::Time {
+        sec: i32::MAX,
+        nanosec: 999_999_999,
+    };
+
+/// Convert nanosecond timestamp to ROS 2 `builtin_interfaces/Time`,
+/// clamping to `i32::MAX` on Y2038 overflow.
+///
+/// ROS 2 `Time.sec` is `i32`, which overflows on 2038-01-19T03:14:07Z.
+/// When the input exceeds that limit, this function returns a saturated
+/// timestamp and logs a rate-limited warning. Downstream consumers should
+/// treat saturated timestamps as an indication that the Y2038 limit has
+/// been reached.
+pub fn timestamp_to_time(nanos: u64) -> edgefirst_schemas::builtin_interfaces::Time {
+    let secs = nanos / NSEC_IN_SEC;
+    if secs > MAX_ROS2_SEC {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static WARN_COUNT: AtomicU64 = AtomicU64::new(0);
+        let count = WARN_COUNT.fetch_add(1, Ordering::Relaxed);
+        if count.is_multiple_of(1000) {
+            tracing::warn!(
+                "Timestamp overflow: system clock exceeds i32 range (Y2038), saturating"
+            );
+        }
+        return SATURATED_TIME;
+    }
+    edgefirst_schemas::builtin_interfaces::Time {
+        sec: secs as i32,
+        nanosec: (nanos % NSEC_IN_SEC) as u32,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,5 +469,32 @@ mod tests {
     #[test]
     fn test_apply_timestamp_offset_saturates() {
         assert_eq!(apply_timestamp_offset(100, 1_000_000_000), 0);
+    }
+
+    #[test]
+    fn test_timestamp_to_time_normal() {
+        // 1_500_000_000 seconds + 500ms = well before Y2038
+        let nanos = 1_500_000_000u64 * NSEC_IN_SEC + 500_000_000;
+        let t = timestamp_to_time(nanos);
+        assert_eq!(t.sec, 1_500_000_000);
+        assert_eq!(t.nanosec, 500_000_000);
+    }
+
+    #[test]
+    fn test_timestamp_to_time_y2038_overflow() {
+        // i32::MAX + 1 seconds in nanoseconds
+        let nanos = (i32::MAX as u64 + 1) * NSEC_IN_SEC;
+        let t = timestamp_to_time(nanos);
+        assert_eq!(t.sec, i32::MAX);
+        assert_eq!(t.nanosec, 999_999_999);
+    }
+
+    #[test]
+    fn test_timestamp_to_time_at_boundary() {
+        // Exactly i32::MAX seconds — should work, not saturate
+        let nanos = i32::MAX as u64 * NSEC_IN_SEC + 123_456_789;
+        let t = timestamp_to_time(nanos);
+        assert_eq!(t.sec, i32::MAX);
+        assert_eq!(t.nanosec, 123_456_789);
     }
 }

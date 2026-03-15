@@ -312,7 +312,8 @@ async fn run_robosense(session: Session, args: Args) -> Result<(), Box<dyn std::
 
                     // Publish IMU data if present
                     if let Some(imu) = &info.imu {
-                        let timestamp = Time::from_nanos(crate::lidar::timestamp().unwrap_or(0));
+                        let timestamp =
+                            crate::lidar::timestamp_to_time(crate::lidar::timestamp().unwrap_or(0));
 
                         let msg = IMU {
                             header: Header {
@@ -723,7 +724,7 @@ async fn run_lidar_loop<D: LidarDriver, F: lidar::LidarFrameWriter + LidarFrame>
                     "publishing frame"
                 );
 
-                let timestamp = Time::from_nanos(timestamp_ns);
+                let timestamp = crate::lidar::timestamp_to_time(timestamp_ns);
 
                 // Send to clustering if enabled
                 if args.clustering_enabled() {
@@ -829,7 +830,7 @@ async fn tf_static_loop(session: Session, args: Args) {
         .await
         .unwrap();
 
-    let timestamp = Time::from_nanos(crate::lidar::timestamp().unwrap_or(0));
+    let timestamp = crate::lidar::timestamp_to_time(crate::lidar::timestamp().unwrap_or(0));
     let msg = TransformStamped {
         header: Header {
             frame_id: args.base_frame_id.clone(),
