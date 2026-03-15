@@ -264,6 +264,49 @@ impl fmt::Display for SensorType {
     }
 }
 
+/// Timestamp source selection for point cloud messages.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum TimeSource {
+    /// Use host CLOCK_REALTIME at first packet of each frame (default)
+    #[default]
+    Host,
+    /// Use sensor packet timestamp with sanity validation
+    Sensor,
+}
+
+impl fmt::Display for TimeSource {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            TimeSource::Host => write!(f, "host"),
+            TimeSource::Sensor => write!(f, "sensor"),
+        }
+    }
+}
+
+/// Returns `true` if the sensor timestamp passes sanity checks.
+///
+/// Checks:
+/// 1. sensor_ns must be <= host_ns (must be in the past or equal)
+/// 2. host_ns - sensor_ns must be <= half_period_ns (must be recent)
+#[allow(dead_code)] // Used by later tasks in timestamp management overhaul
+pub fn validate_sensor_timestamp(sensor_ns: u64, host_ns: u64, half_period_ns: u64) -> bool {
+    sensor_ns <= host_ns && (host_ns - sensor_ns) <= half_period_ns
+}
+
+/// Apply timestamp offset to a raw timestamp value.
+///
+/// The offset is subtracted (positive offset shifts timestamp earlier,
+/// negative offset shifts it forward). Uses saturating arithmetic to
+/// avoid underflow.
+#[allow(dead_code)] // Used by later tasks in timestamp management overhaul
+pub fn apply_timestamp_offset(timestamp_ns: u64, offset_ns: i64) -> u64 {
+    if offset_ns >= 0 {
+        timestamp_ns.saturating_sub(offset_ns as u64)
+    } else {
+        timestamp_ns.saturating_add(offset_ns.unsigned_abs())
+    }
+}
+
 /// Unified driver trait for all LiDAR sensors.
 ///
 /// This trait uses the client-owned frame pattern where the client owns all
@@ -295,27 +338,96 @@ pub trait LidarDriver: Send {
     fn process<F: LidarFrameWriter>(&mut self, frame: &mut F, data: &[u8]) -> Result<bool, Error>;
 }
 
-/// Get current timestamp in nanoseconds.
+/// Get current wall-clock timestamp in nanoseconds (CLOCK_REALTIME).
 ///
-/// On Linux, uses `CLOCK_MONOTONIC_RAW` for best accuracy.
-/// On other platforms, falls back to `SystemTime`.
-#[cfg(target_os = "linux")]
-pub fn timestamp() -> Result<u64, Error> {
-    let mut tp = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    let err = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, &mut tp) };
-    if err != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-
-    Ok(tp.tv_sec as u64 * 1_000_000_000 + tp.tv_nsec as u64)
-}
-
-#[cfg(not(target_os = "linux"))]
+/// Uses `SystemTime::now()` which maps to `clock_gettime(CLOCK_REALTIME)`
+/// on Linux with identical precision (both hit the vDSO). This is the
+/// correct clock for ROS2 `builtin_interfaces/Time` messages.
 pub fn timestamp() -> Result<u64, Error> {
     let now = std::time::SystemTime::now();
     let duration = now.duration_since(std::time::UNIX_EPOCH)?;
     Ok(duration.as_nanos() as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_sensor_timestamp_valid() {
+        let host = 1_000_000_000u64;
+        let sensor = host - 10_000_000;
+        let half_period = 50_000_000;
+        assert!(validate_sensor_timestamp(sensor, host, half_period));
+    }
+
+    #[test]
+    fn test_validate_sensor_timestamp_future() {
+        let host = 1_000_000_000u64;
+        let sensor = host + 1_000_000;
+        let half_period = 50_000_000;
+        assert!(!validate_sensor_timestamp(sensor, host, half_period));
+    }
+
+    #[test]
+    fn test_validate_sensor_timestamp_too_old() {
+        let host = 1_000_000_000u64;
+        let sensor = host - 60_000_000;
+        let half_period = 50_000_000;
+        assert!(!validate_sensor_timestamp(sensor, host, half_period));
+    }
+
+    #[test]
+    fn test_validate_sensor_timestamp_boundary() {
+        let host = 1_000_000_000u64;
+        let sensor = host - 50_000_000;
+        let half_period = 50_000_000;
+        assert!(validate_sensor_timestamp(sensor, host, half_period));
+    }
+
+    #[test]
+    fn test_validate_sensor_timestamp_equal() {
+        let host = 1_000_000_000u64;
+        assert!(validate_sensor_timestamp(host, host, 50_000_000));
+    }
+
+    #[test]
+    fn test_timestamp_is_realtime() {
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let ts = timestamp().unwrap();
+        let after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        assert!(ts >= before && ts <= after);
+    }
+
+    #[test]
+    fn test_apply_timestamp_offset_positive() {
+        assert_eq!(
+            apply_timestamp_offset(1_000_000_000, 5_000_000),
+            995_000_000
+        );
+    }
+
+    #[test]
+    fn test_apply_timestamp_offset_negative() {
+        assert_eq!(
+            apply_timestamp_offset(1_000_000_000, -5_000_000),
+            1_005_000_000
+        );
+    }
+
+    #[test]
+    fn test_apply_timestamp_offset_zero() {
+        assert_eq!(apply_timestamp_offset(1_000_000_000, 0), 1_000_000_000);
+    }
+
+    #[test]
+    fn test_apply_timestamp_offset_saturates() {
+        assert_eq!(apply_timestamp_offset(100, 1_000_000_000), 0);
+    }
 }
