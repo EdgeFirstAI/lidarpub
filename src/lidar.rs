@@ -288,7 +288,6 @@ impl fmt::Display for TimeSource {
 /// Checks:
 /// 1. sensor_ns must be <= host_ns (must be in the past or equal)
 /// 2. host_ns - sensor_ns must be <= half_period_ns (must be recent)
-#[allow(dead_code)] // Used by later tasks in timestamp management overhaul
 pub fn validate_sensor_timestamp(sensor_ns: u64, host_ns: u64, half_period_ns: u64) -> bool {
     sensor_ns <= host_ns && (host_ns - sensor_ns) <= half_period_ns
 }
@@ -298,7 +297,6 @@ pub fn validate_sensor_timestamp(sensor_ns: u64, host_ns: u64, half_period_ns: u
 /// The offset is subtracted (positive offset shifts timestamp earlier,
 /// negative offset shifts it forward). Uses saturating arithmetic to
 /// avoid underflow.
-#[allow(dead_code)] // Used by later tasks in timestamp management overhaul
 pub fn apply_timestamp_offset(timestamp_ns: u64, offset_ns: i64) -> u64 {
     if offset_ns >= 0 {
         timestamp_ns.saturating_sub(offset_ns as u64)
