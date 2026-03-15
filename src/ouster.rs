@@ -12,7 +12,10 @@
 #![allow(clippy::wrong_self_convention)]
 #![allow(dead_code)]
 
-use crate::lidar::{Error, LidarDriver, LidarFrame, LidarFrameWriter, timestamp};
+use crate::lidar::{
+    Error, LidarDriver, LidarFrame, LidarFrameWriter, TimeSource, apply_timestamp_offset,
+    timestamp, validate_sensor_timestamp,
+};
 use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 use std::{f32::consts::PI, fmt};
@@ -380,6 +383,8 @@ pub struct FrameReader {
     /// Reflectivity buffer owned by FrameReader - never copied
     reflect: Array2<u8>,
     timestamp: u64,
+    /// Sensor-reported column timestamp (nanoseconds), captured from first column
+    sensor_timestamp: u64,
     /// True when a complete frame is ready for processing
     frame_ready: bool,
 }
@@ -404,6 +409,7 @@ impl FrameReader {
             depth: Array2::zeros((rows, cols)),
             reflect: Array2::zeros((rows, cols)),
             timestamp: 0,
+            sensor_timestamp: 0,
             frame_ready: false,
         })
     }
@@ -450,8 +456,9 @@ impl FrameReader {
                 }
             }
 
-            if i == 0 {
+            if i == 0 && self.timestamp == 0 {
                 self.timestamp = timestamp()?;
+                self.sensor_timestamp = column.timestamp();
             }
         }
 
@@ -465,11 +472,18 @@ impl FrameReader {
         self.depth.fill(0);
         self.reflect.fill(0);
         self.frame_ready = false;
+        self.timestamp = 0;
+        self.sensor_timestamp = 0;
     }
 
-    /// Get the timestamp of the current/completed frame.
+    /// Get the host timestamp of the current/completed frame.
     pub fn timestamp(&self) -> u64 {
         self.timestamp
+    }
+
+    /// Get the sensor-reported column timestamp of the current/completed frame.
+    pub fn sensor_timestamp(&self) -> u64 {
+        self.sensor_timestamp
     }
 
     /// Get the frame_id of the current/completed frame.
@@ -962,19 +976,44 @@ pub struct OusterDriver {
     pending_packet_buf: Vec<u8>,
     /// Length of valid data in pending_packet_buf (0 = no pending packet)
     pending_packet_len: usize,
+    /// Timestamp source configuration
+    time_source: TimeSource,
+    /// Timestamp offset in nanoseconds
+    timestamp_offset: i64,
+    /// Half frame period in nanoseconds (for sensor timestamp validation)
+    half_period_ns: u64,
+    /// Counter for rate-limiting validation warnings
+    validation_warn_count: u32,
 }
 
 impl OusterDriver {
     /// Create a new Ouster driver from sensor parameters
-    pub fn new(params: &Parameters) -> Result<Self, Error> {
+    pub fn new(
+        params: &Parameters,
+        lidar_mode: &str,
+        time_source: TimeSource,
+        timestamp_offset: i64,
+    ) -> Result<Self, Error> {
         let frame_reader = FrameReader::new(&params.lidar_data_format)?;
         let frame_builder = FrameBuilder::new(params);
+
+        // Parse frame rate from lidar_mode (e.g. "1024x10" -> 10Hz)
+        let hz: u64 = lidar_mode
+            .split('x')
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10);
+        let half_period_ns = 1_000_000_000 / (hz * 2);
 
         Ok(Self {
             frame_reader,
             frame_builder,
             pending_packet_buf: vec![0u8; MAX_PACKET_SIZE],
             pending_packet_len: 0,
+            time_source,
+            timestamp_offset,
+            half_period_ns,
+            validation_warn_count: 0,
         })
     }
 
@@ -1012,15 +1051,37 @@ impl LidarDriver for OusterDriver {
             self.pending_packet_buf[..len].copy_from_slice(&data[..len]);
             self.pending_packet_len = len;
 
-            // Get zero-copy references to FrameReader's buffers
-            let timestamp = self.frame_reader.timestamp();
+            // Select timestamp based on time source configuration
+            let host_ts = self.frame_reader.timestamp();
+            let ts = match self.time_source {
+                TimeSource::Host => host_ts,
+                TimeSource::Sensor => {
+                    let sensor_ts = self.frame_reader.sensor_timestamp();
+                    if validate_sensor_timestamp(sensor_ts, host_ts, self.half_period_ns) {
+                        sensor_ts
+                    } else {
+                        self.validation_warn_count += 1;
+                        if self.validation_warn_count % 100 == 1 {
+                            warn!(
+                                sensor_ts,
+                                host_ts,
+                                delta_ms = (host_ts as i64 - sensor_ts as i64) as f64 / 1_000_000.0,
+                                "sensor timestamp failed validation, using host time"
+                            );
+                        }
+                        host_ts
+                    }
+                }
+            };
+            let ts = apply_timestamp_offset(ts, self.timestamp_offset);
+
             let frame_id = self.frame_reader.frame_id();
             let depth = self.frame_reader.depth();
             let reflect = self.frame_reader.reflect();
 
             // Reset frame for new data
             frame.reset();
-            frame.set_timestamp(timestamp);
+            frame.set_timestamp(ts);
             frame.set_frame_id(frame_id as u32);
 
             // Build point cloud directly into frame buffers (true zero-copy)

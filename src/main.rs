@@ -39,7 +39,7 @@ use std::{
     net::TcpStream,
     sync::{Arc, Mutex},
     thread::sleep,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 
 use tokio::net::UdpSocket;
@@ -180,7 +180,12 @@ async fn run_ouster(session: Session, args: Args) -> Result<(), Box<dyn std::err
     debug!("{:?}", params);
 
     // Create OusterDriver
-    let driver = ouster::OusterDriver::new(&params)?;
+    let driver = ouster::OusterDriver::new(
+        &params,
+        &args.lidar_mode,
+        args.time_source,
+        args.timestamp_offset,
+    )?;
     let rows = driver.rows();
     let cols = driver.cols();
 
@@ -202,7 +207,8 @@ async fn run_ouster(session: Session, args: Args) -> Result<(), Box<dyn std::err
 
 /// Run the Robosense E1R LiDAR sensor
 async fn run_robosense(session: Session, args: Args) -> Result<(), Box<dyn std::error::Error>> {
-    let mut robosense_driver = RobosenseDriver::new();
+    let mut robosense_driver =
+        RobosenseDriver::with_config(args.time_source, args.timestamp_offset);
     robosense_driver.set_filter_noisy(!args.include_noisy);
     let driver = Arc::new(Mutex::new(robosense_driver));
 
@@ -306,10 +312,7 @@ async fn run_robosense(session: Session, args: Args) -> Result<(), Box<dyn std::
 
                     // Publish IMU data if present
                     if let Some(imu) = &info.imu {
-                        let now = SystemTime::now()
-                            .duration_since(SystemTime::UNIX_EPOCH)
-                            .unwrap();
-                        let timestamp = Time::from_nanos(now.as_nanos() as u64);
+                        let timestamp = Time::from_nanos(crate::lidar::timestamp().unwrap_or(0));
 
                         let msg = IMU {
                             header: Header {
@@ -826,10 +829,7 @@ async fn tf_static_loop(session: Session, args: Args) {
         .await
         .unwrap();
 
-    let timestamp = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap();
-    let timestamp = Time::from_nanos(timestamp.as_nanos() as u64);
+    let timestamp = Time::from_nanos(crate::lidar::timestamp().unwrap_or(0));
     let msg = TransformStamped {
         header: Header {
             frame_id: args.base_frame_id.clone(),

@@ -20,7 +20,10 @@
 //! - Device info: serial number, firmware version, network config, time sync
 //!   status
 
-use crate::lidar::{Error, LidarDriver, LidarFrame, LidarFrameWriter, timestamp};
+use crate::lidar::{
+    Error, LidarDriver, LidarFrame, LidarFrameWriter, TimeSource, apply_timestamp_offset,
+    timestamp, validate_sensor_timestamp,
+};
 
 /// MSOP packet sync bytes: 0x55, 0xaa, 0x5a, 0xa5
 const MSOP_SYNC: [u8; 4] = [0x55, 0xaa, 0x5a, 0xa5];
@@ -336,11 +339,24 @@ pub struct RobosenseDriver {
     return_mode: ReturnMode,
     /// Whether to filter noisy points (PointAttribute == 2)
     filter_noisy: bool,
+    /// Timestamp source configuration
+    time_source: TimeSource,
+    /// Timestamp offset in nanoseconds
+    timestamp_offset: i64,
+    /// Half frame period in nanoseconds (50ms for 10Hz E1R)
+    half_period_ns: u64,
+    /// Counter for rate-limiting validation warnings
+    validation_warn_count: u32,
 }
 
 impl RobosenseDriver {
-    /// Create a new Robosense E1R driver
+    /// Create a new Robosense E1R driver with default time settings
     pub fn new() -> Self {
+        Self::with_config(TimeSource::Host, 0)
+    }
+
+    /// Create a new Robosense E1R driver with time source configuration
+    pub fn with_config(time_source: TimeSource, timestamp_offset: i64) -> Self {
         Self {
             frame_id: 0,
             last_pkt_cnt: u16::MAX,
@@ -349,6 +365,10 @@ impl RobosenseDriver {
             needs_reset: false,
             return_mode: ReturnMode::default(),
             filter_noisy: true,
+            time_source,
+            timestamp_offset,
+            half_period_ns: 50_000_000, // 10Hz -> 100ms period -> 50ms half
+            validation_warn_count: 0,
         }
     }
 
@@ -533,6 +553,38 @@ impl RobosenseDriver {
         Ok(())
     }
 
+    /// Select and validate frame timestamp based on time source configuration.
+    fn select_timestamp(&mut self, sensor_ts: u64) -> u64 {
+        let ts = match self.time_source {
+            TimeSource::Host => timestamp().unwrap_or(sensor_ts),
+            TimeSource::Sensor => match timestamp() {
+                Ok(host_ts) => {
+                    if validate_sensor_timestamp(sensor_ts, host_ts, self.half_period_ns) {
+                        sensor_ts
+                    } else {
+                        self.validation_warn_count += 1;
+                        if self.validation_warn_count % 100 == 1 {
+                            tracing::warn!(
+                                sensor_ts,
+                                host_ts,
+                                delta_ms = (host_ts as i64 - sensor_ts as i64) as f64 / 1_000_000.0,
+                                "sensor timestamp failed validation, using host time"
+                            );
+                        }
+                        host_ts
+                    }
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "SystemTime failed in sensor mode, using sensor timestamp unvalidated"
+                    );
+                    sensor_ts
+                }
+            },
+        };
+        apply_timestamp_offset(ts, self.timestamp_offset)
+    }
+
     /// Check if this packet indicates a new frame boundary
     fn is_frame_boundary(&self, pkt_cnt: u16) -> bool {
         // First packet always starts a new frame
@@ -570,7 +622,7 @@ impl LidarDriver for RobosenseDriver {
         // so this packet is the first data packet of the new frame.
         if self.needs_reset {
             frame.reset();
-            let ts = timestamp().unwrap_or(header.timestamp_ns);
+            let ts = self.select_timestamp(header.timestamp_ns);
             frame.set_timestamp(ts);
             frame.set_frame_id(self.frame_id);
             self.needs_reset = false;
@@ -590,7 +642,7 @@ impl LidarDriver for RobosenseDriver {
             // Start new frame if at boundary (first packet case)
             if is_boundary {
                 frame.reset();
-                let ts = timestamp().unwrap_or(header.timestamp_ns);
+                let ts = self.select_timestamp(header.timestamp_ns);
                 frame.set_timestamp(ts);
                 frame.set_frame_id(self.frame_id);
             }
