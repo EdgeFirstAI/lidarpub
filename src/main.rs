@@ -114,7 +114,7 @@ async fn run_ouster(session: Session, args: Args) -> Result<(), Box<dyn std::err
     let config = Config {
         udp_dest: local.to_string(),
         lidar_mode: args.lidar_mode.clone(),
-        timestamp_mode: args.timestamp_mode.to_string(),
+        timestamp_mode: args.time_sync.to_string(),
         azimuth_window: args
             .azimuth
             .iter()

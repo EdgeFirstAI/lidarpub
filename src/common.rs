@@ -8,31 +8,31 @@ use std::{fmt, net::UdpSocket};
 use log::warn;
 
 #[derive(Copy, Clone, Debug, PartialEq, ValueEnum)]
-pub enum TimestampMode {
+pub enum TimeSync {
     Internal,
     SyncPulse,
     Ptp1588,
 }
 
-impl fmt::Display for TimestampMode {
+impl fmt::Display for TimeSync {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TimestampMode::Internal => write!(f, "TIME_FROM_INTERNAL_OSC"),
-            TimestampMode::SyncPulse => write!(f, "TIME_FROM_SYNC_PULSE_IN"),
-            TimestampMode::Ptp1588 => write!(f, "TIME_FROM_PTP_1588"),
+            TimeSync::Internal => write!(f, "TIME_FROM_INTERNAL_OSC"),
+            TimeSync::SyncPulse => write!(f, "TIME_FROM_SYNC_PULSE_IN"),
+            TimeSync::Ptp1588 => write!(f, "TIME_FROM_PTP_1588"),
         }
     }
 }
 
-impl TryFrom<&str> for TimestampMode {
+impl TryFrom<&str> for TimeSync {
     type Error = String;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         match value {
-            "TIME_FROM_INTERNAL_OSC" => Ok(TimestampMode::Internal),
-            "TIME_FROM_SYNC_PULSE_IN" => Ok(TimestampMode::SyncPulse),
-            "TIME_FROM_PTP_1588" => Ok(TimestampMode::Ptp1588),
-            _ => Err(format!("Invalid timestamp mode: {}", value)),
+            "TIME_FROM_INTERNAL_OSC" => Ok(TimeSync::Internal),
+            "TIME_FROM_SYNC_PULSE_IN" => Ok(TimeSync::SyncPulse),
+            "TIME_FROM_PTP_1588" => Ok(TimeSync::Ptp1588),
+            _ => Err(format!("Invalid time sync mode: {}", value)),
         }
     }
 }

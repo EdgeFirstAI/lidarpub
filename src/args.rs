@@ -6,7 +6,10 @@ use serde_json::json;
 use tracing::level_filters::LevelFilter;
 use zenoh::config::{Config, WhatAmI};
 
-use crate::{common::TimestampMode, lidar::SensorType};
+use crate::{
+    common::TimeSync,
+    lidar::{SensorType, TimeSource},
+};
 
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
@@ -35,12 +38,30 @@ pub struct Args {
           value_parser = PossibleValuesParser::new(["512x10", "1024x10", "2048x10", "512x20", "1024x20",]))]
     pub lidar_mode: String,
 
-    /// LiDAR timestamp mode.  If using the PTP1588 timestamp mode the LiDAR
-    /// must be connected to a PTP1588 enabled network, the Maivin can provide
-    /// this time through the ptp4l service.
+    /// LiDAR time synchronization mode. Configures which clock the Ouster
+    /// sensor hardware uses. "internal" uses the internal oscillator,
+    /// "ptp-1588" synchronizes to a PTP master (e.g. ptp4l on Maivin).
     /// (Ouster only)
-    #[arg(long, env, default_value = "internal")]
-    pub timestamp_mode: TimestampMode,
+    #[arg(
+        long,
+        env = "TIME_SYNC",
+        default_value = "internal",
+        alias = "timestamp-mode"
+    )]
+    pub time_sync: TimeSync,
+
+    /// Timestamp source for point cloud and cluster messages.
+    /// "host" uses the host wall clock (CLOCK_REALTIME) at frame start.
+    /// "sensor" uses the sensor's packet timestamp with sanity validation,
+    /// falling back to host time if validation fails.
+    #[arg(long, env, default_value = "host")]
+    pub time_source: TimeSource,
+
+    /// Timestamp offset in nanoseconds, subtracted from each frame timestamp
+    /// to compensate for estimated sensor-to-host latency. A positive value
+    /// shifts timestamps earlier; negative shifts forward. 0 = disabled.
+    #[arg(long, env, default_value = "0")]
+    pub timestamp_offset: i64,
 
     // --- Robosense-specific options ---
     /// MSOP (Main data Stream Output Protocol) port for Robosense sensors.
