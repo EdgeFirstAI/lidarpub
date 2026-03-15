@@ -65,6 +65,28 @@ TF_QUAT="-0.0086497 0.0088020 -0.0086497 0.9998864"
 #MIRROR=""
 
 # ---------------------------------------------------------------------------
+# Timestamp settings
+# ---------------------------------------------------------------------------
+
+# Timestamp source for point cloud and cluster messages.
+#   "host"   - Use host wall clock (CLOCK_REALTIME) captured at the first
+#              UDP packet of each new frame. This is the default and correct
+#              for most deployments.
+#   "sensor" - Use the sensor's packet timestamp after sanity validation.
+#              The sensor time must be in the past and within half a frame
+#              period of the host clock. On validation failure, falls back
+#              to host time with a warning. Useful when sensors are
+#              PTP-synchronized for sub-millisecond accuracy.
+#TIME_SOURCE="host"
+
+# Timestamp offset in nanoseconds, subtracted from each frame timestamp.
+# Compensates for the estimated latency between real-world light capture
+# and the first UDP packet arriving on the host. A positive value shifts
+# timestamps earlier (into the past); a negative value shifts forward.
+# 0 = disabled (default). Typical values: 1000000-5000000 (1-5ms).
+#TIMESTAMP_OFFSET="0"
+
+# ---------------------------------------------------------------------------
 # Clustering settings
 # ---------------------------------------------------------------------------
 
@@ -133,10 +155,12 @@ AZIMUTH="0 360"
 # Valid values: 512x10 1024x10 2048x10 512x20 1024x20
 LIDAR_MODE="1024x10"
 
-# Timestamp mode for the Ouster sensor.
+# Time synchronization mode for the Ouster sensor hardware clock.
+# Configures which clock source the sensor uses for its internal timestamps.
 # "internal" uses the internal oscillator (time since boot).
-# "ptp1588" synchronizes to a PTP-1588 master (e.g. ptp4l on Maivin).
-TIMESTAMP_MODE="internal"
+# "ptp-1588" synchronizes to a PTP-1588 master (e.g. ptp4l on Maivin).
+# (Ouster only)
+TIME_SYNC="internal"
 
 # ---------------------------------------------------------------------------
 # Robosense E1R settings (ignored when SENSOR_TYPE="ouster")

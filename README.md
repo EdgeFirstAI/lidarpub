@@ -27,6 +27,7 @@ High-performance LiDAR point cloud publisher connecting Ouster sensors to the Ze
 - OS1-64 RevD (firmware 2.5.3)
 - Packet format: RNG15_RFL8_NIR8 (15-bit range, 8-bit reflectivity, 8-bit NIR)
 - HTTP API for configuration and calibration
+- PTP-1588 time synchronization support (`--time-sync ptp-1588` + `--time-source sensor`)
 
 **Robosense:**
 - E1R solid-state LiDAR (~20k points per frame at 10Hz)
@@ -100,6 +101,11 @@ lidarpub --help
 # --ground-filter           Enable IMU-guided ground plane removal
 # --ground-thickness <MM>   Slab thickness above ground to remove (default: 150)
 # --sensor-height <MM>      Fixed sensor height (skips auto-detection)
+
+# Timestamp parameters:
+# --time-source <MODE>        Timestamp source: "host" (default), "sensor"
+# --timestamp-offset <NS>     Nanosecond offset subtracted from timestamps (default: 0)
+# --time-sync <MODE>          Ouster sensor clock: "internal", "sync-pulse", "ptp-1588"
 
 # Or use environment variables (useful for systemd services):
 SENSOR_TYPE=robosense CLUSTERING=voxel GROUND_FILTER=true lidarpub

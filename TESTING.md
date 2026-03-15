@@ -321,6 +321,47 @@ Connect the Tracy profiler GUI to the device. You should see named spans for
 each pipeline stage: `valid_mask`, `ground_filter`, `clustering`, `relabel`,
 `publish`.
 
+#### 9. Sensor Timestamp Mode
+
+```bash
+# Ouster with PTP time sync
+SENSOR_TYPE=ouster TIME_SYNC=ptp-1588 TIME_SOURCE=sensor \
+  TARGET=os-122122000149.local \
+  ./target/release/edgefirst-lidarpub
+```
+
+Verify:
+- Published timestamps on `rt/lidar/points` reflect the sensor's PTP-synchronized
+  time, not the host's wall clock
+- If the sensor clock is out of sync, a rate-limited warning appears:
+  `sensor timestamp failed validation, using host time`
+- Compare with `TIME_SOURCE=host` to confirm timestamps differ when PTP is active
+
+```bash
+# Robosense with sensor timestamps
+SENSOR_TYPE=robosense TIME_SOURCE=sensor \
+  ./target/release/edgefirst-lidarpub
+```
+
+Verify: Timestamps from the E1R MSOP header are used (if the sensor clock is
+reasonable). Check the first-frame `timestamp=` trace log.
+
+#### 10. Timestamp Offset
+
+```bash
+# Apply 5ms offset to compensate for sensor-to-host latency
+SENSOR_TYPE=robosense TIMESTAMP_OFFSET=5000000 \
+  ./target/release/edgefirst-lidarpub
+```
+
+Verify:
+- Published timestamps are approximately 5ms earlier than the host wall clock
+- Compare timestamps with and without the offset using `z_sub`:
+  ```bash
+  z_sub -k "rt/lidar/points"
+  ```
+- The offset should be consistent across all frames
+
 ### On-Target Deployment Testing
 
 For testing on the Maivin (aarch64 Torizon):

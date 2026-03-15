@@ -1,7 +1,7 @@
 # EdgeFirst LiDAR Publisher - Architecture Documentation
 
-**Version:** 2.1
-**Last Updated:** 2026-02-27
+**Version:** 2.2
+**Last Updated:** 2026-03-13
 **Project:** EdgeFirst LiDAR Publisher  
 **License:** Apache-2.0
 
@@ -235,7 +235,9 @@ graph LR
 | `TARGET` | String | (optional) | Sensor IP, hostname, or pcap file |
 | `--azimuth` | Vec<u32> | `0 360` | FOV start/stop degrees (Ouster) |
 | `--lidar-mode` | String | `1024x10` | Column×Hz configuration (Ouster) |
-| `--timestamp-mode` | Enum | `internal` | Timestamp source (Ouster) |
+| `--time-sync` | Enum | `internal` | Ouster sensor clock source (internal, sync-pulse, ptp-1588) |
+| `--time-source` | Enum | `host` | Timestamp source: `host` (wall clock) or `sensor` (packet time) |
+| `--timestamp-offset` | i64 | `0` | Nanosecond offset subtracted from frame timestamps |
 | `--msop-port` | u16 | `6699` | MSOP UDP port (Robosense) |
 | `--difop-port` | u16 | `7788` | DIFOP UDP port (Robosense) |
 | `--include-noisy` | bool | `false` | Include noisy points (Robosense) |
@@ -443,6 +445,40 @@ graph TD
 - Published at 1Hz
 - Static transform from base_link to lidar frame
 - Configurable via `--tf-vec` and `--tf-quat` args
+
+### Timestamp Management
+
+All published timestamps use `CLOCK_REALTIME` (wall-clock time) via Rust's `SystemTime::now()`,
+which is the correct clock for ROS2 `builtin_interfaces/Time` messages.
+
+**Time Sources (`--time-source`):**
+
+| Mode | Behavior |
+|------|----------|
+| `host` (default) | `SystemTime::now()` captured at the first UDP packet of each new frame |
+| `sensor` | Sensor packet timestamp, sanity-checked against host clock |
+
+**Sensor Timestamp Validation (sensor mode only):**
+1. Must be in the past: `sensor_time <= host_time`
+2. Must be recent: `host_time - sensor_time <= frame_period / 2`
+3. On failure: warn (rate-limited to 1 per 100 frames), fall back to host time
+
+**Frame rate for validation threshold:**
+- Ouster: parsed from `lidar_mode` metadata (e.g. 10Hz → 50ms threshold)
+- Robosense E1R: hardcoded 10Hz → 50ms threshold
+
+**Timestamp Offset (`--timestamp-offset`):**
+Signed nanosecond value subtracted from the final timestamp. Compensates for
+sensor-to-host packet latency. Default 0 (disabled).
+
+**Per-message timestamp origins:**
+
+| Message | Timestamp Source |
+|---------|-----------------|
+| `{topic}/points` (PointCloud2) | Frame timestamp (time source + offset) |
+| `{topic}/clusters` (PointCloud2) | Inherited from source frame (identical) |
+| `{topic}/imu` (IMU) | `SystemTime::now()` at publish time |
+| `rt/tf_static` (TransformStamped) | `SystemTime::now()` at publish time |
 
 ---
 

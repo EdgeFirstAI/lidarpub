@@ -510,6 +510,7 @@ examples/
 - `Args` struct with clap derive macros
 - Sensor type selection (`ouster`, `robosense`)
 - Clustering parameters, ground filter, topic names
+- Timestamp parameters: `--time-sync`, `--time-source`, `--timestamp-offset`
 - Environment variable support for all arguments
 
 ### Build and Deployment
@@ -620,7 +621,9 @@ pipeline avg over 100 frames (24967 pts): valid=0.2ms ground=9.3ms cluster=13.2m
 - UDP ports: 7502 (data), 7503 (IMU)
 - Network: Gigabit Ethernet (static IP recommended: 192.168.1.x)
 - HTTP API: Sensor configuration, metadata, calibration
-- Timestamp modes: Internal OSC, Sync pulse, PTP
+- Time sync modes (`--time-sync`): Internal OSC, Sync pulse, PTP-1588
+- Timestamp source (`--time-source`): `host` (CLOCK_REALTIME) or `sensor` (packet timestamp with validation)
+- Timestamp offset (`--timestamp-offset`): Nanosecond correction for capture-to-arrival latency
 - Packets are IP-fragmented on standard MTU networks
 
 **Robosense E1R LiDAR:**
