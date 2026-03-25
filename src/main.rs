@@ -39,7 +39,7 @@ use std::{
     net::TcpStream,
     sync::{Arc, Mutex},
     thread::sleep,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 
 use tokio::net::UdpSocket;
@@ -304,16 +304,13 @@ async fn run_robosense(session: Session, args: Args) -> Result<(), Box<dyn std::
                         }
                     }
 
-                    // Publish IMU data if present
-                    if let Some(imu) = &info.imu {
-                        let now = SystemTime::now()
-                            .duration_since(SystemTime::UNIX_EPOCH)
-                            .unwrap();
-                        let timestamp = Time::from_nanos(now.as_nanos() as u64);
-
+                    // Publish IMU data if present and wall-clock stamp available
+                    if let Some(imu) = &info.imu
+                        && let Some(stamp) = get_stamp()
+                    {
                         let msg = IMU {
                             header: Header {
-                                stamp: timestamp,
+                                stamp,
                                 frame_id: imu_frame_id.clone(),
                             },
                             orientation: Quaternion {
@@ -765,8 +762,28 @@ async fn run_lidar_loop<D: LidarDriver, F: lidar::LidarFrameWriter + LidarFrame>
     }
 }
 
-/// Format point cloud data into a PointCloud2 message.
+/// Gets the current wall-clock timestamp for message headers.
 ///
+/// On Y2038 overflow, logs a warning and returns a saturated timestamp so
+/// data continues publishing. Returns `None` only if the system clock is
+/// before the Unix epoch (unrecoverable).
+fn get_stamp() -> Option<Time> {
+    match lidar::timestamp() {
+        Ok(ns) => Some(Time::from_nanos(ns)),
+        Err(lidar::Error::TimestampOverflow) => {
+            warn!("Timestamp overflow: system clock exceeds i32 range (Y2038), saturating");
+            Some(Time {
+                sec: i32::MAX,
+                nanosec: 999_999_999,
+            })
+        }
+        Err(e) => {
+            warn!("Failed to get timestamp: {}", e);
+            None
+        }
+    }
+}
+
 /// Uses the shared SIMD formatters from the formats module.
 #[inline(never)]
 fn format_points<F: LidarFrame>(
@@ -826,14 +843,14 @@ async fn tf_static_loop(session: Session, args: Args) {
         .await
         .unwrap();
 
-    let timestamp = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap();
-    let timestamp = Time::from_nanos(timestamp.as_nanos() as u64);
+    let stamp = get_stamp().unwrap_or_else(|| {
+        warn!("tf_static: system clock unavailable, using epoch-zero timestamp");
+        Time { sec: 0, nanosec: 0 }
+    });
     let msg = TransformStamped {
         header: Header {
             frame_id: args.base_frame_id.clone(),
-            stamp: timestamp,
+            stamp,
         },
         child_frame_id: args.frame_id.clone(),
         transform: Transform {
