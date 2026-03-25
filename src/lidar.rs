@@ -186,8 +186,10 @@ pub enum Error {
     InvalidPacket(String),
     /// Buffer overflow (too many points for buffer capacity)
     BufferOverflow,
-    /// System time error
+    /// System time error (clock before Unix epoch)
     SystemTime(std::time::SystemTimeError),
+    /// System clock seconds exceed i32 range (Y2038)
+    TimestampOverflow,
     /// Shape error from ndarray operations
     Shape(ndarray::ShapeError),
     /// Unsupported data format
@@ -214,7 +216,8 @@ impl fmt::Display for Error {
             Error::Io(err) => write!(f, "I/O error: {}", err),
             Error::InvalidPacket(msg) => write!(f, "invalid packet: {}", msg),
             Error::BufferOverflow => write!(f, "buffer overflow"),
-            Error::SystemTime(err) => write!(f, "system time error: {}", err),
+            Error::SystemTime(err) => write!(f, "system clock before Unix epoch: {}", err),
+            Error::TimestampOverflow => write!(f, "system clock seconds exceed i32 range"),
             Error::Shape(err) => write!(f, "shape error: {}", err),
             Error::UnsupportedFormat(format) => write!(f, "unsupported format: {}", format),
             Error::UnexpectedEnd(len) => write!(f, "unexpected end of data at {} bytes", len),
@@ -295,27 +298,67 @@ pub trait LidarDriver: Send {
     fn process<F: LidarFrameWriter>(&mut self, frame: &mut F, data: &[u8]) -> Result<bool, Error>;
 }
 
-/// Get current timestamp in nanoseconds.
+/// Gets the current wall-clock timestamp in nanoseconds.
 ///
-/// On Linux, uses `CLOCK_MONOTONIC_RAW` for best accuracy.
-/// On other platforms, falls back to `SystemTime`.
-#[cfg(target_os = "linux")]
+/// Uses `SystemTime` (backed by `CLOCK_REALTIME` on Linux) for ROS 2
+/// compatible Header stamps. Wall-clock time is required across all
+/// EdgeFirst services to enable temporal synchronization in downstream
+/// consumers (fusion, webui, rosbag correlation).
+///
+/// Returns an error if the system clock is before the Unix epoch or
+/// if seconds exceed the `i32` range used by `builtin_interfaces::Time`
+/// (Y2038 overflow).
 pub fn timestamp() -> Result<u64, Error> {
-    let mut tp = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    let err = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, &mut tp) };
-    if err != 0 {
-        return Err(std::io::Error::last_os_error().into());
+    let duration = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(Error::SystemTime)?;
+
+    let secs = duration.as_secs();
+    if secs > i32::MAX as u64 {
+        return Err(Error::TimestampOverflow);
     }
 
-    Ok(tp.tv_sec as u64 * 1_000_000_000 + tp.tv_nsec as u64)
+    Ok(duration.as_nanos() as u64)
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn timestamp() -> Result<u64, Error> {
-    let now = std::time::SystemTime::now();
-    let duration = now.duration_since(std::time::UNIX_EPOCH)?;
-    Ok(duration.as_nanos() as u64)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_timestamp_matches_system_time() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let before = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        let ns = timestamp().unwrap();
+        let after = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+
+        // Timestamp should fall between the two SystemTime samples
+        assert!(ns >= before.as_nanos() as u64);
+        assert!(ns <= after.as_nanos() as u64);
+    }
+
+    #[test]
+    fn test_timestamp_consecutive_calls_valid() {
+        let ns1 = timestamp().unwrap();
+        let ns2 = timestamp().unwrap();
+
+        // Both should be post-epoch (non-zero)
+        assert!(ns1 > 0);
+        assert!(ns2 > 0);
+
+        // Second call should be >= first in practice (NTP step-backs are
+        // theoretically possible but not between consecutive calls)
+        assert!(ns2 >= ns1);
+    }
+
+    #[test]
+    fn test_timestamp_nanoseconds_in_valid_range() {
+        let ns = timestamp().unwrap();
+
+        // Seconds component should be reasonable (after 2020, before 2038)
+        let secs = ns / 1_000_000_000;
+        assert!(secs > 1_577_836_800, "timestamp before 2020-01-01");
+        assert!(secs <= i32::MAX as u64, "timestamp exceeds i32::MAX");
+    }
 }

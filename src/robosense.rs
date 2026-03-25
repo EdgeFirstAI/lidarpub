@@ -570,7 +570,10 @@ impl LidarDriver for RobosenseDriver {
         // so this packet is the first data packet of the new frame.
         if self.needs_reset {
             frame.reset();
-            let ts = timestamp().unwrap_or(header.timestamp_ns);
+            let ts = timestamp().unwrap_or_else(|e| {
+                tracing::warn!("wall-clock timestamp failed ({e}), using sensor timestamp");
+                header.timestamp_ns
+            });
             frame.set_timestamp(ts);
             frame.set_frame_id(self.frame_id);
             self.needs_reset = false;
@@ -590,7 +593,10 @@ impl LidarDriver for RobosenseDriver {
             // Start new frame if at boundary (first packet case)
             if is_boundary {
                 frame.reset();
-                let ts = timestamp().unwrap_or(header.timestamp_ns);
+                let ts = timestamp().unwrap_or_else(|e| {
+                    tracing::warn!("wall-clock timestamp failed ({e}), using sensor timestamp");
+                    header.timestamp_ns
+                });
                 frame.set_timestamp(ts);
                 frame.set_frame_id(self.frame_id);
             }
