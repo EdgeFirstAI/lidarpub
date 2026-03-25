@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.1] - 2026-03-25
+
+### Fixed
+- Use wall-clock time (`CLOCK_REALTIME`) for all ROS 2 Header timestamps instead
+  of `CLOCK_MONOTONIC_RAW`, enabling temporal synchronization across EdgeFirst
+  services (fusion, webui, rosbag correlation) (EDGEAI-1131)
+- Add Y2038 overflow guard for `builtin_interfaces::Time` (sec is `i32`)
+- Add warning logs when Robosense driver falls back to sensor-domain timestamps
+- Fix IMU publish path skipping DIFOP bookkeeping on timestamp failure
+
 ## [2.2.0] - 2026-03-02
 
 ### Added
