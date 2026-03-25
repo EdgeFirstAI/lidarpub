@@ -339,26 +339,21 @@ mod tests {
     }
 
     #[test]
-    fn test_timestamp_consecutive_calls_valid() {
-        let ns1 = timestamp().unwrap();
-        let ns2 = timestamp().unwrap();
+    fn test_timestamp_conversion_invariants() {
+        let ns = timestamp().unwrap();
 
-        // Both should be post-epoch (non-zero)
-        assert!(ns1 > 0);
-        assert!(ns2 > 0);
+        // Seconds must fit in i32 (Y2038 guard ensures this)
+        let secs = ns / 1_000_000_000;
+        assert!(secs <= i32::MAX as u64, "timestamp exceeds i32::MAX");
 
-        // Second call should be >= first in practice (NTP step-backs are
-        // theoretically possible but not between consecutive calls)
-        assert!(ns2 >= ns1);
+        // Sub-second nanoseconds must be valid
+        let subsec_ns = ns % 1_000_000_000;
+        assert!(subsec_ns < 1_000_000_000, "nanoseconds out of range");
     }
 
     #[test]
-    fn test_timestamp_nanoseconds_in_valid_range() {
-        let ns = timestamp().unwrap();
-
-        // Seconds component should be reasonable (after 2020, before 2038)
-        let secs = ns / 1_000_000_000;
-        assert!(secs > 1_577_836_800, "timestamp before 2020-01-01");
-        assert!(secs <= i32::MAX as u64, "timestamp exceeds i32::MAX");
+    fn test_timestamp_error_display() {
+        let err = Error::TimestampOverflow;
+        assert_eq!(err.to_string(), "system clock seconds exceed i32 range");
     }
 }

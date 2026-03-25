@@ -304,12 +304,10 @@ async fn run_robosense(session: Session, args: Args) -> Result<(), Box<dyn std::
                         }
                     }
 
-                    // Publish IMU data if present
-                    if let Some(imu) = &info.imu {
-                        let Some(stamp) = get_stamp() else {
-                            continue;
-                        };
-
+                    // Publish IMU data if present and wall-clock stamp available
+                    if let Some(imu) = &info.imu
+                        && let Some(stamp) = get_stamp()
+                    {
                         let msg = IMU {
                             header: Header {
                                 stamp,
