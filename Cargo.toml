@@ -3,8 +3,9 @@ name = "edgefirst-lidarpub"
 description = "EdgeFirst LiDAR Publisher"
 repository = "https://github.com/EdgeFirstAI/lidarpub"
 license = "Apache-2.0"
-version = "2.2.1"
+version = "2.3.0"
 edition = "2024"
+rust-version = "1.95"
 
 [[bin]]
 name = "edgefirst-lidarpub"
@@ -38,17 +39,17 @@ profiling = [
 ]
 
 [dependencies]
-clap = { version = "4.5", features = ["derive", "env"] }
-edgefirst-schemas = "4.0"
+clap = { version = "4.6", features = ["derive", "env"] }
+edgefirst-schemas = "4.0.0"
 env_logger = "0.11"
-etherparse = { version = "0.20", optional = true }
+etherparse = { version = "0.21", optional = true }
 kanal = { git = "https://github.com/fereidani/kanal", rev = "9a4b98d" }
 libc = "0.2"
 mdns-sd = { version = "0.18", optional = true }
 log = "0.4"
 ndarray = "0.17"
 pcap-parser = { version = "0.17", optional = true }
-rerun = { version = "0.29", optional = true, features = ["clap"] }
+rerun = { version = "0.36", optional = true, features = ["clap"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1", features = [
@@ -62,13 +63,13 @@ tracing = "0.1"
 tracing-journald = "0.3"
 tracing-log = "0.2"
 tracing-subscriber = "0.3"
-tracing-tracy = { version = "0.11", default-features = false, features = [
+tracing-tracy = { version = "0.12", default-features = false, features = [
     "manual-lifetime",
     "broadcast",
     "ondemand",
     "fibers",
 ] }
-tracy-client = { version = "0.18", default-features = false, features = [
+tracy-client = { version = "0.19", default-features = false, features = [
     "manual-lifetime",
     "broadcast",
     "ondemand",
