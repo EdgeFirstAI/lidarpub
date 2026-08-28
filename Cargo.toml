@@ -75,7 +75,7 @@ tracy-client = { version = "0.18", default-features = false, features = [
     "fibers",
 ] }
 ureq = { version = "3", features = ["json"] }
-zenoh = "1.7"
+zenoh = "1.10"
 
 [profile.release]
 opt-level = 3

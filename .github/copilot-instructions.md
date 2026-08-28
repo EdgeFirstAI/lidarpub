@@ -362,7 +362,7 @@ cargo clippy -- -D warnings -W clippy::all
 
 **Key Dependencies:**
 - **tokio** (1.49+) - Async runtime with multi-thread feature
-- **zenoh** (1.7.2) - High-performance pub/sub messaging
+- **zenoh** (1.10) - High-performance pub/sub messaging
 - **edgefirst-schemas** (4.0) - ROS2 message definitions and buffer-backed CDR builders
 - **kanal** - Bounded channels for inter-thread communication
 - **ndarray** (0.17) - N-dimensional arrays for frame data

@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no longer fails when GitHub `latest` moves to a new binary
 - Cover schemas 4.0 CDR encoding (PointCloud2, Imu, TransformStamped) with
   unit tests so SonarCloud new-code coverage meets the quality gate
+- Pin the zenoh Cargo requirement to 1.10 to match the resolved crate
+- Assert axis-mirroring slice bounds and log TransformStamped encode
+  failures instead of panicking the spawned TF task
 
 ## [2.2.1] - 2026-03-25
 

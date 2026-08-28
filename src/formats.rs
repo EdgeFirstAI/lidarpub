@@ -144,7 +144,16 @@ pub fn clustered_xyz_fields() -> [PointFieldView<'static>; 5] {
 }
 
 /// Optionally negate the first `n_points` values for axis mirroring.
+///
+/// # Panics
+///
+/// Panics if `n_points` is greater than `values.len()`.
 fn mirrored(values: &[f32], n_points: usize, negate: bool) -> Cow<'_, [f32]> {
+    assert!(
+        n_points <= values.len(),
+        "n_points ({n_points}) exceeds coordinate slice length ({})",
+        values.len()
+    );
     if negate {
         Cow::Owned(values[..n_points].iter().map(|v| -v).collect())
     } else {
@@ -906,6 +915,27 @@ mod tests {
         let z0 = f32::from_le_bytes(pc.data()[8..12].try_into().unwrap());
         assert_eq!(y0, -2.0);
         assert_eq!(z0, -3.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "n_points (2) exceeds coordinate slice length (1)")]
+    fn test_mirrored_rejects_short_slice() {
+        let x = [1.0f32, 2.0];
+        let y = [10.0f32];
+        let z = [100.0f32, 200.0];
+        let intensity = [128u8, 64];
+        let stamp = Time { sec: 0, nanosec: 0 };
+        let _ = encode_xyzr_pointcloud2_cdr(
+            &x,
+            &y,
+            &z,
+            &intensity,
+            2,
+            stamp,
+            "lidar".to_string(),
+            true,
+            false,
+        );
     }
 
     #[test]

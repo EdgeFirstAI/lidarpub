@@ -811,7 +811,7 @@ async fn tf_static_loop(session: Session, args: Args) {
         warn!("tf_static: system clock unavailable, using epoch-zero timestamp");
         Time { sec: 0, nanosec: 0 }
     });
-    let cdr = encode_transform_stamped_cdr(
+    let cdr = match encode_transform_stamped_cdr(
         stamp,
         args.base_frame_id.as_str(),
         args.frame_id.as_str(),
@@ -826,8 +826,13 @@ async fn tf_static_loop(session: Session, args: Args) {
             z: args.tf_quat[2],
             w: args.tf_quat[3],
         },
-    )
-    .expect("TransformStamped encode");
+    ) {
+        Ok(cdr) => cdr,
+        Err(e) => {
+            error!("TransformStamped encode failed: {e}");
+            return;
+        }
+    };
 
     let msg = ZBytes::from(cdr);
     let enc = Encoding::APPLICATION_CDR.with_schema("geometry_msgs/msg/TransformStamped");
