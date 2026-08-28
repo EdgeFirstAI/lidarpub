@@ -13,9 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `TransformStamped::builder()`) instead of `serde_cdr` struct serialization
 - Point field descriptors use `PointFieldView` (borrowed names) instead of
   owned `PointField`
-- Updated dependencies, including edgefirst-schemas 4.0, zenoh 1.10,
-  clap 4.6, criterion 0.8, etherparse 0.21, rerun 0.36, and Tracy 0.12/0.19.
-  MSRV is 1.95. Package version is 2.3.0.
+- Document that sensor scan rate is `LIDAR_MODE` and Zenoh participant
+  mode is `MODE` in `lidarpub.default`
 
 ### Fixed
 - Pin CycloneDX CLI to v0.33.1 with a matching SHA256 so the SBOM workflow
