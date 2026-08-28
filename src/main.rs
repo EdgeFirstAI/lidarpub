@@ -24,10 +24,9 @@ use clap::Parser as _;
 use cluster_thread::cluster_thread;
 use edgefirst_schemas::{
     builtin_interfaces::Time,
+    cdr::CdrError,
     geometry_msgs::{Quaternion, Transform, TransformStamped, Vector3},
-    sensor_msgs::{IMU, PointCloud2},
-    serde_cdr,
-    std_msgs::Header,
+    sensor_msgs::{Imu, PointCloud2},
 };
 use formats::{format_points_13byte, standard_xyz_intensity_fields};
 use lidar::{LidarDriver, LidarFrame, SensorType};
@@ -308,38 +307,39 @@ async fn run_robosense(session: Session, args: Args) -> Result<(), Box<dyn std::
                     if let Some(imu) = &info.imu
                         && let Some(stamp) = get_stamp()
                     {
-                        let msg = IMU {
-                            header: Header {
-                                stamp,
-                                frame_id: imu_frame_id.clone(),
-                            },
-                            orientation: Quaternion {
+                        match Imu::builder()
+                            .stamp(stamp)
+                            .frame_id(imu_frame_id.as_str())
+                            .orientation(Quaternion {
                                 x: 0.0,
                                 y: 0.0,
                                 z: 0.0,
                                 w: 1.0,
-                            },
-                            orientation_covariance: [0.0; 9],
-                            angular_velocity: Vector3 {
+                            })
+                            .orientation_covariance([0.0; 9])
+                            .angular_velocity(Vector3 {
                                 x: imu.gyro_x as f64,
                                 y: imu.gyro_y as f64,
                                 z: imu.gyro_z as f64,
-                            },
-                            angular_velocity_covariance: [0.0; 9],
-                            linear_acceleration: Vector3 {
+                            })
+                            .angular_velocity_covariance([0.0; 9])
+                            .linear_acceleration(Vector3 {
                                 x: imu.accel_x as f64,
                                 y: imu.accel_y as f64,
                                 z: imu.accel_z as f64,
-                            },
-                            linear_acceleration_covariance: [0.0; 9],
-                        };
-
-                        if let Ok(bytes) = serde_cdr::serialize(&msg) {
-                            let zbytes = ZBytes::from(bytes);
-                            let enc = Encoding::APPLICATION_CDR.with_schema("sensor_msgs/msg/Imu");
-                            if let Err(e) = imu_publisher.put(zbytes).encoding(enc).await {
-                                debug!("IMU publish error: {:?}", e);
+                            })
+                            .linear_acceleration_covariance([0.0; 9])
+                            .build()
+                        {
+                            Ok(msg) => {
+                                let zbytes = ZBytes::from(msg.into_cdr());
+                                let enc =
+                                    Encoding::APPLICATION_CDR.with_schema("sensor_msgs/msg/Imu");
+                                if let Err(e) = imu_publisher.put(zbytes).encoding(enc).await {
+                                    debug!("IMU publish error: {:?}", e);
+                                }
                             }
+                            Err(e) => debug!("IMU encode error: {:?}", e),
                         }
                     }
 
@@ -734,7 +734,7 @@ async fn run_lidar_loop<D: LidarDriver, F: lidar::LidarFrameWriter + LidarFrame>
                     } else {
                         None
                     };
-                    let _ = tx_cluster.send((ranges, points, timestamp.clone(), imu_accel));
+                    let _ = tx_cluster.send((ranges, points, timestamp, imu_accel));
                 }
 
                 // Format and publish point cloud
@@ -792,7 +792,7 @@ fn format_points<F: LidarFrame>(
     frame_id: String,
     mirror_y: bool,
     mirror_z: bool,
-) -> Result<(ZBytes, Encoding), serde_cdr::Error> {
+) -> Result<(ZBytes, Encoding), CdrError> {
     let fields = standard_xyz_intensity_fields();
     let n_points = frame.len();
 
@@ -814,25 +814,23 @@ fn format_points<F: LidarFrame>(
     // Use the shared SIMD formatter
     let data = format_points_13byte(frame.x(), y, z, frame.intensity(), n_points);
 
-    let msg = PointCloud2 {
-        header: Header {
-            stamp: timestamp,
-            frame_id,
-        },
-        height: 1,
-        width: n_points as u32,
-        fields,
-        is_bigendian: false,
-        point_step: 13,
-        row_step: 13 * n_points as u32,
-        data,
-        is_dense: true,
-    };
+    let msg = PointCloud2::builder()
+        .stamp(timestamp)
+        .frame_id(frame_id)
+        .height(1)
+        .width(n_points as u32)
+        .fields(&fields)
+        .is_bigendian(false)
+        .point_step(13)
+        .row_step(13 * n_points as u32)
+        .data(&data)
+        .is_dense(true)
+        .build()?;
 
-    let msg = ZBytes::from(serde_cdr::serialize(&msg)?);
+    let zbytes = ZBytes::from(msg.into_cdr());
     let enc = Encoding::APPLICATION_CDR.with_schema("sensor_msgs/msg/PointCloud2");
 
-    Ok((msg, enc))
+    Ok((zbytes, enc))
 }
 
 async fn tf_static_loop(session: Session, args: Args) {
@@ -847,13 +845,11 @@ async fn tf_static_loop(session: Session, args: Args) {
         warn!("tf_static: system clock unavailable, using epoch-zero timestamp");
         Time { sec: 0, nanosec: 0 }
     });
-    let msg = TransformStamped {
-        header: Header {
-            frame_id: args.base_frame_id.clone(),
-            stamp,
-        },
-        child_frame_id: args.frame_id.clone(),
-        transform: Transform {
+    let msg = TransformStamped::builder()
+        .stamp(stamp)
+        .frame_id(args.base_frame_id.as_str())
+        .child_frame_id(args.frame_id.as_str())
+        .transform(Transform {
             translation: Vector3 {
                 x: args.tf_vec[0],
                 y: args.tf_vec[1],
@@ -865,10 +861,11 @@ async fn tf_static_loop(session: Session, args: Args) {
                 z: args.tf_quat[2],
                 w: args.tf_quat[3],
             },
-        },
-    };
+        })
+        .build()
+        .expect("TransformStamped encode");
 
-    let msg = ZBytes::from(serde_cdr::serialize(&msg).unwrap());
+    let msg = ZBytes::from(msg.into_cdr());
     let enc = Encoding::APPLICATION_CDR.with_schema("geometry_msgs/msg/TransformStamped");
 
     let interval = Duration::from_secs(1);

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Migrated to **edgefirst-schemas 4.0**: CDR encoding now uses buffer-backed
+  builders (`PointCloud2::builder()`, `Imu::builder()`,
+  `TransformStamped::builder()`) instead of `serde_cdr` struct serialization
+- Point field descriptors use `PointFieldView` (borrowed names) instead of
+  owned `PointField`
+- Updated dependencies, including edgefirst-schemas 4.0, zenoh 1.10,
+  clap 4.6, criterion 0.8, and etherparse 0.20
+
 ## [2.2.1] - 2026-03-25
 
 ### Fixed

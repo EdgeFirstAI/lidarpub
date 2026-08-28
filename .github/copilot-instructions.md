@@ -363,7 +363,7 @@ cargo clippy -- -D warnings -W clippy::all
 **Key Dependencies:**
 - **tokio** (1.49+) - Async runtime with multi-thread feature
 - **zenoh** (1.7.2) - High-performance pub/sub messaging
-- **edgefirst-schemas** (1.5.5) - ROS2 message definitions and CDR serialization
+- **edgefirst-schemas** (4.0) - ROS2 message definitions and buffer-backed CDR builders
 - **kanal** - Bounded channels for inter-thread communication
 - **ndarray** (0.17) - N-dimensional arrays for frame data
 - **clap** (4.5) - CLI argument parsing with derive and env features
@@ -655,7 +655,7 @@ pipeline avg over 100 frames (24967 pts): valid=0.2ms ground=9.3ms cluster=13.2m
 - Use CLI argument `--lidar-topic` to customize prefix
 
 **Message Serialization:**
-- Use `edgefirst_schemas::serde_cdr` for ROS2 Common Data Representation
+- Use `Type::builder()` from `edgefirst-schemas` 4.0 (no `serde_cdr`)
 - Schemas from `edgefirst-schemas` crate (sensor_msgs, geometry_msgs)
 - PointCloud2: 13 bytes/point unclustered, 17 bytes/point clustered
 
@@ -716,7 +716,7 @@ pipeline avg over 100 frames (24967 pts): valid=0.2ms ground=9.3ms cluster=13.2m
 - Assuming nightly Rust (project uses stable; nightly only for portable_simd on non-aarch64)
 - Using old binary name `lidarpub` (correct name: `edgefirst-lidarpub`)
 - Using `cross` for cross-compilation (use `cargo-zigbuild` instead)
-- Referencing `cdr` crate directly (use `edgefirst_schemas::serde_cdr`)
+- Referencing `serde_cdr` or constructing buffer-backed messages with struct literals (use `Type::builder()`)
 
 **Review Checklist:**
 - [ ] Code compiles: `cargo check`

@@ -10,9 +10,7 @@ use edgefirst_lidarpub::cluster::{
     CLUSTER_ID_FIRST, CLUSTER_ID_GROUND, ClusterData, VoxelClusterData, cluster_, voxel_cluster,
 };
 use edgefirst_lidarpub::ground::GroundFilter;
-use edgefirst_schemas::{
-    builtin_interfaces::Time, sensor_msgs::PointCloud2, serde_cdr, std_msgs::Header,
-};
+use edgefirst_schemas::{builtin_interfaces::Time, cdr::CdrError, sensor_msgs::PointCloud2};
 use kanal::Receiver;
 use std::time::Instant;
 use tracing::{error, info, info_span, instrument};
@@ -245,7 +243,7 @@ fn format_points_clustered(
     frame_id: String,
     mirror_y: bool,
     mirror_z: bool,
-) -> Result<(ZBytes, Encoding), serde_cdr::Error> {
+) -> Result<(ZBytes, Encoding), CdrError> {
     let fields = clustered_xyz_fields();
 
     let y_neg: Vec<f32>;
@@ -266,23 +264,21 @@ fn format_points_clustered(
     // Use the shared SIMD formatter from formats module
     let data = format_clustered_17byte(&points.x, y, z, cluster_ids, &points.intensity, n_points);
 
-    let msg = PointCloud2 {
-        header: Header {
-            stamp: timestamp,
-            frame_id,
-        },
-        height: 1,
-        width: n_points as u32,
-        fields,
-        is_bigendian: false,
-        point_step: 17,
-        row_step: 17 * n_points as u32,
-        data,
-        is_dense: true,
-    };
+    let msg = PointCloud2::builder()
+        .stamp(timestamp)
+        .frame_id(frame_id)
+        .height(1)
+        .width(n_points as u32)
+        .fields(&fields)
+        .is_bigendian(false)
+        .point_step(17)
+        .row_step(17 * n_points as u32)
+        .data(&data)
+        .is_dense(true)
+        .build()?;
 
-    let msg = ZBytes::from(serde_cdr::serialize(&msg)?);
+    let zbytes = ZBytes::from(msg.into_cdr());
     let enc = Encoding::APPLICATION_CDR.with_schema("sensor_msgs/msg/PointCloud2");
 
-    Ok((msg, enc))
+    Ok((zbytes, enc))
 }

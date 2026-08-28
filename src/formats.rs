@@ -36,7 +36,7 @@ use std::simd::{Simd, ToBytes as _};
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
 
-use edgefirst_schemas::sensor_msgs::PointField;
+use edgefirst_schemas::sensor_msgs::PointFieldView;
 
 /// Point field data types for PointCloud2 messages.
 ///
@@ -59,33 +59,33 @@ pub enum PointFieldType {
 
 /// Build the standard XYZ + intensity point fields (13-byte stride).
 ///
-/// Returns a vector of PointField definitions for:
+/// Returns PointFieldView definitions for:
 /// - x: FLOAT32 at offset 0
 /// - y: FLOAT32 at offset 4
 /// - z: FLOAT32 at offset 8
 /// - reflect: UINT8 at offset 12
-pub fn standard_xyz_intensity_fields() -> Vec<PointField> {
-    vec![
-        PointField {
-            name: String::from("x"),
+pub fn standard_xyz_intensity_fields() -> [PointFieldView<'static>; 4] {
+    [
+        PointFieldView {
+            name: "x",
             offset: 0,
             datatype: PointFieldType::FLOAT32 as u8,
             count: 1,
         },
-        PointField {
-            name: String::from("y"),
+        PointFieldView {
+            name: "y",
             offset: 4,
             datatype: PointFieldType::FLOAT32 as u8,
             count: 1,
         },
-        PointField {
-            name: String::from("z"),
+        PointFieldView {
+            name: "z",
             offset: 8,
             datatype: PointFieldType::FLOAT32 as u8,
             count: 1,
         },
-        PointField {
-            name: String::from("reflect"),
+        PointFieldView {
+            name: "reflect",
             offset: 12,
             datatype: PointFieldType::UINT8 as u8,
             count: 1,
@@ -95,40 +95,40 @@ pub fn standard_xyz_intensity_fields() -> Vec<PointField> {
 
 /// Build the clustered point fields (17-byte stride).
 ///
-/// Returns a vector of PointField definitions for:
+/// Returns PointFieldView definitions for:
 /// - x: FLOAT32 at offset 0
 /// - y: FLOAT32 at offset 4
 /// - z: FLOAT32 at offset 8
 /// - cluster_id: UINT32 at offset 12
 /// - reflect: UINT8 at offset 16
-pub fn clustered_xyz_fields() -> Vec<PointField> {
-    vec![
-        PointField {
-            name: String::from("x"),
+pub fn clustered_xyz_fields() -> [PointFieldView<'static>; 5] {
+    [
+        PointFieldView {
+            name: "x",
             offset: 0,
             datatype: PointFieldType::FLOAT32 as u8,
             count: 1,
         },
-        PointField {
-            name: String::from("y"),
+        PointFieldView {
+            name: "y",
             offset: 4,
             datatype: PointFieldType::FLOAT32 as u8,
             count: 1,
         },
-        PointField {
-            name: String::from("z"),
+        PointFieldView {
+            name: "z",
             offset: 8,
             datatype: PointFieldType::FLOAT32 as u8,
             count: 1,
         },
-        PointField {
-            name: String::from("cluster_id"),
+        PointFieldView {
+            name: "cluster_id",
             offset: 12,
             datatype: PointFieldType::UINT32 as u8,
             count: 1,
         },
-        PointField {
-            name: String::from("reflect"),
+        PointFieldView {
+            name: "reflect",
             offset: 16,
             datatype: PointFieldType::UINT8 as u8,
             count: 1,
