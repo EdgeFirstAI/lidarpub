@@ -30,13 +30,20 @@
 //! └───────┴───────┴───────┴────────────┴───────────┘
 //! ```
 
+use std::borrow::Cow;
+
 #[cfg(all(feature = "portable_simd", not(target_arch = "aarch64")))]
 use std::simd::{Simd, ToBytes as _};
 
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
 
-use edgefirst_schemas::sensor_msgs::PointFieldView;
+use edgefirst_schemas::{
+    builtin_interfaces::Time,
+    cdr::CdrError,
+    geometry_msgs::{Quaternion, Transform, TransformStamped, Vector3},
+    sensor_msgs::{Imu, PointCloud2, PointFieldView},
+};
 
 /// Point field data types for PointCloud2 messages.
 ///
@@ -134,6 +141,135 @@ pub fn clustered_xyz_fields() -> [PointFieldView<'static>; 5] {
             count: 1,
         },
     ]
+}
+
+/// Optionally negate the first `n_points` values for axis mirroring.
+fn mirrored(values: &[f32], n_points: usize, negate: bool) -> Cow<'_, [f32]> {
+    if negate {
+        Cow::Owned(values[..n_points].iter().map(|v| -v).collect())
+    } else {
+        Cow::Borrowed(&values[..n_points])
+    }
+}
+
+/// Encode XYZ+intensity points as a CDR-serialized `sensor_msgs/PointCloud2`.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_xyzr_pointcloud2_cdr(
+    x: &[f32],
+    y: &[f32],
+    z: &[f32],
+    intensity: &[u8],
+    n_points: usize,
+    timestamp: Time,
+    frame_id: String,
+    mirror_y: bool,
+    mirror_z: bool,
+) -> Result<Vec<u8>, CdrError> {
+    let fields = standard_xyz_intensity_fields();
+    let y = mirrored(y, n_points, mirror_y);
+    let z = mirrored(z, n_points, mirror_z);
+
+    let data = format_points_13byte(x, &y, &z, intensity, n_points);
+
+    let msg = PointCloud2::builder()
+        .stamp(timestamp)
+        .frame_id(frame_id)
+        .height(1)
+        .width(n_points as u32)
+        .fields(&fields)
+        .is_bigendian(false)
+        .point_step(13)
+        .row_step(13 * n_points as u32)
+        .data(&data)
+        .is_dense(true)
+        .build()?;
+
+    Ok(msg.into_cdr())
+}
+
+/// Encode clustered XYZ+cluster_id+intensity points as CDR `PointCloud2`.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_clustered_pointcloud2_cdr(
+    x: &[f32],
+    y: &[f32],
+    z: &[f32],
+    cluster_ids: &[u32],
+    intensity: &[u8],
+    n_points: usize,
+    timestamp: Time,
+    frame_id: String,
+    mirror_y: bool,
+    mirror_z: bool,
+) -> Result<Vec<u8>, CdrError> {
+    let fields = clustered_xyz_fields();
+    let y = mirrored(y, n_points, mirror_y);
+    let z = mirrored(z, n_points, mirror_z);
+
+    let data = format_clustered_17byte(x, &y, &z, cluster_ids, intensity, n_points);
+
+    let msg = PointCloud2::builder()
+        .stamp(timestamp)
+        .frame_id(frame_id)
+        .height(1)
+        .width(n_points as u32)
+        .fields(&fields)
+        .is_bigendian(false)
+        .point_step(17)
+        .row_step(17 * n_points as u32)
+        .data(&data)
+        .is_dense(true)
+        .build()?;
+
+    Ok(msg.into_cdr())
+}
+
+/// Encode an IMU sample as CDR-serialized `sensor_msgs/Imu`.
+///
+/// Orientation is identity; covariances are left unset (zeros).
+pub fn encode_imu_cdr(
+    stamp: Time,
+    frame_id: &str,
+    angular_velocity: Vector3,
+    linear_acceleration: Vector3,
+) -> Result<Vec<u8>, CdrError> {
+    let msg = Imu::builder()
+        .stamp(stamp)
+        .frame_id(frame_id)
+        .orientation(Quaternion {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            w: 1.0,
+        })
+        .orientation_covariance([0.0; 9])
+        .angular_velocity(angular_velocity)
+        .angular_velocity_covariance([0.0; 9])
+        .linear_acceleration(linear_acceleration)
+        .linear_acceleration_covariance([0.0; 9])
+        .build()?;
+
+    Ok(msg.into_cdr())
+}
+
+/// Encode a static transform as CDR-serialized `geometry_msgs/TransformStamped`.
+pub fn encode_transform_stamped_cdr(
+    stamp: Time,
+    parent_frame: &str,
+    child_frame: &str,
+    translation: Vector3,
+    rotation: Quaternion,
+) -> Result<Vec<u8>, CdrError> {
+    let msg = TransformStamped::builder()
+        .stamp(stamp)
+        .frame_id(parent_frame)
+        .child_frame_id(child_frame)
+        .transform(Transform {
+            translation,
+            rotation,
+        })
+        .build()?;
+
+    Ok(msg.into_cdr())
 }
 
 // ============================================================================
@@ -699,5 +835,165 @@ mod tests {
             buffer[offset + 3],
         ]);
         assert_eq!(x_last, 1.0);
+    }
+
+    #[test]
+    fn test_encode_xyzr_pointcloud2_cdr_roundtrip() {
+        let x = [1.0f32, 2.0];
+        let y = [10.0f32, 20.0];
+        let z = [100.0f32, 200.0];
+        let intensity = [128u8, 64];
+        let stamp = Time {
+            sec: 1,
+            nanosec: 500,
+        };
+
+        let cdr = encode_xyzr_pointcloud2_cdr(
+            &x,
+            &y,
+            &z,
+            &intensity,
+            2,
+            stamp,
+            "lidar".to_string(),
+            false,
+            false,
+        )
+        .expect("encode PointCloud2");
+        let pc = PointCloud2::from_cdr(cdr).expect("decode PointCloud2");
+
+        assert_eq!(pc.stamp(), stamp);
+        assert_eq!(pc.frame_id(), "lidar");
+        assert_eq!(pc.height(), 1);
+        assert_eq!(pc.width(), 2);
+        assert_eq!(pc.point_step(), 13);
+        assert_eq!(pc.row_step(), 26);
+        assert!(pc.is_dense());
+        assert_eq!(pc.data().len(), 26);
+        assert_eq!(pc.fields_len(), 4);
+
+        let x0 = f32::from_le_bytes(pc.data()[0..4].try_into().unwrap());
+        let y0 = f32::from_le_bytes(pc.data()[4..8].try_into().unwrap());
+        let z0 = f32::from_le_bytes(pc.data()[8..12].try_into().unwrap());
+        assert_eq!(x0, 1.0);
+        assert_eq!(y0, 10.0);
+        assert_eq!(z0, 100.0);
+        assert_eq!(pc.data()[12], 128);
+    }
+
+    #[test]
+    fn test_encode_xyzr_pointcloud2_cdr_mirrors_axes() {
+        let x = [1.0f32];
+        let y = [2.0f32];
+        let z = [3.0f32];
+        let intensity = [1u8];
+        let stamp = Time { sec: 0, nanosec: 0 };
+
+        let cdr = encode_xyzr_pointcloud2_cdr(
+            &x,
+            &y,
+            &z,
+            &intensity,
+            1,
+            stamp,
+            "lidar".to_string(),
+            true,
+            true,
+        )
+        .expect("encode mirrored PointCloud2");
+        let pc = PointCloud2::from_cdr(cdr).expect("decode PointCloud2");
+        let y0 = f32::from_le_bytes(pc.data()[4..8].try_into().unwrap());
+        let z0 = f32::from_le_bytes(pc.data()[8..12].try_into().unwrap());
+        assert_eq!(y0, -2.0);
+        assert_eq!(z0, -3.0);
+    }
+
+    #[test]
+    fn test_encode_clustered_pointcloud2_cdr_roundtrip() {
+        let x = [1.0f32, 2.0];
+        let y = [10.0f32, 20.0];
+        let z = [100.0f32, 200.0];
+        let cluster_ids = [7u32, 8];
+        let intensity = [128u8, 64];
+        let stamp = Time { sec: 2, nanosec: 0 };
+
+        let cdr = encode_clustered_pointcloud2_cdr(
+            &x,
+            &y,
+            &z,
+            &cluster_ids,
+            &intensity,
+            2,
+            stamp,
+            "cluster".to_string(),
+            false,
+            true,
+        )
+        .expect("encode clustered PointCloud2");
+        let pc = PointCloud2::from_cdr(cdr).expect("decode clustered PointCloud2");
+
+        assert_eq!(pc.frame_id(), "cluster");
+        assert_eq!(pc.width(), 2);
+        assert_eq!(pc.point_step(), 17);
+        assert_eq!(pc.fields_len(), 5);
+        assert_eq!(pc.data().len(), 34);
+
+        let y0 = f32::from_le_bytes(pc.data()[4..8].try_into().unwrap());
+        let z0 = f32::from_le_bytes(pc.data()[8..12].try_into().unwrap());
+        let id0 = u32::from_le_bytes(pc.data()[12..16].try_into().unwrap());
+        assert_eq!(y0, 10.0);
+        assert_eq!(z0, -100.0);
+        assert_eq!(id0, 7);
+        assert_eq!(pc.data()[16], 128);
+    }
+
+    #[test]
+    fn test_encode_imu_cdr_roundtrip() {
+        let stamp = Time { sec: 3, nanosec: 7 };
+        let gyro = Vector3 {
+            x: 0.1,
+            y: 0.2,
+            z: 0.3,
+        };
+        let accel = Vector3 {
+            x: 1.0,
+            y: 2.0,
+            z: 3.0,
+        };
+
+        let cdr = encode_imu_cdr(stamp, "imu", gyro, accel).expect("encode Imu");
+        let imu = Imu::from_cdr(cdr).expect("decode Imu");
+
+        assert_eq!(imu.stamp(), stamp);
+        assert_eq!(imu.frame_id(), "imu");
+        assert_eq!(imu.orientation().w, 1.0);
+        assert_eq!(imu.angular_velocity(), gyro);
+        assert_eq!(imu.linear_acceleration(), accel);
+    }
+
+    #[test]
+    fn test_encode_transform_stamped_cdr_roundtrip() {
+        let stamp = Time { sec: 4, nanosec: 0 };
+        let translation = Vector3 {
+            x: 0.1,
+            y: 0.2,
+            z: 0.3,
+        };
+        let rotation = Quaternion {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            w: 1.0,
+        };
+
+        let cdr = encode_transform_stamped_cdr(stamp, "base", "lidar", translation, rotation)
+            .expect("encode TransformStamped");
+        let tf = TransformStamped::from_cdr(cdr).expect("decode TransformStamped");
+
+        assert_eq!(tf.stamp(), stamp);
+        assert_eq!(tf.frame_id(), "base");
+        assert_eq!(tf.child_frame_id(), "lidar");
+        assert_eq!(tf.transform().translation, translation);
+        assert_eq!(tf.transform().rotation, rotation);
     }
 }
