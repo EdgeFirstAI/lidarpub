@@ -801,7 +801,7 @@ fn format_points<F: LidarFrame>(
 
 async fn tf_static_loop(session: Session, args: Args) {
     let publisher = session
-        .declare_publisher("rt/tf_static".to_string())
+        .declare_publisher("tf_static".to_string())
         .priority(Priority::Background)
         .congestion_control(CongestionControl::Drop)
         .await
@@ -846,7 +846,7 @@ async fn tf_static_loop(session: Session, args: Args) {
             .encoding(enc.clone())
             .await
             .unwrap();
-        trace!("lidarpub publishing rt/tf");
+        trace!("lidarpub publishing tf_static");
         sleep(target_time.duration_since(Instant::now()));
         target_time += interval
     }

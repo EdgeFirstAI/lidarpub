@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Set the Zenoh session namespace to the system hostname and drop the `rt/`
+  prefix from default key expressions. Wire keys are `{hostname}/lidar/…`
+  and `{hostname}/tf_static` (EDGEAI-1396).
 - Migrated to **edgefirst-schemas 4.0**: CDR encoding now uses buffer-backed
   builders (`PointCloud2::builder()`, `Imu::builder()`,
   `TransformStamped::builder()`) instead of `serde_cdr` struct serialization

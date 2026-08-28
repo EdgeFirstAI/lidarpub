@@ -161,7 +161,7 @@ The LiDAR Publisher implements an event-driven pipeline with async processing:
   - `{lidar_topic}/depth` → `sensor_msgs/msg/Image` (range image, mono16)
   - `{lidar_topic}/reflect` → `sensor_msgs/msg/Image` (reflectivity image, mono8)
   - `{lidar_topic}/clusters` → `sensor_msgs/msg/PointCloud2` (clustered points, when enabled)
-  - `rt/tf_static` → `geometry_msgs/msg/TransformStamped` (sensor transform)
+  - `tf_static` → `geometry_msgs/msg/TransformStamped` (sensor transform)
 
 **Transport:**
 - Zenoh pub/sub with configurable QoS

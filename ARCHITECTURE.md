@@ -75,7 +75,7 @@ graph TB
         Depth["/lidar/depth<br/>Image mono16"]
         Reflect["/lidar/reflect<br/>Image mono8"]
         Clusters["/lidar/clusters<br/>PointCloud2"]
-        TF["rt/tf_static<br/>TransformStamped"]
+        TF["tf_static<br/>TransformStamped"]
     end
     
     UDP --> Receiver
@@ -244,7 +244,7 @@ graph LR
 | `--tf-quat` | Vec<f64> | `0 0 0 1` | Transform rotation quaternion |
 | `--base-frame-id` | String | `base_link` | Base frame name |
 | `--frame-id` | String | `lidar` | LiDAR child frame name |
-| `--lidar-topic` | String | `rt/lidar` | Topic prefix |
+| `--lidar-topic` | String | `lidar` | Topic prefix |
 | `--rust-log` | Level | `info` | Log level |
 | `--tracy` | bool | `false` | Enable Tracy profiler |
 | `--clustering` | String | `""` | Algorithm: `""`, `dbscan`, `voxel` |
@@ -409,7 +409,7 @@ let session = zenoh::open(args.clone()).await.unwrap();
 | `/lidar/depth` | DataHigh | Drop | Real-time sensor data |
 | `/lidar/reflect` | DataHigh | Drop | Real-time sensor data |
 | `/lidar/clusters` | DataHigh | Drop | Real-time sensor data |
-| `rt/tf_static` | Background | Drop | Low-frequency broadcast |
+| `tf_static` | Background | Drop | Low-frequency broadcast |
 
 See `frame_processor()` for publisher declarations.
 
@@ -417,14 +417,14 @@ See `frame_processor()` for publisher declarations.
 
 ```mermaid
 graph TD
-    Base["Base Topic: --lidar-topic arg, default rt/lidar"]
+    Base["Base Topic: --lidar-topic arg, default lidar"]
     
     Base --> Points["/points: sensor_msgs/PointCloud2, XYZR fields"]
     Base --> Depth["/depth: sensor_msgs/Image, mono16 encoding"]
     Base --> Reflect["/reflect: sensor_msgs/Image, mono8 encoding"]
     Base --> Clusters["/clusters: sensor_msgs/PointCloud2, XYZR + cluster_id"]
     
-    Root["Root Topic: rt/"] --> TF["tf_static: geometry_msgs/TransformStamped"]
+    Root["Root Topic: hostname namespace"] --> TF["tf_static: geometry_msgs/TransformStamped"]
 ```
 
 ### CDR Serialization
