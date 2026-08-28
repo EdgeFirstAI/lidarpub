@@ -189,9 +189,11 @@ echo "[3/6] Generating dependency SBOM..."
 if [ -f "Cargo.toml" ] && cargo cyclonedx --version &> /dev/null; then
     echo "  Generating Rust dependencies with cargo cyclonedx..."
     cargo cyclonedx --format json
-    # cargo cyclonedx creates PROJECT_NAME.cdx.json
+    # cargo-cyclonedx names the file after the Cargo package, not PROJECT_NAME
     if [ -f "$PROJECT_NAME.cdx.json" ]; then
         mv "$PROJECT_NAME.cdx.json" deps-sbom.json
+    elif [ -f "edgefirst-lidarpub.cdx.json" ]; then
+        mv "edgefirst-lidarpub.cdx.json" deps-sbom.json
     fi
 fi
 

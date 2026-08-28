@@ -24,12 +24,10 @@ use clap::Parser as _;
 use cluster_thread::cluster_thread;
 use edgefirst_schemas::{
     builtin_interfaces::Time,
-    geometry_msgs::{Quaternion, Transform, TransformStamped, Vector3},
-    sensor_msgs::{IMU, PointCloud2},
-    serde_cdr,
-    std_msgs::Header,
+    cdr::CdrError,
+    geometry_msgs::{Quaternion, Vector3},
 };
-use formats::{format_points_13byte, standard_xyz_intensity_fields};
+use formats::{encode_imu_cdr, encode_transform_stamped_cdr, encode_xyzr_pointcloud2_cdr};
 use lidar::{LidarDriver, LidarFrame, SensorType};
 use ouster::{BeamIntrinsics, Config, LidarDataFormat, OusterLidarFrame, Parameters, SensorInfo};
 use robosense::{RobosenseDriver, RobosenseLidarFrame};
@@ -308,38 +306,29 @@ async fn run_robosense(session: Session, args: Args) -> Result<(), Box<dyn std::
                     if let Some(imu) = &info.imu
                         && let Some(stamp) = get_stamp()
                     {
-                        let msg = IMU {
-                            header: Header {
-                                stamp,
-                                frame_id: imu_frame_id.clone(),
-                            },
-                            orientation: Quaternion {
-                                x: 0.0,
-                                y: 0.0,
-                                z: 0.0,
-                                w: 1.0,
-                            },
-                            orientation_covariance: [0.0; 9],
-                            angular_velocity: Vector3 {
+                        match encode_imu_cdr(
+                            stamp,
+                            imu_frame_id.as_str(),
+                            Vector3 {
                                 x: imu.gyro_x as f64,
                                 y: imu.gyro_y as f64,
                                 z: imu.gyro_z as f64,
                             },
-                            angular_velocity_covariance: [0.0; 9],
-                            linear_acceleration: Vector3 {
+                            Vector3 {
                                 x: imu.accel_x as f64,
                                 y: imu.accel_y as f64,
                                 z: imu.accel_z as f64,
                             },
-                            linear_acceleration_covariance: [0.0; 9],
-                        };
-
-                        if let Ok(bytes) = serde_cdr::serialize(&msg) {
-                            let zbytes = ZBytes::from(bytes);
-                            let enc = Encoding::APPLICATION_CDR.with_schema("sensor_msgs/msg/Imu");
-                            if let Err(e) = imu_publisher.put(zbytes).encoding(enc).await {
-                                debug!("IMU publish error: {:?}", e);
+                        ) {
+                            Ok(cdr) => {
+                                let zbytes = ZBytes::from(cdr);
+                                let enc =
+                                    Encoding::APPLICATION_CDR.with_schema("sensor_msgs/msg/Imu");
+                                if let Err(e) = imu_publisher.put(zbytes).encoding(enc).await {
+                                    debug!("IMU publish error: {:?}", e);
+                                }
                             }
+                            Err(e) => debug!("IMU encode error: {:?}", e),
                         }
                     }
 
@@ -734,7 +723,7 @@ async fn run_lidar_loop<D: LidarDriver, F: lidar::LidarFrameWriter + LidarFrame>
                     } else {
                         None
                     };
-                    let _ = tx_cluster.send((ranges, points, timestamp.clone(), imu_accel));
+                    let _ = tx_cluster.send((ranges, points, timestamp, imu_accel));
                 }
 
                 // Format and publish point cloud
@@ -792,47 +781,22 @@ fn format_points<F: LidarFrame>(
     frame_id: String,
     mirror_y: bool,
     mirror_z: bool,
-) -> Result<(ZBytes, Encoding), serde_cdr::Error> {
-    let fields = standard_xyz_intensity_fields();
+) -> Result<(ZBytes, Encoding), CdrError> {
     let n_points = frame.len();
-
-    let y_neg: Vec<f32>;
-    let y: &[f32] = if mirror_y {
-        y_neg = frame.y().iter().map(|v| -v).collect();
-        &y_neg
-    } else {
-        frame.y()
-    };
-    let z_neg: Vec<f32>;
-    let z: &[f32] = if mirror_z {
-        z_neg = frame.z().iter().map(|v| -v).collect();
-        &z_neg
-    } else {
-        frame.z()
-    };
-
-    // Use the shared SIMD formatter
-    let data = format_points_13byte(frame.x(), y, z, frame.intensity(), n_points);
-
-    let msg = PointCloud2 {
-        header: Header {
-            stamp: timestamp,
-            frame_id,
-        },
-        height: 1,
-        width: n_points as u32,
-        fields,
-        is_bigendian: false,
-        point_step: 13,
-        row_step: 13 * n_points as u32,
-        data,
-        is_dense: true,
-    };
-
-    let msg = ZBytes::from(serde_cdr::serialize(&msg)?);
+    let cdr = encode_xyzr_pointcloud2_cdr(
+        frame.x(),
+        frame.y(),
+        frame.z(),
+        frame.intensity(),
+        n_points,
+        timestamp,
+        frame_id,
+        mirror_y,
+        mirror_z,
+    )?;
+    let zbytes = ZBytes::from(cdr);
     let enc = Encoding::APPLICATION_CDR.with_schema("sensor_msgs/msg/PointCloud2");
-
-    Ok((msg, enc))
+    Ok((zbytes, enc))
 }
 
 async fn tf_static_loop(session: Session, args: Args) {
@@ -847,28 +811,30 @@ async fn tf_static_loop(session: Session, args: Args) {
         warn!("tf_static: system clock unavailable, using epoch-zero timestamp");
         Time { sec: 0, nanosec: 0 }
     });
-    let msg = TransformStamped {
-        header: Header {
-            frame_id: args.base_frame_id.clone(),
-            stamp,
+    let cdr = match encode_transform_stamped_cdr(
+        stamp,
+        args.base_frame_id.as_str(),
+        args.frame_id.as_str(),
+        Vector3 {
+            x: args.tf_vec[0],
+            y: args.tf_vec[1],
+            z: args.tf_vec[2],
         },
-        child_frame_id: args.frame_id.clone(),
-        transform: Transform {
-            translation: Vector3 {
-                x: args.tf_vec[0],
-                y: args.tf_vec[1],
-                z: args.tf_vec[2],
-            },
-            rotation: Quaternion {
-                x: args.tf_quat[0],
-                y: args.tf_quat[1],
-                z: args.tf_quat[2],
-                w: args.tf_quat[3],
-            },
+        Quaternion {
+            x: args.tf_quat[0],
+            y: args.tf_quat[1],
+            z: args.tf_quat[2],
+            w: args.tf_quat[3],
         },
+    ) {
+        Ok(cdr) => cdr,
+        Err(e) => {
+            error!("TransformStamped encode failed: {e}");
+            return;
+        }
     };
 
-    let msg = ZBytes::from(serde_cdr::serialize(&msg).unwrap());
+    let msg = ZBytes::from(cdr);
     let enc = Encoding::APPLICATION_CDR.with_schema("geometry_msgs/msg/TransformStamped");
 
     let interval = Duration::from_secs(1);
@@ -883,5 +849,47 @@ async fn tf_static_loop(session: Session, args: Args) {
         trace!("lidarpub publishing rt/tf");
         sleep(target_time.duration_since(Instant::now()));
         target_time += interval
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use edgefirst_schemas::sensor_msgs::PointCloud2;
+    use lidar::LidarFrameWriter;
+
+    fn sample_frame() -> RobosenseLidarFrame {
+        let mut frame = RobosenseLidarFrame::with_capacity(4);
+        assert!(frame.push(1.0, 2.0, 3.0, 128, 3.74));
+        assert!(frame.push(4.0, 5.0, 6.0, 64, 8.77));
+        frame
+    }
+
+    #[test]
+    fn format_points_encodes_pointcloud2() {
+        let frame = sample_frame();
+        let stamp = Time { sec: 1, nanosec: 2 };
+        let (zbytes, enc) =
+            format_points(&frame, stamp, "lidar".to_string(), false, false).unwrap();
+        assert!(enc.to_string().contains("PointCloud2"));
+
+        let cdr = zbytes.to_bytes().into_owned();
+        let pc = PointCloud2::from_cdr(cdr).unwrap();
+        assert_eq!(pc.frame_id(), "lidar");
+        assert_eq!(pc.width(), 2);
+        assert_eq!(pc.point_step(), 13);
+        let y0 = f32::from_le_bytes(pc.data()[4..8].try_into().unwrap());
+        assert_eq!(y0, 2.0);
+    }
+
+    #[test]
+    fn format_points_mirrors_y() {
+        let frame = sample_frame();
+        let stamp = Time { sec: 0, nanosec: 0 };
+        let (zbytes, _) = format_points(&frame, stamp, "lidar".to_string(), true, false).unwrap();
+        let cdr = zbytes.to_bytes().into_owned();
+        let pc = PointCloud2::from_cdr(cdr).unwrap();
+        let y0 = f32::from_le_bytes(pc.data()[4..8].try_into().unwrap());
+        assert_eq!(y0, -2.0);
     }
 }

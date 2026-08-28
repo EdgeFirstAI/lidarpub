@@ -32,7 +32,7 @@ https://crates.io/crates/clap
 **edgefirst-schemas** (Apache-2.0)  
 ROS2 message type definitions (sensor_msgs, geometry_msgs) with CDR serialization  
 https://github.com/EdgeFirstAI/schemas  
-v1.5.2 - Au-Zone Technologies
+v4.0.0 - Au-Zone Technologies
 
 **env_logger** (MIT OR Apache-2.0)  
 Logging implementation for the log facade  

@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Migrated to **edgefirst-schemas 4.0**: CDR encoding now uses buffer-backed
+  builders (`PointCloud2::builder()`, `Imu::builder()`,
+  `TransformStamped::builder()`) instead of `serde_cdr` struct serialization
+- Point field descriptors use `PointFieldView` (borrowed names) instead of
+  owned `PointField`
+- Updated dependencies, including edgefirst-schemas 4.0, zenoh 1.10,
+  clap 4.6, criterion 0.8, and etherparse 0.20
+
+### Fixed
+- Pin CycloneDX CLI to v0.33.1 with a matching SHA256 so the SBOM workflow
+  no longer fails when GitHub `latest` moves to a new binary
+- Cover schemas 4.0 CDR encoding (PointCloud2, Imu, TransformStamped) with
+  unit tests so SonarCloud new-code coverage meets the quality gate
+- Pin the zenoh Cargo requirement to 1.10 to match the resolved crate
+- Assert axis-mirroring slice bounds and log TransformStamped encode
+  failures instead of panicking the spawned TF task
+
 ## [2.2.1] - 2026-03-25
 
 ### Fixed

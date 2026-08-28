@@ -1,18 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2025 Au-Zone Technologies. All Rights Reserved.
 
-use crate::{
-    Args,
-    formats::{clustered_xyz_fields, format_clustered_17byte},
-    lidar::Points,
-};
+use crate::{Args, formats::encode_clustered_pointcloud2_cdr, lidar::Points};
 use edgefirst_lidarpub::cluster::{
     CLUSTER_ID_FIRST, CLUSTER_ID_GROUND, ClusterData, VoxelClusterData, cluster_, voxel_cluster,
 };
 use edgefirst_lidarpub::ground::GroundFilter;
-use edgefirst_schemas::{
-    builtin_interfaces::Time, sensor_msgs::PointCloud2, serde_cdr, std_msgs::Header,
-};
+use edgefirst_schemas::{builtin_interfaces::Time, cdr::CdrError};
 use kanal::Receiver;
 use std::time::Instant;
 use tracing::{error, info, info_span, instrument};
@@ -245,44 +239,60 @@ fn format_points_clustered(
     frame_id: String,
     mirror_y: bool,
     mirror_z: bool,
-) -> Result<(ZBytes, Encoding), serde_cdr::Error> {
-    let fields = clustered_xyz_fields();
-
-    let y_neg: Vec<f32>;
-    let y: &[f32] = if mirror_y {
-        y_neg = points.y.iter().map(|v| -v).collect();
-        &y_neg
-    } else {
-        &points.y
-    };
-    let z_neg: Vec<f32>;
-    let z: &[f32] = if mirror_z {
-        z_neg = points.z.iter().map(|v| -v).collect();
-        &z_neg
-    } else {
-        &points.z
-    };
-
-    // Use the shared SIMD formatter from formats module
-    let data = format_clustered_17byte(&points.x, y, z, cluster_ids, &points.intensity, n_points);
-
-    let msg = PointCloud2 {
-        header: Header {
-            stamp: timestamp,
-            frame_id,
-        },
-        height: 1,
-        width: n_points as u32,
-        fields,
-        is_bigendian: false,
-        point_step: 17,
-        row_step: 17 * n_points as u32,
-        data,
-        is_dense: true,
-    };
-
-    let msg = ZBytes::from(serde_cdr::serialize(&msg)?);
+) -> Result<(ZBytes, Encoding), CdrError> {
+    let cdr = encode_clustered_pointcloud2_cdr(
+        &points.x,
+        &points.y,
+        &points.z,
+        cluster_ids,
+        &points.intensity,
+        n_points,
+        timestamp,
+        frame_id,
+        mirror_y,
+        mirror_z,
+    )?;
+    let zbytes = ZBytes::from(cdr);
     let enc = Encoding::APPLICATION_CDR.with_schema("sensor_msgs/msg/PointCloud2");
+    Ok((zbytes, enc))
+}
 
-    Ok((msg, enc))
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use edgefirst_schemas::sensor_msgs::PointCloud2;
+
+    #[test]
+    fn format_points_clustered_encodes_pointcloud2() {
+        let points = Points {
+            x: vec![1.0, 2.0],
+            y: vec![3.0, 4.0],
+            z: vec![5.0, 6.0],
+            intensity: vec![10, 20],
+        };
+        let cluster_ids = [1u32, 2];
+        let stamp = Time { sec: 9, nanosec: 1 };
+
+        let (zbytes, enc) = format_points_clustered(
+            &points,
+            &cluster_ids,
+            2,
+            stamp,
+            "cluster".to_string(),
+            true,
+            false,
+        )
+        .unwrap();
+        assert!(enc.to_string().contains("PointCloud2"));
+
+        let cdr = zbytes.to_bytes().into_owned();
+        let pc = PointCloud2::from_cdr(cdr).unwrap();
+        assert_eq!(pc.frame_id(), "cluster");
+        assert_eq!(pc.width(), 2);
+        assert_eq!(pc.point_step(), 17);
+        let y0 = f32::from_le_bytes(pc.data()[4..8].try_into().unwrap());
+        let id0 = u32::from_le_bytes(pc.data()[12..16].try_into().unwrap());
+        assert_eq!(y0, -3.0);
+        assert_eq!(id0, 1);
+    }
 }
