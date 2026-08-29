@@ -37,6 +37,7 @@ async fn drain_recv<T>(rx: &mut Receiver<T>) -> Option<T> {
 pub async fn cluster_thread(
     mut rx: Receiver<(Vec<f32>, Points, Time, Option<(f32, f32, f32)>)>,
     publ: zenoh::pubsub::Publisher<'_>,
+    session: zenoh::Session,
     args: Args,
 ) {
     let eps_m = args.clustering_eps as f32 / 1000.0;
@@ -182,7 +183,12 @@ pub async fn cluster_thread(
         let t0 = Instant::now();
         info_span!("publish")
             .in_scope(|| async {
-                match publ.put(msg).encoding(enc).await {
+                match publ
+                    .put(msg)
+                    .encoding(enc)
+                    .timestamp(session.new_timestamp())
+                    .await
+                {
                     Ok(_) => {}
                     Err(e) => error!("cluster publish error: {:?}", e),
                 }

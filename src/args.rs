@@ -243,24 +243,30 @@ mod tests {
     use super::*;
     use clap::Parser;
 
-    #[test]
-    fn zenoh_config_sets_namespace() {
-        let args = Args::parse_from(["edgefirst-lidarpub"]);
-        let cfg = Config::from(args);
-        let ns: String = serde_json::from_str(&cfg.to_string())
-            .ok()
-            .and_then(|v: serde_json::Value| {
-                v.pointer("/namespace")
-                    .and_then(|n| n.as_str().map(String::from))
-            })
-            .expect("namespace should be set in config");
-        assert!(!ns.is_empty(), "namespace should be non-empty");
-        assert!(!ns.contains('/'), "namespace must not contain '/'");
+    fn parse_cli() -> Args {
+        Args::parse_from([
+            "edgefirst-lidarpub",
+            "--lidar-topic",
+            "lidar",
+            "--rust-log",
+            "info",
+        ])
     }
 
     #[test]
-    fn default_topic_has_no_rt_prefix() {
-        let args = Args::parse_from(["edgefirst-lidarpub"]);
-        assert_eq!(args.lidar_topic, "lidar");
+    fn zenoh_config_sets_namespace() {
+        let ns = zenoh_namespace();
+        assert!(!ns.is_empty(), "namespace should be non-empty");
+        assert!(!ns.contains('/'), "namespace must not contain '/'");
+        let rendered = Config::from(parse_cli()).to_string();
+        assert!(
+            rendered.contains(&ns),
+            "config should include namespace {ns}: {rendered}"
+        );
+    }
+
+    #[test]
+    fn cli_lidar_topic_has_no_rt_prefix() {
+        assert_eq!(parse_cli().lidar_topic, "lidar");
     }
 }

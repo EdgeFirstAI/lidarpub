@@ -223,6 +223,7 @@ async fn run_robosense(session: Session, args: Args) -> Result<(), Box<dyn std::
 
     // Use oneshot channel to confirm DIFOP startup (PR #7 fix)
     let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+    let session_difop = session.clone();
 
     tokio::spawn(async move {
         let bind_addr = format!("0.0.0.0:{}", difop_port);
@@ -324,7 +325,12 @@ async fn run_robosense(session: Session, args: Args) -> Result<(), Box<dyn std::
                                 let zbytes = ZBytes::from(cdr);
                                 let enc =
                                     Encoding::APPLICATION_CDR.with_schema("sensor_msgs/msg/Imu");
-                                if let Err(e) = imu_publisher.put(zbytes).encoding(enc).await {
+                                if let Err(e) = imu_publisher
+                                    .put(zbytes)
+                                    .encoding(enc)
+                                    .timestamp(session_difop.new_timestamp())
+                                    .await
+                                {
                                     debug!("IMU publish error: {:?}", e);
                                 }
                             }
@@ -646,6 +652,7 @@ async fn run_lidar_loop<D: LidarDriver, F: lidar::LidarFrameWriter + LidarFrame>
     let (tx_cluster, rx_cluster) = kanal::bounded(8);
     if args.clustering_enabled() {
         let args_ = args.clone();
+        let session_cluster = session.clone();
         match std::thread::Builder::new()
             .name("cluster".to_string())
             .spawn(move || {
@@ -653,7 +660,12 @@ async fn run_lidar_loop<D: LidarDriver, F: lidar::LidarFrameWriter + LidarFrame>
                     .enable_all()
                     .build()
                     .expect("Failed to create clustering runtime")
-                    .block_on(cluster_thread(rx_cluster, cluster_publisher, args_));
+                    .block_on(cluster_thread(
+                        rx_cluster,
+                        cluster_publisher,
+                        session_cluster,
+                        args_,
+                    ));
             }) {
             Ok(_) => info!("Clustering thread started"),
             Err(e) => {
@@ -735,7 +747,12 @@ async fn run_lidar_loop<D: LidarDriver, F: lidar::LidarFrameWriter + LidarFrame>
                     args.mirror_z(),
                 )?;
 
-                if let Err(e) = points_publisher.put(msg).encoding(enc).await {
+                if let Err(e) = points_publisher
+                    .put(msg)
+                    .encoding(enc)
+                    .timestamp(session.new_timestamp())
+                    .await
+                {
                     error!("publish points error: {:?}", e);
                 }
 
@@ -844,11 +861,12 @@ async fn tf_static_loop(session: Session, args: Args) {
         publisher
             .put(msg.clone())
             .encoding(enc.clone())
+            .timestamp(session.new_timestamp())
             .await
             .unwrap();
         trace!("lidarpub publishing tf_static");
-        sleep(target_time.duration_since(Instant::now()));
-        target_time += interval
+        tokio::time::sleep(target_time.saturating_duration_since(Instant::now())).await;
+        target_time += interval;
     }
 }
 

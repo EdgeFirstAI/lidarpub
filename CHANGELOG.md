@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Attach a Zenoh source timestamp on published LiDAR, IMU, and `tf_static`
+  samples so the recorder can use publisher time instead of receive time.
 - Set the Zenoh session namespace to the system hostname and drop the `rt/`
   prefix from default key expressions. Wire keys are `{hostname}/lidar/…`
   and `{hostname}/tf_static` (EDGEAI-1396).
