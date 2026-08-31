@@ -7,12 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.0] - 2026-08-31
+
+### Breaking
+- Zenoh wire keys no longer use the `rt/` prefix. The session namespace is the
+  system hostname, so default topics are `{hostname}/lidar/points`,
+  `{hostname}/lidar/clusters`, and `{hostname}/tf_static`. Update subscribers,
+  recorders, and EdgeFirst Studio key expressions accordingly (EDGEAI-1396).
+
 ### Changed
 - Attach a Zenoh source timestamp on published LiDAR, IMU, and `tf_static`
   samples so the recorder can use publisher time instead of receive time.
-- Set the Zenoh session namespace to the system hostname and drop the `rt/`
-  prefix from default key expressions. Wire keys are `{hostname}/lidar/…`
-  and `{hostname}/tf_static` (EDGEAI-1396).
 - Migrated to **edgefirst-schemas 4.0**: CDR encoding now uses buffer-backed
   builders (`PointCloud2::builder()`, `Imu::builder()`,
   `TransformStamped::builder()`) instead of `serde_cdr` struct serialization

@@ -226,8 +226,8 @@ SENSOR_TYPE=robosense \
   ./target/release/edgefirst-lidarpub
 ```
 
-Verify: Zenoh topic `rt/lidar/points` receives PointCloud2 messages at the
-sensor's frame rate.
+Verify: Zenoh topic `{hostname}/lidar/points` receives PointCloud2 messages at the
+sensor's frame rate (replace `{hostname}` with the publisher's system hostname).
 
 #### 2. Voxel Clustering
 
@@ -236,7 +236,7 @@ SENSOR_TYPE=robosense CLUSTERING=voxel CLUSTERING_EPS=200 CLUSTERING_MINPTS=4 \
   ./target/release/edgefirst-lidarpub
 ```
 
-Verify: `rt/lidar/clusters` publishes clustered point clouds with cluster IDs
+Verify: `{hostname}/lidar/clusters` publishes clustered point clouds with cluster IDs
 (17 bytes/point). Pipeline timing log appears every 100 frames.
 
 #### 3. DBSCAN Clustering
@@ -364,14 +364,16 @@ ssh torizon@10.10.41.236 "cd ~ && ./lidarpub-tests --test-threads=1 --nocapture"
 ### Verifying Zenoh Output
 
 ```bash
+HOST=$(hostname)
+
 # Subscribe to all lidar topics
-z_sub -k "rt/lidar/**"
+z_sub -k "${HOST}/lidar/**"
 
 # Subscribe to point cloud only
-z_sub -k "rt/lidar/points"
+z_sub -k "${HOST}/lidar/points"
 
 # Subscribe to clustered point cloud
-z_sub -k "rt/lidar/clusters"
+z_sub -k "${HOST}/lidar/clusters"
 ```
 
 ## Troubleshooting

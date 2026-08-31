@@ -156,12 +156,13 @@ The LiDAR Publisher implements an event-driven pipeline with async processing:
 
 **Message Format:**
 - **Serialization**: CDR (Common Data Representation) for ROS2 compatibility
+- **Zenoh namespace**: System hostname (default `{lidar_topic}` is `lidar`)
 - **Published Topics**:
-  - `{lidar_topic}/points` → `sensor_msgs/msg/PointCloud2` (XYZ + reflectivity)
-  - `{lidar_topic}/depth` → `sensor_msgs/msg/Image` (range image, mono16)
-  - `{lidar_topic}/reflect` → `sensor_msgs/msg/Image` (reflectivity image, mono8)
-  - `{lidar_topic}/clusters` → `sensor_msgs/msg/PointCloud2` (clustered points, when enabled)
-  - `tf_static` → `geometry_msgs/msg/TransformStamped` (sensor transform)
+  - `{hostname}/{lidar_topic}/points` → `sensor_msgs/msg/PointCloud2` (XYZ + reflectivity)
+  - `{hostname}/{lidar_topic}/depth` → `sensor_msgs/msg/Image` (range image, mono16)
+  - `{hostname}/{lidar_topic}/reflect` → `sensor_msgs/msg/Image` (reflectivity image, mono8)
+  - `{hostname}/{lidar_topic}/clusters` → `sensor_msgs/msg/PointCloud2` (clustered points, when enabled)
+  - `{hostname}/tf_static` → `geometry_msgs/msg/TransformStamped` (sensor transform)
 
 **Transport:**
 - Zenoh pub/sub with configurable QoS
