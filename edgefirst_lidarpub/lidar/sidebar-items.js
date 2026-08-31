@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["Error","SensorType"],"fn":["timestamp"],"struct":["Points"],"trait":["LidarDriver","LidarFrame","LidarFrameWriter"]};
