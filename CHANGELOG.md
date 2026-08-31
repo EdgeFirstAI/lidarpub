@@ -22,6 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mode is `MODE` in `lidarpub.default`
 
 ### Fixed
+- Document `gethostname` in NOTICE so SBOM NOTICE validation passes
+- Split llvm-cov into an instrumented nextest run plus summary/LCOV reports
+  with a 70% line floor, and enable `sonar.tests` / `sonar.rust.lcov.reportPaths`
+- Cover hostname namespace fallbacks, Zenoh CDR publish timestamps, PCAP
+  fragment reassembly, Ouster FrameReader, E1R DIFOP, and real PCD frames
 - Pin CycloneDX CLI to v0.33.1 with a matching SHA256 so the SBOM workflow
   no longer fails when GitHub `latest` moves to a new binary
 - Cover schemas 4.0 CDR encoding (PointCloud2, Imu, TransformStamped) with

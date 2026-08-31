@@ -1115,4 +1115,65 @@ mod tests {
         assert_eq!(AlertStatus::from_flags(0x85), AlertStatus::Active(5));
         assert_eq!(AlertStatus::from_flags(0x45), AlertStatus::Overflow(5));
     }
+
+    #[test]
+    fn test_load_os1_sensor_info_json() {
+        let params = load_os1_params().expect("testdata/os1_sensor_info.json");
+        assert_eq!(params.lidar_data_format.pixels_per_column, 64);
+        assert_eq!(params.lidar_data_format.columns_per_frame, 2048);
+        assert_eq!(
+            params.lidar_data_format.udp_profile_lidar,
+            "RNG15_RFL8_NIR8"
+        );
+        assert_eq!(params.beam_intrinsics.beam_altitude_angles.len(), 64);
+        assert!(FrameReader::new(&params.lidar_data_format).is_ok());
+    }
+
+    fn load_os1_params() -> Option<Parameters> {
+        let raw = std::fs::read_to_string("testdata/os1_sensor_info.json").ok()?;
+
+        #[derive(serde::Deserialize)]
+        struct File {
+            status: String,
+            build_rev: String,
+            prod_sn: String,
+            prod_pn: String,
+            prod_line: String,
+            beam_altitude_angles: Vec<f32>,
+            beam_azimuth_angles: Vec<f32>,
+            beam_to_lidar_transform: Vec<f32>,
+            data_format: LidarDataFormat,
+        }
+
+        let f: File = serde_json::from_str(&raw).ok()?;
+        Some(Parameters {
+            sensor_info: SensorInfo {
+                status: f.status,
+                build_rev: f.build_rev,
+                prod_sn: f.prod_sn,
+                prod_pn: f.prod_pn,
+                prod_line: f.prod_line,
+            },
+            lidar_data_format: f.data_format,
+            beam_intrinsics: BeamIntrinsics {
+                beam_altitude_angles: f.beam_altitude_angles,
+                beam_azimuth_angles: f.beam_azimuth_angles,
+                beam_to_lidar_transform: f.beam_to_lidar_transform,
+            },
+        })
+    }
+
+    #[test]
+    fn test_frame_reader_rejects_unsupported_profile() {
+        let format = LidarDataFormat {
+            udp_profile_lidar: "LEGACY".into(),
+            udp_profile_imu: "LEGACY".into(),
+            columns_per_packet: 16,
+            columns_per_frame: 1024,
+            pixels_per_column: 64,
+            column_window: [0, 1023],
+            pixel_shift_by_row: vec![0; 64],
+        };
+        assert!(FrameReader::new(&format).is_err());
+    }
 }

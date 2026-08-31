@@ -607,4 +607,36 @@ mod tests {
         source.index = 3;
         assert_eq!(source.remaining(), 0);
     }
+
+    #[test]
+    fn test_os1_pcap_reassembles_fragmented_lidar_packets() {
+        let path = "testdata/os1_frames.pcap";
+        if !std::path::Path::new(path).exists() {
+            eprintln!("Skipping: {path} not found");
+            return;
+        }
+        let metadata = std::fs::metadata(path).expect("stat os1 pcap");
+        assert!(
+            metadata.len() > 10_000,
+            "{path} is {} bytes — likely a git-lfs pointer",
+            metadata.len()
+        );
+
+        let source = PcapSource::from_file(path, Some(7502)).expect("load os1 pcap");
+        assert!(
+            !source.is_empty(),
+            "os1_frames.pcap should contain lidar packets on port 7502"
+        );
+
+        let oversized = source
+            .packets
+            .iter()
+            .filter(|p| p.payload.len() > 1500)
+            .count();
+        assert!(
+            oversized > 0,
+            "expected reassembled Ouster UDP payloads larger than Ethernet MTU, got 0 of {}",
+            source.len()
+        );
+    }
 }

@@ -266,6 +266,7 @@ fn format_points_clustered(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use edgefirst_schemas::sensor_msgs::PointCloud2;
 
     #[test]
@@ -300,5 +301,101 @@ mod tests {
         let id0 = u32::from_le_bytes(pc.data()[12..16].try_into().unwrap());
         assert_eq!(y0, -3.0);
         assert_eq!(id0, 1);
+    }
+
+    type Xyzr = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<u8>);
+
+    fn load_pcd_xyzr(path: &str) -> Option<Xyzr> {
+        let data = std::fs::read(path).ok()?;
+        let header_end = data.windows(12).position(|w| w == b"DATA binary\n")? + 12;
+        let body = &data[header_end..];
+        let point_size = 13;
+        if body.len() % point_size != 0 {
+            return None;
+        }
+        let n = body.len() / point_size;
+        let mut x = Vec::with_capacity(n);
+        let mut y = Vec::with_capacity(n);
+        let mut z = Vec::with_capacity(n);
+        let mut intensity = Vec::with_capacity(n);
+        for i in 0..n {
+            let off = i * point_size;
+            x.push(f32::from_le_bytes(body[off..off + 4].try_into().ok()?));
+            y.push(f32::from_le_bytes(body[off + 4..off + 8].try_into().ok()?));
+            z.push(f32::from_le_bytes(body[off + 8..off + 12].try_into().ok()?));
+            intensity.push(body[off + 12]);
+        }
+        Some((x, y, z, intensity))
+    }
+
+    fn test_zenoh_config() -> zenoh::config::Config {
+        let mut config = zenoh::config::Config::default();
+        config
+            .insert_json5("scouting/multicast/enabled", "false")
+            .unwrap();
+        config
+            .insert_json5("listen/endpoints", r#"["tcp/127.0.0.1:0"]"#)
+            .unwrap();
+        config
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn cluster_thread_publishes_pcd_frame() {
+        let Some((x, y, z, intensity)) = load_pcd_xyzr("testdata/e1r_frame0.pcd") else {
+            eprintln!("Skipping: testdata/e1r_frame0.pcd not found");
+            return;
+        };
+        assert!(x.len() > 10_000);
+
+        let args = Args::parse_from([
+            "edgefirst-lidarpub",
+            "--clustering",
+            "voxel",
+            "--clustering-eps",
+            "256",
+            "--clustering-minpts",
+            "4",
+            "--ground-filter",
+            "true",
+            "--sensor-height",
+            "1500",
+            "--rust-log",
+            "error",
+        ]);
+
+        let session = zenoh::open(test_zenoh_config()).await.unwrap();
+        let key = format!("lidarpub/test/clusters/{}", std::process::id());
+        let subscriber = session.declare_subscriber(key.clone()).await.unwrap();
+        let publisher = session.declare_publisher(key).await.unwrap();
+
+        let (tx, rx) = kanal::bounded(2);
+        let handle = tokio::spawn(cluster_thread(rx, publisher, session.clone(), args));
+
+        let n = x.len();
+        let ranges: Vec<f32> = (0..n)
+            .map(|i| (x[i] * x[i] + y[i] * y[i] + z[i] * z[i]).sqrt())
+            .collect();
+        let points = Points { x, y, z, intensity };
+        tx.send((
+            ranges,
+            points,
+            Time { sec: 1, nanosec: 0 },
+            Some((0.0, 0.0, -9.81)),
+        ))
+        .expect("send cluster frame");
+        drop(tx);
+
+        let sample =
+            tokio::time::timeout(std::time::Duration::from_secs(30), subscriber.recv_async())
+                .await
+                .expect("timed out waiting for clustered cloud")
+                .expect("recv clustered cloud");
+        assert!(sample.timestamp().is_some());
+        let pc = PointCloud2::from_cdr(sample.payload().to_bytes().into_owned())
+            .expect("decode clustered PointCloud2");
+        assert_eq!(pc.point_step(), 17);
+        assert!(pc.width() > 10_000);
+
+        handle.await.expect("cluster_thread join");
     }
 }

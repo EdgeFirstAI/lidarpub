@@ -325,11 +325,8 @@ async fn run_robosense(session: Session, args: Args) -> Result<(), Box<dyn std::
                                 let zbytes = ZBytes::from(cdr);
                                 let enc =
                                     Encoding::APPLICATION_CDR.with_schema("sensor_msgs/msg/Imu");
-                                if let Err(e) = imu_publisher
-                                    .put(zbytes)
-                                    .encoding(enc)
-                                    .timestamp(session_difop.new_timestamp())
-                                    .await
+                                if let Err(e) =
+                                    publish_cdr(&imu_publisher, &session_difop, zbytes, enc).await
                                 {
                                     debug!("IMU publish error: {:?}", e);
                                 }
@@ -747,12 +744,7 @@ async fn run_lidar_loop<D: LidarDriver, F: lidar::LidarFrameWriter + LidarFrame>
                     args.mirror_z(),
                 )?;
 
-                if let Err(e) = points_publisher
-                    .put(msg)
-                    .encoding(enc)
-                    .timestamp(session.new_timestamp())
-                    .await
-                {
+                if let Err(e) = publish_cdr(&points_publisher, &session, msg, enc).await {
                     error!("publish points error: {:?}", e);
                 }
 
@@ -816,6 +808,20 @@ fn format_points<F: LidarFrame>(
     Ok((zbytes, enc))
 }
 
+/// Put a CDR payload with a Zenoh source timestamp from `session`.
+async fn publish_cdr(
+    publisher: &zenoh::pubsub::Publisher<'_>,
+    session: &Session,
+    payload: impl Into<ZBytes>,
+    encoding: Encoding,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    publisher
+        .put(payload)
+        .encoding(encoding)
+        .timestamp(session.new_timestamp())
+        .await
+}
+
 async fn tf_static_loop(session: Session, args: Args) {
     let publisher = session
         .declare_publisher("tf_static".to_string())
@@ -858,10 +864,7 @@ async fn tf_static_loop(session: Session, args: Args) {
     let mut target_time = Instant::now() + interval;
 
     loop {
-        publisher
-            .put(msg.clone())
-            .encoding(enc.clone())
-            .timestamp(session.new_timestamp())
+        publish_cdr(&publisher, &session, msg.clone(), enc.clone())
             .await
             .unwrap();
         trace!("lidarpub publishing tf_static");
@@ -909,5 +912,40 @@ mod tests {
         let pc = PointCloud2::from_cdr(cdr).unwrap();
         let y0 = f32::from_le_bytes(pc.data()[4..8].try_into().unwrap());
         assert_eq!(y0, -2.0);
+    }
+
+    fn test_zenoh_config() -> zenoh::Config {
+        let mut config = zenoh::Config::default();
+        config
+            .insert_json5("scouting/multicast/enabled", "false")
+            .unwrap();
+        config
+            .insert_json5("listen/endpoints", r#"["tcp/127.0.0.1:0"]"#)
+            .unwrap();
+        config
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn publish_cdr_attaches_session_timestamp() {
+        let session = zenoh::open(test_zenoh_config()).await.unwrap();
+        let key = format!("lidarpub/test/publish_cdr/{}", std::process::id());
+        let subscriber = session.declare_subscriber(key.clone()).await.unwrap();
+        let publisher = session.declare_publisher(key).await.unwrap();
+
+        let payload = ZBytes::from(vec![1u8, 2, 3, 4]);
+        let enc = Encoding::APPLICATION_CDR.with_schema("sensor_msgs/msg/PointCloud2");
+        publish_cdr(&publisher, &session, payload, enc)
+            .await
+            .expect("publish_cdr");
+
+        let sample = tokio::time::timeout(Duration::from_secs(5), subscriber.recv_async())
+            .await
+            .expect("timed out waiting for sample")
+            .expect("recv sample");
+        assert!(
+            sample.timestamp().is_some(),
+            "published sample should carry a Zenoh source timestamp"
+        );
+        assert_eq!(sample.payload().to_bytes().as_ref(), &[1u8, 2, 3, 4]);
     }
 }
