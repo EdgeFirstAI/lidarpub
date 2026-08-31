@@ -48,7 +48,7 @@ TF_QUAT="-0.0086497 0.0088020 -0.0086497 0.9998864"
 
 # Zenoh base topic for LiDAR data.
 # Published topics: {LIDAR_TOPIC}/points, {LIDAR_TOPIC}/clusters, etc.
-#LIDAR_TOPIC="rt/lidar"
+#LIDAR_TOPIC="lidar"
 
 # Zenoh participant mode. In "peer" mode nodes discover each other via
 # multicast. Use "client" to connect to a Zenoh router, or "router" to act

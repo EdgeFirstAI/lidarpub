@@ -98,6 +98,10 @@ https://crates.io/crates/ureq
 Zero Overhead Network Protocol - pub/sub messaging framework  
 https://crates.io/crates/zenoh
 
+**gethostname** (MIT)  
+Cross-platform hostname lookup for the Zenoh session namespace  
+https://crates.io/crates/gethostname
+
 ### Optional Dependencies (Feature Flags)
 
 **etherparse** (MIT OR Apache-2.0) - Optional, enabled with `--features pcap`

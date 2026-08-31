@@ -94,7 +94,7 @@ pub struct Args {
     pub frame_id: String,
 
     /// lidar base topic
-    #[arg(long, env, default_value = "rt/lidar")]
+    #[arg(long, env, default_value = "lidar")]
     pub lidar_topic: String,
 
     /// Application log level
@@ -180,9 +180,36 @@ impl Args {
     }
 }
 
+/// System hostname used as the Zenoh session namespace.
+///
+/// Empty or `/`-containing hostnames would create unintended sub-keys, so we
+/// fall back to `"localhost"` and warn. Two devices both falling back would
+/// silently share a namespace; that is a deployment defect.
+fn zenoh_namespace() -> String {
+    zenoh_namespace_from(&gethostname::gethostname().to_string_lossy())
+}
+
+fn zenoh_namespace_from(raw: &str) -> String {
+    if raw.is_empty() || raw.contains('/') {
+        tracing::warn!(
+            hostname = %raw,
+            "system hostname is empty or contains '/' — falling back to \"localhost\""
+        );
+        "localhost".into()
+    } else {
+        raw.to_owned()
+    }
+}
+
 impl From<Args> for Config {
     fn from(args: Args) -> Self {
         let mut config = Config::default();
+
+        // Session namespace = hostname: application keys are bare (`lidar`)
+        // and the wire form is `{hostname}/lidar/...`.
+        config
+            .insert_json5("namespace", &json!(zenoh_namespace()).to_string())
+            .unwrap();
 
         config
             .insert_json5("mode", &json!(args.mode).to_string())
@@ -211,5 +238,101 @@ impl From<Args> for Config {
             .unwrap();
 
         config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn parse_cli() -> Args {
+        Args::parse_from(["edgefirst-lidarpub", "--rust-log", "info"])
+    }
+
+    fn with_cleared_lidar_topic<T>(f: impl FnOnce() -> T) -> T {
+        let saved = std::env::var("LIDAR_TOPIC").ok();
+        unsafe { std::env::remove_var("LIDAR_TOPIC") };
+        let result = f();
+        match saved {
+            Some(v) => unsafe { std::env::set_var("LIDAR_TOPIC", v) },
+            None => unsafe { std::env::remove_var("LIDAR_TOPIC") },
+        }
+        result
+    }
+
+    #[test]
+    fn zenoh_namespace_from_valid_hostname() {
+        assert_eq!(zenoh_namespace_from("verdin-imx8mp"), "verdin-imx8mp");
+    }
+
+    #[test]
+    fn zenoh_namespace_from_empty_falls_back() {
+        assert_eq!(zenoh_namespace_from(""), "localhost");
+    }
+
+    #[test]
+    fn zenoh_namespace_from_slash_falls_back() {
+        assert_eq!(zenoh_namespace_from("bad/name"), "localhost");
+    }
+
+    #[test]
+    fn zenoh_config_sets_namespace() {
+        let ns = zenoh_namespace();
+        assert!(!ns.is_empty(), "namespace should be non-empty");
+        assert!(!ns.contains('/'), "namespace must not contain '/'");
+        let rendered = Config::from(parse_cli()).to_string();
+        assert!(
+            rendered.contains(&ns),
+            "config should include namespace {ns}: {rendered}"
+        );
+    }
+
+    #[test]
+    fn cli_default_lidar_topic_has_no_rt_prefix() {
+        let topic = with_cleared_lidar_topic(|| parse_cli().lidar_topic);
+        assert_eq!(topic, "lidar");
+    }
+
+    #[test]
+    fn clustering_enabled_and_mirror_helpers() {
+        let disabled = parse_cli();
+        assert!(!disabled.clustering_enabled());
+        assert!(!disabled.mirror_y());
+        assert!(!disabled.mirror_z());
+
+        let voxel = Args::parse_from(["edgefirst-lidarpub", "--clustering", "voxel"]);
+        assert!(voxel.clustering_enabled());
+
+        let horizontal = Args::parse_from(["edgefirst-lidarpub", "--mirror", "horizontal"]);
+        assert!(horizontal.mirror_y());
+        assert!(!horizontal.mirror_z());
+
+        let vertical = Args::parse_from(["edgefirst-lidarpub", "--mirror", "vertical"]);
+        assert!(!vertical.mirror_y());
+        assert!(vertical.mirror_z());
+
+        let both = Args::parse_from(["edgefirst-lidarpub", "--mirror", "both"]);
+        assert!(both.mirror_y());
+        assert!(both.mirror_z());
+    }
+
+    #[test]
+    fn zenoh_config_optional_endpoints_and_scouting() {
+        let args = Args::parse_from([
+            "edgefirst-lidarpub",
+            "--connect",
+            "tcp/127.0.0.1:7447",
+            "--listen",
+            "tcp/127.0.0.1:7448",
+            "--no-multicast-scouting",
+        ]);
+        let rendered = Config::from(args).to_string();
+        assert!(rendered.contains("127.0.0.1:7447"), "{rendered}");
+        assert!(rendered.contains("127.0.0.1:7448"), "{rendered}");
+        assert!(
+            rendered.contains("false") || rendered.contains("multicast"),
+            "{rendered}"
+        );
     }
 }

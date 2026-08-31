@@ -331,6 +331,36 @@ async fn test_ouster_double_buffer_pattern() {
 }
 
 #[tokio::test]
+async fn test_ouster_frame_reader_depth_and_reflect() {
+    require_test_data!();
+
+    let params = load_test_params().expect("Failed to load sensor parameters");
+    let mut reader =
+        edgefirst_lidarpub::ouster::FrameReader::new(&params.lidar_data_format).unwrap();
+    let mut source =
+        PcapSource::from_file(OUSTER_PCAP, Some(LIDAR_PORT)).expect("Failed to load PCAP file");
+
+    let mut buf = [0u8; 16 * 1024];
+    let mut completed = 0u32;
+    while source.has_more() {
+        let len = source.recv(&mut buf).await.expect("Failed to read packet");
+        if let Ok(true) = reader.update(&buf[..len]) {
+            // First boundary is empty (initial frame_id flip); wait for a filled frame.
+            if reader.depth().iter().any(|&v| v > 0) {
+                completed += 1;
+                assert!(
+                    reader.reflect().iter().any(|&v| v > 0),
+                    "completed frame should have non-zero reflectivity"
+                );
+            }
+            reader.start_new_frame();
+            let _ = reader.update(&buf[..len]);
+        }
+    }
+    assert!(completed >= 1, "expected at least one FrameReader frame");
+}
+
+#[tokio::test]
 async fn test_ouster_pcap_port_filtering() {
     require_test_data!();
 

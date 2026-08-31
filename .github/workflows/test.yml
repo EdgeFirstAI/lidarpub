@@ -112,8 +112,31 @@ jobs:
           key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-test-
 
+      - name: Verify LFS testdata
+        run: |
+          set -euo pipefail
+          min_bytes=10000
+          for f in testdata/e1r_frames.pcap testdata/os1_frames.pcap \
+                   testdata/e1r_frame0.pcd testdata/e1r_frame5.pcd \
+                   testdata/os1_frame0.pcd testdata/os1_frame3.pcd \
+                   testdata/os1_sensor_info.json; do
+            if [ ! -f "$f" ]; then
+              echo "ERROR: missing testdata file $f"
+              exit 1
+            fi
+            size=$(stat -c%s "$f")
+            echo "$f: $size bytes"
+            if [ "$size" -lt "$min_bytes" ] && [[ "$f" != *.json ]]; then
+              echo "ERROR: $f is $size bytes — likely a git-lfs pointer, not smudged"
+              exit 1
+            fi
+          done
+
       - name: Run unit tests with coverage
-        run: cargo llvm-cov nextest --workspace --features pcap --lcov --output-path coverage.lcov --no-fail-fast
+        run: |
+          cargo llvm-cov nextest --workspace --features pcap --no-report --no-fail-fast
+          cargo llvm-cov report --summary-only
+          cargo llvm-cov report --lcov --output-path coverage.lcov --fail-under-lines 70
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@v4

@@ -305,3 +305,25 @@ async fn test_e1r_clustering_real_data() {
         assert!(max_id > 0, "Frame {} should have at least 1 cluster", i);
     }
 }
+
+#[tokio::test]
+async fn test_e1r_difop_port_if_present() {
+    require_test_data!();
+
+    let mut source = PcapSource::from_file(E1R_PCAP, Some(7788)).expect("Failed to load PCAP file");
+    if source.is_empty() {
+        eprintln!("e1r_frames.pcap has no DIFOP packets on port 7788");
+        return;
+    }
+
+    let mut driver = RobosenseDriver::new();
+    let mut buf = [0u8; 512];
+    let mut parsed = 0u32;
+    while source.has_more() {
+        let len = source.recv(&mut buf).await.expect("recv DIFOP");
+        if driver.process_difop(&buf[..len]).is_ok() {
+            parsed += 1;
+        }
+    }
+    assert!(parsed > 0, "expected at least one valid DIFOP packet");
+}

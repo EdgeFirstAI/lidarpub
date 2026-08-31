@@ -868,4 +868,37 @@ mod tests {
         );
         assert!(post_valid > n / 4, "Too many points removed");
     }
+
+    #[test]
+    fn test_ground_filter_os1_real_data() {
+        let (x, y, z) = require_pcd!("testdata/os1_frame0.pcd");
+        let n = x.len();
+        assert!(n > 50_000, "Ouster frame should have >50k points");
+
+        let mut valid = vec![true; n];
+        for i in 0..n {
+            if x[i] == 0.0 && y[i] == 0.0 && z[i] == 0.0 {
+                valid[i] = false;
+            }
+        }
+        let pre_valid = valid.iter().filter(|&&v| v).count();
+        let range = compute_range(&x, &y, &z);
+        let mut filter = GroundFilter::new();
+        filter.filter(
+            &x,
+            &y,
+            &z,
+            &range,
+            (0.0, 0.0, -9.81),
+            Some(1.5),
+            0.15,
+            &mut valid,
+        );
+        let post_valid = valid.iter().filter(|&&v| v).count();
+        assert!(post_valid <= pre_valid);
+        assert!(
+            post_valid > 0,
+            "known-height filter should keep some points"
+        );
+    }
 }

@@ -19,8 +19,8 @@ The GitHub Actions workflow (`.github/workflows/test.yml`) runs on every push an
 |-----|-------------|
 | Format Check | Verifies code formatting with `cargo fmt` |
 | Clippy Lint | Static analysis with `cargo clippy` |
-| Unit Tests | Runs `cargo test` with coverage collection |
-| SonarCloud | Uploads coverage and performs code quality analysis |
+| Unit Tests | `cargo llvm-cov nextest --features pcap`, then LCOV + `--fail-under-lines 70` |
+| SonarCloud | Uploads `coverage.lcov` via `sonar.rust.lcov.reportPaths` |
 | Security Audit | Checks dependencies for known vulnerabilities |
 | License Check | Verifies all dependencies have compatible licenses |
 
@@ -69,7 +69,7 @@ Tests for both DBSCAN and voxel clustering algorithms:
 | `test_voxel_cluster_reuse_second_call` | State correctly resets between frames |
 | `test_voxel_cluster_unstructured` | Voxel clustering on irregular point positions |
 | `test_voxel_cluster_e1r_real_data` | Voxel on real E1R point cloud (`testdata/e1r_frame0.pcd`) |
-| `test_voxel_cluster_ouster_real_data` | Voxel on real Ouster point cloud (`testdata/ouster_frame0.pcd`) |
+| `test_voxel_cluster_ouster_real_data` | Voxel on real Ouster point cloud (`testdata/os1_frame0.pcd`) |
 | `test_voxel_vs_dbscan_agreement` | Verifies voxel and DBSCAN produce structurally similar results |
 
 ```bash
@@ -153,10 +153,15 @@ Real-data tests use PCD files in the `testdata/` directory:
 | File | Description |
 |------|-------------|
 | `testdata/e1r_frame0.pcd` | Robosense E1R frame, ~20,512 points |
-| `testdata/ouster_frame0.pcd` | Ouster OS1 frame |
+| `testdata/e1r_frame5.pcd` | Robosense E1R later frame (state reuse) |
+| `testdata/os1_frame0.pcd` | Ouster OS1 frame, >50k points |
+| `testdata/os1_frame3.pcd` | Ouster OS1 later frame |
+| `testdata/e1r_frames.pcap` | E1R MSOP capture (port 6699). No DIFOP/7788 packets. |
+| `testdata/os1_frames.pcap` | OS1 lidar capture (port 7502), IP-fragmented |
+| `testdata/os1_sensor_info.json` | OS1 metadata for driver/FrameReader tests |
 
-These files are checked into the repository. Tests that depend on them are skipped
-if the file is not found (e.g., in stripped CI environments).
+PCAP and PCD files are stored in git-lfs. CI fails if those files are missing or
+still LFS pointer stubs. Locally, tests that cannot load a file skip.
 
 ## Manual Hardware Testing
 

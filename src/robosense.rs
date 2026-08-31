@@ -823,4 +823,47 @@ mod tests {
         assert!(result.is_ok());
         assert!(result.unwrap()); // Frame complete!
     }
+
+    fn make_difop_packet() -> Vec<u8> {
+        let mut data = vec![0u8; DIFOP_PACKET_SIZE];
+        data[0..8].copy_from_slice(&DIFOP_SYNC);
+        data[16..19].copy_from_slice(&[1, 2, 3]);
+        data[20..26].copy_from_slice(&[0x01, 0x02, 0x03, 0x04, 0x05, 0x06]);
+        data[44..48].copy_from_slice(&[192, 168, 1, 10]);
+        data[62..64].copy_from_slice(&6699u16.to_be_bytes());
+        data[70..72].copy_from_slice(&7788u16.to_be_bytes());
+        data[101] = 0x02; // PTP E2E
+        data[102] = 0x01; // success
+        let imu = [0.1f32, -0.2, 9.81, 0.01, 0.02, 0.03];
+        for (i, v) in imu.iter().enumerate() {
+            let off = 208 + i * 4;
+            data[off..off + 4].copy_from_slice(&v.to_be_bytes());
+        }
+        data
+    }
+
+    #[test]
+    fn test_process_difop_extracts_device_info_and_imu() {
+        let mut driver = RobosenseDriver::new();
+        driver.process_difop(&make_difop_packet()).unwrap();
+        let info = driver.device_info();
+        assert_eq!(info.serial_string(), "010203040506");
+        assert_eq!(info.version_string(), "1.2.3");
+        assert_eq!(info.msop_port, 6699);
+        assert_eq!(info.difop_port, 7788);
+        assert_eq!(info.timesync_mode, TimeSyncMode::PtpE2E);
+        assert_eq!(info.timesync_status, TimeSyncStatus::Success);
+        let imu = info.imu.as_ref().expect("IMU should be parsed");
+        assert!((imu.accel_z - 9.81).abs() < 1e-5);
+        assert!((imu.gyro_y - 0.02).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_process_difop_rejects_short_and_bad_sync() {
+        let mut driver = RobosenseDriver::new();
+        assert!(driver.process_difop(&[0u8; 32]).is_err());
+        let mut bad = make_difop_packet();
+        bad[0] = 0x00;
+        assert!(driver.process_difop(&bad).is_err());
+    }
 }

@@ -1026,4 +1026,76 @@ mod tests {
         assert_eq!(tf.transform().translation, translation);
         assert_eq!(tf.transform().rotation, rotation);
     }
+
+    type Xyzr = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<u8>);
+
+    fn load_pcd_xyzr(path: &str) -> Option<Xyzr> {
+        let data = std::fs::read(path).ok()?;
+        let header_end = data.windows(12).position(|w| w == b"DATA binary\n")? + 12;
+        let body = &data[header_end..];
+        let point_size = 13;
+        if body.len() % point_size != 0 {
+            return None;
+        }
+        let n = body.len() / point_size;
+        let mut x = Vec::with_capacity(n);
+        let mut y = Vec::with_capacity(n);
+        let mut z = Vec::with_capacity(n);
+        let mut intensity = Vec::with_capacity(n);
+        for i in 0..n {
+            let off = i * point_size;
+            x.push(f32::from_le_bytes(body[off..off + 4].try_into().ok()?));
+            y.push(f32::from_le_bytes(body[off + 4..off + 8].try_into().ok()?));
+            z.push(f32::from_le_bytes(body[off + 8..off + 12].try_into().ok()?));
+            intensity.push(body[off + 12]);
+        }
+        Some((x, y, z, intensity))
+    }
+
+    #[test]
+    fn test_encode_e1r_pcd_pointcloud2() {
+        let Some((x, y, z, intensity)) = load_pcd_xyzr("testdata/e1r_frame0.pcd") else {
+            eprintln!("Skipping: testdata/e1r_frame0.pcd not found");
+            return;
+        };
+        let n = x.len();
+        assert!(n > 10_000);
+        let stamp = Time { sec: 1, nanosec: 0 };
+        let cdr = encode_xyzr_pointcloud2_cdr(
+            &x,
+            &y,
+            &z,
+            &intensity,
+            n,
+            stamp,
+            "lidar".to_string(),
+            false,
+            false,
+        )
+        .expect("encode E1R PointCloud2");
+        let pc = PointCloud2::from_cdr(cdr).expect("decode E1R PointCloud2");
+        assert_eq!(pc.width() as usize, n);
+        assert_eq!(pc.point_step(), 13);
+        assert_eq!(pc.data().len(), n * 13);
+
+        let cluster_ids = vec![1u32; n];
+        let clustered = encode_clustered_pointcloud2_cdr(
+            &x,
+            &y,
+            &z,
+            &cluster_ids,
+            &intensity,
+            n,
+            stamp,
+            "lidar".to_string(),
+            true,
+            false,
+        )
+        .expect("encode clustered E1R PointCloud2");
+        let pc = PointCloud2::from_cdr(clustered).expect("decode clustered E1R");
+        assert_eq!(pc.point_step(), 17);
+        assert_eq!(pc.width() as usize, n);
+        let y0 = f32::from_le_bytes(pc.data()[4..8].try_into().unwrap());
+        assert_eq!(y0, -y[0]);
+    }
 }
