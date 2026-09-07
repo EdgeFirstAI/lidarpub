@@ -103,6 +103,10 @@ name = "driver_bench"
 harness = false
 required-features = ["pcap"]
 
+[[test]]
+name = "env_scrub"
+harness = false
+
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
 tokio = { version = "1", features = ["rt", "macros"] }
