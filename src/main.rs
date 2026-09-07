@@ -19,7 +19,7 @@ mod lidar;
 mod ouster;
 mod robosense;
 
-use args::Args;
+use args::{Args, KEEP, scrub_empty_env};
 use clap::Parser as _;
 use cluster_thread::cluster_thread;
 use edgefirst_schemas::{
@@ -55,8 +55,17 @@ use zenoh::{
 static GLOBAL: tracy_client::ProfiledAllocator<std::alloc::System> =
     tracy_client::ProfiledAllocator::new(std::alloc::System, 100);
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // SAFETY: single-threaded here; runs before the runtime is built below.
+    unsafe { scrub_empty_env::<Args>(KEEP) };
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     args.tracy.then(tracy_client::Client::start);

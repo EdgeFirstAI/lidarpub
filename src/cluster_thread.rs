@@ -347,21 +347,25 @@ mod tests {
         };
         assert!(x.len() > 10_000);
 
-        let args = Args::parse_from([
-            "edgefirst-lidarpub",
-            "--clustering",
-            "voxel",
-            "--clustering-eps",
-            "256",
-            "--clustering-minpts",
-            "4",
-            "--ground-filter",
-            "true",
-            "--sensor-height",
-            "1500",
-            "--rust-log",
-            "error",
-        ]);
+        let args = {
+            // Parsing reads the environment; serialise against env-mutating tests.
+            let _env = crate::args::env_lock();
+            Args::parse_from([
+                "edgefirst-lidarpub",
+                "--clustering",
+                "voxel",
+                "--clustering-eps",
+                "256",
+                "--clustering-minpts",
+                "4",
+                "--ground-filter",
+                "true",
+                "--sensor-height",
+                "1500",
+                "--rust-log",
+                "error",
+            ])
+        };
 
         let session = zenoh::open(test_zenoh_config()).await.unwrap();
         let key = format!("lidarpub/test/clusters/{}", std::process::id());

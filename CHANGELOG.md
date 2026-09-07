@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Empty environment variables in `/etc/default/lidarpub` (`KEY=""`) are now
+  treated as unset so the documented default applies instead of failing to
+  start with a clap parse error (EDGEAI-1094)
+
 ## [2.3.0] - 2026-08-31
 
 ### Breaking

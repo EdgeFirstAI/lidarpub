@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2025 Au-Zone Technologies. All Rights Reserved.
 
-use clap::{Parser, builder::PossibleValuesParser};
+use clap::{CommandFactory, Parser, builder::PossibleValuesParser};
 use serde_json::json;
 use tracing::level_filters::LevelFilter;
 use zenoh::config::{Config, WhatAmI};
@@ -166,6 +166,38 @@ pub struct Args {
     no_multicast_scouting: bool,
 }
 
+/// Environment variables where an empty value is meaningful and must be
+/// preserved (i.e. the argument has a non-empty default but "" is a documented
+/// "disable" sentinel).
+///
+/// None for lidarpub: the only arguments where "" is a documented sentinel
+/// (`CLUSTERING`, `MIRROR`) already default to "", so scrubbing them is a
+/// no-op.
+pub const KEEP: &[&str] = &[];
+
+/// Treat an empty environment variable as unset, so clap's declared
+/// `default_value` applies instead of failing to parse.
+///
+/// Only variables bound to this program's own arguments are considered;
+/// unrelated process environment is left alone. `keep` names variables
+/// where an empty value is meaningful and must be preserved.
+///
+/// # Safety
+/// Must be called before any thread is spawned — that is, before the tokio
+/// runtime is built. Mutating the process environment is not thread-safe.
+pub unsafe fn scrub_empty_env<C: CommandFactory>(keep: &[&str]) {
+    for arg in C::command().get_arguments() {
+        let Some(env) = arg.get_env() else { continue };
+        let name = env.to_string_lossy().into_owned();
+        if keep.contains(&name.as_str()) {
+            continue;
+        }
+        if matches!(std::env::var(&name), Ok(v) if v.is_empty()) {
+            unsafe { std::env::remove_var(&name) };
+        }
+    }
+}
+
 impl Args {
     pub fn clustering_enabled(&self) -> bool {
         !self.clustering.is_empty()
@@ -241,16 +273,54 @@ impl From<Args> for Config {
     }
 }
 
+/// Serialises tests that parse [`Args`] against tests that mutate the process
+/// environment. Every `Args::parse_from` in the test binary consults the
+/// environment, so a concurrent `set_var` would otherwise race with it.
+#[cfg(test)]
+pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;
+
+    /// Env-bound arguments with a non-empty default where we have consciously
+    /// decided that an empty value is NOT meaningful (so scrubbing to the
+    /// default is correct).
+    const SCRUB_REVIEWED: &[&str] = &[
+        "SENSOR_TYPE",
+        "AZIMUTH",
+        "LIDAR_MODE",
+        "TIMESTAMP_MODE",
+        "MSOP_PORT",
+        "DIFOP_PORT",
+        "INCLUDE_NOISY",
+        "DISCOVER",
+        "TF_VEC",
+        "TF_QUAT",
+        "BASE_FRAME_ID",
+        "FRAME_ID",
+        "LIDAR_TOPIC",
+        "RUST_LOG",
+        "TRACY",
+        "CLUSTERING_EPS",
+        "CLUSTERING_MINPTS",
+        "CLUSTERING_BRIDGE",
+        "GROUND_FILTER",
+        "GROUND_THICKNESS",
+        "MODE",
+        "NO_MULTICAST_SCOUTING",
+    ];
 
     fn parse_cli() -> Args {
         Args::parse_from(["edgefirst-lidarpub", "--rust-log", "info"])
     }
 
     fn with_cleared_lidar_topic<T>(f: impl FnOnce() -> T) -> T {
+        let _env = env_lock();
         let saved = std::env::var("LIDAR_TOPIC").ok();
         unsafe { std::env::remove_var("LIDAR_TOPIC") };
         let result = f();
@@ -277,7 +347,70 @@ mod tests {
     }
 
     #[test]
+    fn every_env_arg_is_either_scrubbable_or_explicitly_kept() {
+        for arg in Args::command().get_arguments() {
+            let Some(env) = arg.get_env() else { continue };
+            let name = env.to_string_lossy().into_owned();
+            let has_nonempty_default = arg
+                .get_default_values()
+                .first()
+                .is_some_and(|d| !d.is_empty());
+            if has_nonempty_default && !KEEP.contains(&name.as_str()) {
+                assert!(
+                    SCRUB_REVIEWED.contains(&name.as_str()),
+                    "{name} has a non-empty default; decide whether empty is meaningful \
+                     and add it to KEEP or SCRUB_REVIEWED"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn empty_env_vars_fall_back_to_defaults_after_scrub() {
+        let _env = env_lock();
+        // Numeric, boolean, bare-flag and two-value (num_args = 2) arguments,
+        // all written as KEY="" in /etc/default/lidarpub.
+        const VARS: [&str; 4] = ["CLUSTERING_EPS", "GROUND_FILTER", "AZIMUTH", "DISCOVER"];
+        let saved: Vec<Option<String>> = VARS.iter().map(|v| std::env::var(v).ok()).collect();
+        let restore = || {
+            for (name, value) in VARS.iter().zip(&saved) {
+                match value {
+                    Some(v) => unsafe { std::env::set_var(name, v) },
+                    None => unsafe { std::env::remove_var(name) },
+                }
+            }
+        };
+
+        for name in VARS {
+            unsafe { std::env::set_var(name, "") };
+        }
+        // Without scrubbing, clap sees "" as a present value and fails.
+        let before = Args::try_parse_from(["edgefirst-lidarpub"]);
+        // A variable listed in `keep` must survive the scrub untouched.
+        unsafe { scrub_empty_env::<Args>(&["CLUSTERING_EPS"]) };
+        let kept = std::env::var("CLUSTERING_EPS");
+        // The service configuration (KEEP is empty) scrubs everything.
+        unsafe { scrub_empty_env::<Args>(KEEP) };
+        let remaining: Vec<&str> = VARS
+            .into_iter()
+            .filter(|v| std::env::var(v).is_ok())
+            .collect();
+        let after = Args::try_parse_from(["edgefirst-lidarpub"]);
+        restore();
+
+        assert!(before.is_err(), "empty env vars should fail without scrub");
+        assert_eq!(kept.as_deref(), Ok(""), "KEEP entry must not be removed");
+        assert!(remaining.is_empty(), "still set after scrub: {remaining:?}");
+        let args = after.expect("empty env vars must fall back to defaults");
+        assert_eq!(args.clustering_eps, 200);
+        assert!(!args.ground_filter);
+        assert_eq!(args.azimuth, [0, 360]);
+        assert!(!args.discover);
+    }
+
+    #[test]
     fn zenoh_config_sets_namespace() {
+        let _env = env_lock();
         let ns = zenoh_namespace();
         assert!(!ns.is_empty(), "namespace should be non-empty");
         assert!(!ns.contains('/'), "namespace must not contain '/'");
@@ -296,6 +429,7 @@ mod tests {
 
     #[test]
     fn clustering_enabled_and_mirror_helpers() {
+        let _env = env_lock();
         let disabled = parse_cli();
         assert!(!disabled.clustering_enabled());
         assert!(!disabled.mirror_y());
@@ -319,6 +453,7 @@ mod tests {
 
     #[test]
     fn zenoh_config_optional_endpoints_and_scouting() {
+        let _env = env_lock();
         let args = Args::parse_from([
             "edgefirst-lidarpub",
             "--connect",
