@@ -3,7 +3,7 @@ name = "edgefirst-lidarpub"
 description = "EdgeFirst LiDAR Publisher"
 repository = "https://github.com/EdgeFirstAI/lidarpub"
 license = "Apache-2.0"
-version = "2.3.0"
+version = "2.3.1"
 edition = "2024"
 rust-version = "1.95"
 
@@ -102,6 +102,10 @@ harness = false
 name = "driver_bench"
 harness = false
 required-features = ["pcap"]
+
+[[test]]
+name = "env_scrub"
+harness = false
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2025 Au-Zone Technologies. All Rights Reserved.
 
-use clap::{Parser, builder::PossibleValuesParser};
+use clap::{CommandFactory, Parser, builder::PossibleValuesParser};
 use serde_json::json;
 use tracing::level_filters::LevelFilter;
 use zenoh::config::{Config, WhatAmI};
@@ -166,6 +166,48 @@ pub struct Args {
     no_multicast_scouting: bool,
 }
 
+/// Environment variables where an empty value is meaningful and must be
+/// preserved (i.e. the argument has a non-empty default but "" is a documented
+/// "disable" sentinel).
+///
+/// None for lidarpub: the only arguments where "" is a documented sentinel
+/// (`CLUSTERING`, `MIRROR`) already default to "", so scrubbing them is a
+/// no-op.
+pub const KEEP: &[&str] = &[];
+
+/// Names of this program's env-bound arguments whose value, as reported by
+/// `var`, is present but empty and not listed in `keep`.
+///
+/// Pure: the environment is only read through `var`, so this can be unit
+/// tested with a fake lookup and no process-wide mutation.
+pub fn empty_env_vars<C: CommandFactory>(
+    keep: &[&str],
+    var: impl Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    C::command()
+        .get_arguments()
+        .filter_map(|arg| arg.get_env().map(|e| e.to_string_lossy().into_owned()))
+        .filter(|name| !keep.contains(&name.as_str()))
+        .filter(|name| var(name).is_some_and(|v| v.is_empty()))
+        .collect()
+}
+
+/// Treat an empty environment variable as unset, so clap's declared
+/// `default_value` applies instead of failing to parse.
+///
+/// Only variables bound to this program's own arguments are considered;
+/// unrelated process environment is left alone. `keep` names variables
+/// where an empty value is meaningful and must be preserved.
+///
+/// # Safety
+/// Must be called before any thread is spawned — that is, before the tokio
+/// runtime is built. Mutating the process environment is not thread-safe.
+pub unsafe fn scrub_empty_env<C: CommandFactory>(keep: &[&str]) {
+    for name in empty_env_vars::<C>(keep, |name| std::env::var(name).ok()) {
+        unsafe { std::env::remove_var(&name) };
+    }
+}
+
 impl Args {
     pub fn clustering_enabled(&self) -> bool {
         !self.clustering.is_empty()
@@ -245,6 +287,35 @@ impl From<Args> for Config {
 mod tests {
     use super::*;
     use clap::Parser;
+    use std::collections::HashMap;
+
+    /// Env-bound arguments with a non-empty default where we have consciously
+    /// decided that an empty value is NOT meaningful (so scrubbing to the
+    /// default is correct).
+    const SCRUB_REVIEWED: &[&str] = &[
+        "SENSOR_TYPE",
+        "AZIMUTH",
+        "LIDAR_MODE",
+        "TIMESTAMP_MODE",
+        "MSOP_PORT",
+        "DIFOP_PORT",
+        "INCLUDE_NOISY",
+        "DISCOVER",
+        "TF_VEC",
+        "TF_QUAT",
+        "BASE_FRAME_ID",
+        "FRAME_ID",
+        "LIDAR_TOPIC",
+        "RUST_LOG",
+        "TRACY",
+        "CLUSTERING_EPS",
+        "CLUSTERING_MINPTS",
+        "CLUSTERING_BRIDGE",
+        "GROUND_FILTER",
+        "GROUND_THICKNESS",
+        "MODE",
+        "NO_MULTICAST_SCOUTING",
+    ];
 
     fn parse_cli() -> Args {
         Args::parse_from(["edgefirst-lidarpub", "--rust-log", "info"])
@@ -274,6 +345,75 @@ mod tests {
     #[test]
     fn zenoh_namespace_from_slash_falls_back() {
         assert_eq!(zenoh_namespace_from("bad/name"), "localhost");
+    }
+
+    #[test]
+    fn every_env_arg_is_either_scrubbable_or_explicitly_kept() {
+        for arg in Args::command().get_arguments() {
+            let Some(env) = arg.get_env() else { continue };
+            let name = env.to_string_lossy().into_owned();
+            let has_nonempty_default = arg
+                .get_default_values()
+                .first()
+                .is_some_and(|d| !d.is_empty());
+            if has_nonempty_default && !KEEP.contains(&name.as_str()) {
+                assert!(
+                    SCRUB_REVIEWED.contains(&name.as_str()),
+                    "{name} has a non-empty default; decide whether empty is meaningful \
+                     and add it to KEEP or SCRUB_REVIEWED"
+                );
+            }
+        }
+    }
+
+    /// Fake environment lookup for [`empty_env_vars`]: no process-wide
+    /// mutation, so this is safe under libtest's worker threads.
+    fn fake_env(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: HashMap<String, String> = vars
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        move |name| map.get(name).cloned()
+    }
+
+    #[test]
+    fn empty_env_vars_lists_empty_bound_vars_only() {
+        // Numeric, boolean, bare-flag and two-value (num_args = 2) arguments,
+        // all written as KEY="" in /etc/default/lidarpub, are listed ...
+        let env = fake_env(&[
+            ("CLUSTERING_EPS", ""),
+            ("GROUND_FILTER", ""),
+            ("AZIMUTH", ""),
+            ("DISCOVER", ""),
+            ("CLUSTERING_MINPTS", "8"),
+            ("FRAME_ID", "lidar"),
+        ]);
+        let mut found = empty_env_vars::<Args>(KEEP, env);
+        found.sort();
+        // ... while non-empty and unset (e.g. MSOP_PORT) vars are not.
+        assert_eq!(
+            found,
+            ["AZIMUTH", "CLUSTERING_EPS", "DISCOVER", "GROUND_FILTER"]
+        );
+    }
+
+    #[test]
+    fn empty_env_vars_honours_keep() {
+        let env = fake_env(&[("CLUSTERING_EPS", ""), ("GROUND_FILTER", "")]);
+        let found = empty_env_vars::<Args>(&["CLUSTERING_EPS"], env);
+        assert_eq!(found, ["GROUND_FILTER"], "KEEP entry must not be listed");
+    }
+
+    #[test]
+    fn empty_env_vars_ignores_unbound_vars() {
+        // Present and empty, but not bound to any argument: never touched.
+        let env = fake_env(&[("NOT_A_LIDARPUB_ARG", ""), ("PATH", "")]);
+        assert!(empty_env_vars::<Args>(KEEP, env).is_empty());
+    }
+
+    #[test]
+    fn empty_env_vars_with_nothing_set_is_empty() {
+        assert!(empty_env_vars::<Args>(KEEP, |_| None).is_empty());
     }
 
     #[test]
