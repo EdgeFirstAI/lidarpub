@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["AZIMUTH_BIN_SIZE","ELEVATION_TOLERANCE","EMA_ALPHA","FLATNESS_THRESH","K_SEEDS","MAX_RANGE","MIN_ACCEPTED_PATCHES","MIN_RANGE_M","MIN_SEEDS","N_AZIMUTH","N_PATCHES","N_RANGE","RANGE_BIN_SIZE","UPRIGHTNESS_THRESH"],"fn":["eigenvector_for","gravity_frame","smallest_eigenvalue_index","sym3x3_eigen"],"struct":["GroundFilter"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["MAX_PACKET_SIZE"],"enum":["AlertStatus","ShotLimiting","ShutdownStatus"],"struct":["BeamIntrinsics","ColumnHeader","ColumnHeaderSlice","Config","DataBlock","FrameBuilder","FrameReader","Header","HeaderSlice","LidarDataFormat","OusterDriver","OusterLidarFrame","Parameters","SensorInfo"]};
