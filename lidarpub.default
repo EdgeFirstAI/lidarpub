@@ -47,7 +47,8 @@ TF_QUAT="-0.0086497 0.0088020 -0.0086497 0.9998864"
 #FRAME_ID="lidar"
 
 # Zenoh base topic for LiDAR data.
-# Published topics: {LIDAR_TOPIC}/points, {LIDAR_TOPIC}/clusters, etc.
+# Published wire keys (namespace = system hostname):
+#   {hostname}/{LIDAR_TOPIC}/points, /clusters, /imu (Robosense only), {hostname}/tf_static
 #LIDAR_TOPIC="lidar"
 
 # Zenoh participant mode. In "peer" mode nodes discover each other via
