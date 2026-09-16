@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.2] - 2026-09-15
+
+Documentation-only release. No wire-format or configuration-key changes from
+v2.3.1.
+
 ### Documentation
 - Synced README, ARCHITECTURE.md, and copilot-instructions with current Zenoh
   topics and hostname namespace (2.3.x wire surface)
