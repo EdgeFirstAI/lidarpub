@@ -374,6 +374,9 @@ z_sub -k "${HOST}/lidar/points"
 
 # Subscribe to clustered point cloud
 z_sub -k "${HOST}/lidar/clusters"
+
+# Subscribe to IMU (Robosense E1R DIFOP only)
+z_sub -k "${HOST}/lidar/imu"
 ```
 
 ## Troubleshooting

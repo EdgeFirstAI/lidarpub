@@ -4,7 +4,7 @@
 [![Rust](https://img.shields.io/badge/Rust-2024_Edition-orange.svg)](https://www.rust-lang.org/)
 [![EdgeFirst Studio](https://img.shields.io/badge/EdgeFirst-Studio-green)](https://edgefirst.studio)
 
-High-performance LiDAR point cloud publisher connecting Ouster sensors to the Zenoh messaging framework with ROS2-compatible serialization, optimized for edge AI perception pipelines on resource-constrained platforms.
+High-performance LiDAR point cloud publisher for Ouster and Robosense sensors over Zenoh with ROS2-compatible serialization, optimized for edge AI perception pipelines on resource-constrained platforms.
 
 **Part of the [EdgeFirst Perception Middleware](https://doc.edgefirst.ai/test/perception/)** — A collection of highly-optimized Rust services delivering the building blocks for spatial perception systems on edge hardware. The EdgeFirst Perception stack provides ROS2-compatible messaging over Zenoh for cameras, LiDAR, radar, IMU, GPS, and AI inference services.
 
@@ -12,7 +12,7 @@ High-performance LiDAR point cloud publisher connecting Ouster sensors to the Ze
 
 - **Multi-Sensor Support** - Ouster OS1-64 and Robosense E1R with native UDP protocol implementations
 - **Zenoh Messaging** - Low-latency pub/sub with configurable QoS (priority, congestion control)
-- **ROS2 Compatible** - CDR-serialized sensor_msgs/PointCloud2, sensor_msgs/Image, geometry_msgs/TransformStamped
+- **ROS2 Compatible** - CDR-serialized sensor_msgs/PointCloud2, sensor_msgs/Imu, geometry_msgs/TransformStamped
 - **Point Cloud Clustering** - DBSCAN (accurate) and voxel (fast) spatial clustering with NEON SIMD acceleration
 - **Ground Plane Removal** - IMU-guided PCA ground filter prevents floor from merging nearby objects
 - **Bridge Threshold** - Prevents thin structures (ropes, wires, railings) from merging separate clusters
@@ -56,26 +56,28 @@ cd lidarpub
 cargo build --release
 
 # The binary will be available at
-./target/release/lidarpub
+./target/release/edgefirst-lidarpub
 ```
+
+The systemd unit is often named `lidarpub`; packaged images use `/etc/default/lidarpub` for configuration (see [lidarpub.default](lidarpub.default)). The CLI default for `--sensor-type` is `ouster`; the packaged default file sets `SENSOR_TYPE=robosense` for Maivin images.
 
 ### Basic Usage
 
 ```bash
 # Ouster: connect to sensor and publish point clouds
-lidarpub --sensor-type ouster <SENSOR_IP>
+edgefirst-lidarpub --sensor-type ouster <SENSOR_IP>
 
 # Robosense E1R: listen for broadcast UDP packets
-lidarpub --sensor-type robosense
+edgefirst-lidarpub --sensor-type robosense
 
 # Enable voxel clustering (fast, recommended for real-time)
-lidarpub --sensor-type robosense --clustering voxel
+edgefirst-lidarpub --sensor-type robosense --clustering voxel
 
 # Enable DBSCAN clustering (accurate, higher CPU)
-lidarpub --sensor-type robosense --clustering dbscan
+edgefirst-lidarpub --sensor-type robosense --clustering dbscan
 
 # Full pipeline: ground filter + voxel clustering with bridge separation
-lidarpub --sensor-type robosense \
+edgefirst-lidarpub --sensor-type robosense \
     --clustering voxel \
     --ground-filter \
     --ground-thickness 300 \
@@ -88,7 +90,7 @@ All parameters can be set via CLI arguments or environment variables:
 
 ```bash
 # View all options
-lidarpub --help
+edgefirst-lidarpub --help
 
 # Clustering parameters:
 # --clustering <ALG>        Algorithm: "" (disabled), "dbscan", "voxel"
@@ -102,7 +104,7 @@ lidarpub --help
 # --sensor-height <MM>      Fixed sensor height (skips auto-detection)
 
 # Or use environment variables (useful for systemd services):
-SENSOR_TYPE=robosense CLUSTERING=voxel GROUND_FILTER=true lidarpub
+SENSOR_TYPE=robosense CLUSTERING=voxel GROUND_FILTER=true edgefirst-lidarpub
 ```
 
 ### Understanding Bridge Threshold
@@ -138,8 +140,10 @@ pipeline avg over 100 frames (24967 pts): valid=0.2ms ground=9.3ms cluster=13.2m
 
 ## Documentation
 
-- 📚 **[User Guide](docs/)** - Detailed setup and configuration
-- 🔧 **[API Documentation](https://docs.rs/lidarpub)** - Rust API reference
+- 📚 **[Architecture](ARCHITECTURE.md)** - Pipeline, modules, and Zenoh topics
+- 📋 **[Configuration template](lidarpub.default)** - `/etc/default/lidarpub` reference
+- 🧪 **[Testing guide](TESTING.md)** - CI, hardware validation, Zenoh subscribers
+- 🔧 **[API Documentation](https://docs.rs/edgefirst-lidarpub)** - Rust API reference
 - 🎓 **[EdgeFirst Studio Integration](https://docs.edgefirst.ai/studio/integration)** - Deploy to production
 - 💻 **[Hardware Optimization](https://docs.edgefirst.ai/hardware)** - Platform-specific tuning
 
@@ -157,12 +161,17 @@ The LiDAR Publisher implements an event-driven pipeline with async processing:
 **Message Format:**
 - **Serialization**: CDR (Common Data Representation) for ROS2 compatibility
 - **Zenoh namespace**: System hostname (default `{lidar_topic}` is `lidar`)
-- **Published Topics**:
+- **Published Topics** (wire keys; `{hostname}` is the Zenoh session namespace):
   - `{hostname}/{lidar_topic}/points` → `sensor_msgs/msg/PointCloud2` (XYZ + reflectivity)
-  - `{hostname}/{lidar_topic}/depth` → `sensor_msgs/msg/Image` (range image, mono16)
-  - `{hostname}/{lidar_topic}/reflect` → `sensor_msgs/msg/Image` (reflectivity image, mono8)
   - `{hostname}/{lidar_topic}/clusters` → `sensor_msgs/msg/PointCloud2` (clustered points, when enabled)
+  - `{hostname}/{lidar_topic}/imu` → `sensor_msgs/msg/Imu` (Robosense E1R DIFOP only)
   - `{hostname}/tf_static` → `geometry_msgs/msg/TransformStamped` (sensor transform)
+
+```bash
+HOST=$(hostname)
+z_sub -k "${HOST}/lidar/**"    # all keys under default lidar topic
+z_sub -k "${HOST}/lidar/imu"   # Robosense IMU only
+```
 
 **Transport:**
 - Zenoh pub/sub with configurable QoS
@@ -244,7 +253,7 @@ cargo install cross
 cross build --release --target aarch64-unknown-linux-gnu
 
 # Deploy to target device
-scp target/aarch64-unknown-linux-gnu/release/lidarpub user@target-device:/usr/local/bin/
+scp target/aarch64-unknown-linux-gnu/release/edgefirst-lidarpub user@target-device:/usr/local/bin/
 ```
 
 ## Support

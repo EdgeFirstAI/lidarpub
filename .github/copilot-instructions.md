@@ -170,7 +170,7 @@ cargo check --workspace --all-targets
 - **Stack over heap:** Use stack allocation where possible
 - **Zero-copy:** Minimize memory copies in hot paths; use fused write-into-buffer patterns
 - **NEON SIMD:** Native NEON intrinsics on aarch64 for distance checks and point formatting
-- **Pre-computation:** Cache intermediate trigonometric values (see `FrameBuilder`)
+- **Pre-computation:** Cache intermediate trigonometric values in Ouster fused XYZ path (`calculate_points_fused_into`)
 - **Profile on target:** Use Tracy profiler on actual hardware (Maivin/Raivin)
 
 **Async Runtime:**
@@ -389,7 +389,7 @@ cargo clippy -- -D warnings -W clippy::all
 3. **Point Cloud Processor** - Applies 3D transformations (NEON SIMD-accelerated on aarch64)
 4. **Ground Filter** - Optional IMU-guided PCA ground plane removal
 5. **Clustering Engine** - Optional DBSCAN or voxel spatial clustering with bridge threshold
-6. **Zenoh Publisher** - Distributes sensor_msgs/PointCloud2, sensor_msgs/Image
+6. **Zenoh Publisher** - Distributes sensor_msgs/PointCloud2, sensor_msgs/Imu (Robosense), geometry_msgs/TransformStamped
 7. **Transform Publisher** - Broadcasts geometry_msgs/TransformStamped for TF
 
 **Data Flow:**
@@ -413,10 +413,9 @@ Perception Middleware / ROS2 Nodes
 
 **Threading Model:**
 - Main thread: Argument parsing, initialization
-- Tokio runtime: UDP receiver, HTTP requests, Zenoh publishing (async)
-- Frame processor thread: Point transformations (dedicated, blocking compute)
-- Cluster thread: Ground filter + clustering (dedicated, blocking compute)
-- Kanal channels between threads (bounded for clustering, unbounded for frames)
+- Tokio runtime: `run_lidar_loop` UDP recv, Ouster HTTP, Zenoh publish, DIFOP listener
+- Cluster thread: Ground filter + clustering (dedicated OS thread with nested Tokio runtime)
+- Kanal channel: bounded (8) from main loop to cluster thread when clustering enabled
 
 **Error Handling:**
 - Result<T, E> types throughout
@@ -467,9 +466,8 @@ examples/
 
 **ouster.rs** - Ouster LiDAR Protocol
 - `Config`, `SensorInfo`, `LidarDataFormat`, `BeamIntrinsics` - Sensor config types
-- `FrameReader` - UDP packet parsing and frame assembly
-- `FrameBuilder` - SIMD-accelerated Cartesian point transforms
-- Range image and reflectivity image generation
+- `FrameReader` - UDP packet parsing and frame assembly (internal depth/reflect grids, not published)
+- `OusterLidarFrame` / fused XYZ via `calculate_points_fused_into` (NEON on aarch64)
 
 **robosense.rs** - Robosense E1R Protocol
 - MSOP packet parsing (point cloud data, port 6699)
@@ -502,8 +500,8 @@ examples/
 
 **main.rs** - Application Orchestration
 - Zenoh session initialization with QoS configuration
-- Topic publishing: `{lidar_topic}/points`, `/depth`, `/reflect`, `/clusters`
-- TF static frame broadcasting: `rt/tf_static`
+- Topic publishing: `{lidar_topic}/points`, `/clusters`, `/imu` (Robosense), wire namespace `{hostname}/...`
+- TF static frame broadcasting: `tf_static` under the same hostname namespace
 - Async frame processing pipeline
 
 **args.rs** - CLI Configuration
@@ -649,10 +647,11 @@ pipeline avg over 100 frames (24967 pts): valid=0.2ms ground=9.3ms cluster=13.2m
 - TF static frames: Priority `Background`, CongestionControl `Drop`
 
 **Topic Naming:**
-- Sensor data: `{lidar_topic}/points`, `{lidar_topic}/depth`, etc. (default prefix: `rt/lidar`)
-- Transforms: `rt/tf_static` (ROS2 convention)
-- IMU: `rt/lidar/imu` (Robosense E1R only)
-- Use CLI argument `--lidar-topic` to customize prefix
+- Zenoh session namespace is the system hostname (see `zenoh_namespace()` in `args.rs`); no `rt/` prefix since 2.3.0
+- Sensor data: `{hostname}/{lidar_topic}/points`, `/clusters` (when clustering enabled)
+- IMU: `{hostname}/{lidar_topic}/imu` (Robosense E1R DIFOP only)
+- Transforms: `{hostname}/tf_static`
+- Use CLI argument `--lidar-topic` to customize the lidar prefix (default `lidar`)
 
 **Message Serialization:**
 - Use `Type::builder()` from `edgefirst-schemas` 4.0 (no `serde_cdr`)

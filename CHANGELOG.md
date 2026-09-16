@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+- Synced README, ARCHITECTURE.md, and copilot-instructions with current Zenoh
+  topics and hostname namespace (2.3.x wire surface)
+
 ## [2.3.1] - 2026-09-07
 
 Patch release for EDGEAI-1094. Argument parsing only; no wire-format or
@@ -154,7 +158,8 @@ configuration-key changes from 2.3.0.
 - `--discover` flag for parallel multi-sensor network discovery (Robosense via passive
   DIFOP listening, Ouster via mDNS `_roger._tcp`)
 - Robosense DIFOP parsing: serial number, firmware version, network config, time sync,
-  IMU data (accelerometer + gyroscope) published on `rt/lidar/imu`
+  IMU data (accelerometer + gyroscope) published on `{lidar_topic}/imu` (wire form
+  used the `rt/` session prefix before 2.3.0, e.g. `rt/lidar/imu`)
 - Robosense return mode extraction from MSOP header (Dual/Strongest/Last/Nearest)
 - PCAP replay support via `PacketSource` trait with IP fragment reassembly for
   testing LiDAR drivers without hardware (`pcap` feature)
@@ -193,12 +198,16 @@ configuration-key changes from 2.3.0.
 - Legacy `FrameBuilder` and `buffer.rs` module
 - 14 unused fields and 9 legacy methods from Ouster driver
 - `.cargo/config.toml` build configuration
+- **BREAKING:** Zenoh publication of `{lidar_topic}/depth` and `{lidar_topic}/reflect`
+  as `sensor_msgs/Image` (range and reflectivity images). Reflectivity remains on the
+  PointCloud2 `reflect` field on `{lidar_topic}/points`.
 
 ### Performance
 - Zero-copy point cloud processing: computation now dominates (~20%) rather than
   memory copies on imx8mp-frdm
 - Pre-allocated `pending_packet_buf` eliminates allocations in main processing loop
-- Ouster `FrameReader` permanently owns depth/reflect buffers (no per-frame allocation)
+- Ouster `FrameReader` permanently owns internal depth/reflect **assembly buffers**
+  (not published on Zenoh; no per-frame allocation for Ouster packet parsing)
 
 ## [1.4.2] - 2026-01-28
 
