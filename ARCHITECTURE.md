@@ -56,13 +56,13 @@ The EdgeFirst LiDAR Publisher (`edgefirst-lidarpub`) receives UDP packets from O
 ```mermaid
 graph TB
     subgraph Sensors [Sensor inputs]
-        OusterUDP["Ouster UDP 7502/7503"]
+        OusterUDP["Ouster LiDAR UDP 7502"]
         RsMSOP["Robosense MSOP"]
         RsDIFOP["Robosense DIFOP"]
     end
 
     subgraph App [edgefirst-lidarpub process]
-        Entry["main run_ouster run_robosense pcap"]
+        Entry["run_ouster or run_robosense"]
         Loop["run_lidar_loop"]
         Driver["LidarDriver trait"]
         Frame["LidarFrame client-owned"]
@@ -103,7 +103,8 @@ graph TB
 | Clustering | `src/cluster.rs` | DBSCAN and voxel algorithms |
 | Cluster pipeline | `src/cluster_thread.rs` | Ground filter, cluster, relabel, publish clusters |
 | TF broadcast | `src/main.rs::tf_static_loop` | 1 Hz TransformStamped |
-| PCAP / test sources | `src/packet_source.rs` | Offline replay (`pcap` feature) |
+| Packet sources (tests) | `src/packet_source.rs` | UDP/test `PacketSource` trait |
+| PCAP replay (library) | `src/pcap_source.rs` | `PcapSource` when `pcap` feature is enabled (examples/tests, not `main` dispatch) |
 
 ---
 
@@ -123,8 +124,13 @@ src/
 ├── args.rs              - CLI configuration, zenoh_namespace()
 ├── common.rs            - Shared utilities, timestamps
 ├── lidar.rs             - Sensor traits and types
-├── packet_source.rs     - UDP/pcap packet source abstraction
+├── packet_source.rs     - PacketSource trait (UDP, test fixtures)
+├── pcap_source.rs       - PCAP replay (`pcap` feature)
 └── lib.rs               - Library exports and crate-level docs
+
+examples/
+├── pcap_viewer.rs       - Offline PCAP replay with Rerun (`rerun` + `pcap`)
+└── lidar_viewer.rs      - Live visualization
 
 benches/
 ├── cluster_bench.rs
@@ -240,7 +246,7 @@ graph TB
 | `{lidar_topic}/imu` | `{hostname}/lidar/imu` | `sensor_msgs/msg/Imu` | Robosense DIFOP |
 | `tf_static` | `{hostname}/tf_static` | `geometry_msgs/msg/TransformStamped` | 1 Hz |
 
-Publisher declarations live in `run_lidar_loop`, DIFOP handler, and `tf_static_loop`. Samples use `publish_cdr()` to attach a Zenoh source timestamp from the session.
+Publisher declarations live in `run_lidar_loop`, the Robosense DIFOP handler, and `tf_static_loop`. Point clouds, IMU, and `tf_static` use `publish_cdr()` in `main.rs` to attach a Zenoh source timestamp. Cluster output is published from `cluster_thread` via `.put(...).timestamp(session.new_timestamp())` (same timestamp semantics, separate call site).
 
 ### QoS
 
@@ -257,7 +263,7 @@ graph TD
     NS["Namespace hostname"]
     NS --> Base["lidar_topic default lidar"]
     Base --> P["points PointCloud2 XYZR"]
-    Base --> C["clusters PointCloud2 XYZ cluster_id intensity"]
+    Base --> C["clusters PointCloud2 XYZ cluster_id reflect"]
     Base --> I["imu Imu Robosense only"]
     NS --> TF["tf_static TransformStamped"]
 ```
@@ -287,11 +293,11 @@ graph TD
 
 ### Ouster Cartesian generation
 
-`OusterLidarFrameWriter::update_fused` reads internal depth/reflect slices, converts range to meters, copies reflectivity to intensity, and calls `calculate_points_fused_into()` to write x/y/z directly into the frame buffers. Implementations use NEON on aarch64, optional `portable_simd` on other targets, and scalar fallbacks.
+`FrameBuilder::update_fused` reads internal depth/reflect slices, converts range to meters, copies reflectivity into the client frame, and calls `calculate_points_fused_into()` to write x/y/z into the `LidarFrameWriter` buffers. Implementations use NEON on aarch64, optional `portable_simd` on other targets, and scalar fallbacks.
 
 ### PointCloud2 formatting
 
-`formats.rs` provides SIMD paths for packing interleaved XYZR (and clustered XYZRI) into CDR-backed buffers. See `benches/format_points_bench.rs` for performance characterization.
+`formats.rs` provides SIMD paths for packing interleaved XYZR (13 bytes/point) and clustered XYZ + `cluster_id` + `reflect` (17 bytes/point) into CDR-backed buffers. See `benches/format_points_bench.rs` for performance characterization.
 
 ---
 
@@ -400,17 +406,19 @@ Faster BFS over occupied voxels. **Performance:** ~13ms per frame on E1R 25k poi
 
 **Implementation:** `src/cluster_thread.rs`
 
-Each stage is wrapped in `tracing::info_span!()` (Tracy when `--tracy` is set). Per-stage
-`Instant` accumulators log averages every 100 frames.
+Stages `valid_mask`, `ground_filter`, `clustering`, `relabel`, and `publish` use
+`tracing::info_span!()` (visible in Tracy when `--tracy` is set). The CDR format step is
+timed with `Instant` only (no span). Per-stage `Instant` accumulators log averages every
+100 frames.
 
-| Stage | Span name |
-|-------|-----------|
-| Valid mask | `valid_mask` |
-| Ground filter | `ground_filter` |
-| Clustering | `clustering` |
-| Relabel | `relabel` |
-| Format | `format_points_clustered` |
-| Publish | `publish` |
+| Stage | Tracing |
+|-------|---------|
+| Valid mask | span `valid_mask` |
+| Ground filter | span `ground_filter` |
+| Clustering | span `clustering` |
+| Relabel | span `relabel` |
+| Format clustered PC2 | `Instant` only (`format_points_clustered`) |
+| Publish | span `publish` |
 
 Example:
 
@@ -426,10 +434,11 @@ Frame marks in `run_lidar_loop` when `--tracy` is enabled.
 
 - **Packet-level errors:** Logged at debug/warn; processing continues (UDP loss tolerant).
 - **Publish errors:** Logged; loop continues.
-- **Cluster thread:** Unrecoverable errors terminate the process (no silent panic swallow).
+- **Cluster thread:** CDR encode failures log an error and skip the frame; Zenoh publish
+  failures log and continue. Failure to spawn the clustering OS thread exits the process.
 - **Configuration / sensor setup (Ouster):** Fatal at startup when HTTP config fails.
 
-Unified driver errors live in `lidar::Error`; Ouster-specific variants remain in `ouster::Error` where applicable.
+Drivers return the unified `lidar::Error` enum.
 
 ---
 
@@ -461,7 +470,7 @@ Production binary name: **`edgefirst-lidarpub`** (`target/release/edgefirst-lida
 ### Cross-compilation
 
 ```bash
-cargo install cargo-zigbuild   # or cross
+cargo install cargo-zigbuild
 cargo zigbuild --target aarch64-unknown-linux-gnu.2.35 --release
 # artifact: target/aarch64-unknown-linux-gnu/release/edgefirst-lidarpub
 ```
@@ -477,7 +486,7 @@ EnvironmentFile=-/etc/default/lidarpub
 
 ### Network
 
-- **Ouster:** UDP 7502/7503, HTTP configuration API
+- **Ouster:** This publisher binds LiDAR UDP **7502** only (no Ouster IMU port 7503 path); HTTP configuration API
 - **Robosense E1R:** MSOP 6699, DIFOP 7788
 - **Zenoh:** peer multicast or client to router (TCP 7447 typical)
 
