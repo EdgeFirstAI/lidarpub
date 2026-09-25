@@ -12,16 +12,21 @@
 )]
 
 mod args;
+#[cfg(target_os = "linux")]
+mod clock;
 mod cluster_thread;
 mod common;
 mod formats;
 mod lidar;
+mod net;
 mod ouster;
 mod robosense;
+mod stamp;
 
 use args::{Args, KEEP, scrub_empty_env};
 use clap::Parser as _;
 use cluster_thread::cluster_thread;
+use common::TimestampMode;
 use edgefirst_schemas::{
     builtin_interfaces::Time,
     cdr::CdrError,
@@ -31,16 +36,21 @@ use formats::{encode_imu_cdr, encode_transform_stamped_cdr, encode_xyzr_pointclo
 use lidar::{LidarDriver, LidarFrame, SensorType};
 use ouster::{BeamIntrinsics, Config, LidarDataFormat, OusterLidarFrame, Parameters, SensorInfo};
 use robosense::{RobosenseDriver, RobosenseLidarFrame};
+use stamp::system_time_ns;
 use std::{
     collections::HashMap,
     io::{IsTerminal as _, Write as _},
     net::TcpStream,
-    sync::{Arc, Mutex},
+    os::fd::AsRawFd as _,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     thread::sleep,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
-use tokio::net::UdpSocket;
+use tokio::{io::Interest, net::UdpSocket};
 use tracing::{debug, error, info, trace, warn};
 use tracing_subscriber::{Layer as _, Registry, layer::SubscriberExt as _};
 use tracy_client::frame_mark;
@@ -48,6 +58,7 @@ use zenoh::{
     Session,
     bytes::{Encoding, ZBytes},
     qos::{CongestionControl, Priority},
+    time::TimestampId,
 };
 
 #[cfg(feature = "profiling")]
@@ -188,6 +199,32 @@ async fn run_ouster(session: Session, args: Args) -> Result<(), Box<dyn std::err
 
     // Create OusterDriver
     let driver = ouster::OusterDriver::new(&params)?;
+
+    if args.timestamp_mode == TimestampMode::Ptp1588 {
+        info!(
+            "Ouster timestamp mode ptp1588: frames use the sensor clock while it is PTP-synchronized"
+        );
+        let target = target.to_owned();
+        let shared = Arc::new(OusterPtpShared {
+            synced: driver.sensor_synced(),
+            restarts: AtomicU64::new(0),
+        });
+        spawn_named("ouster-ptp", {
+            let target = target.clone();
+            let shared = shared.clone();
+            move || ouster_ptp_monitor(target, shared)
+        });
+        spawn_named("clock-step", move || {
+            clock_step_monitor(Some((target, shared)))
+        });
+    } else {
+        info!(
+            "Ouster timestamp mode {}: frames use the host receive time",
+            args.timestamp_mode
+        );
+        spawn_named("clock-step", || clock_step_monitor(None));
+    }
+
     let rows = driver.rows();
     let cols = driver.cols();
 
@@ -213,6 +250,15 @@ async fn run_robosense(session: Session, args: Args) -> Result<(), Box<dyn std::
     robosense_driver.set_filter_noisy(!args.include_noisy);
     let driver = Arc::new(Mutex::new(robosense_driver));
 
+    // Parse target as source IP filter for Robosense MSOP and DIFOP packets
+    let source_filter: Option<std::net::IpAddr> = args
+        .target
+        .as_deref()
+        .filter(|t| !t.is_empty())
+        .map(|t| t.parse())
+        .transpose()
+        .map_err(|e| format!("Invalid target IP address: {}", e))?;
+
     // Start DIFOP listener for device information and IMU publishing
     let difop_driver = driver.clone();
     let difop_port = args.difop_port;
@@ -230,13 +276,13 @@ async fn run_robosense(session: Session, args: Args) -> Result<(), Box<dyn std::
     let latest_imu: Arc<Mutex<Option<(f32, f32, f32)>>> = Arc::new(Mutex::new(None));
     let imu_writer = latest_imu.clone();
 
-    // Use oneshot channel to confirm DIFOP startup (PR #7 fix)
+    // Confirm the DIFOP socket is bound before starting the MSOP loop
     let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
     let session_difop = session.clone();
 
     tokio::spawn(async move {
         let bind_addr = format!("0.0.0.0:{}", difop_port);
-        let sock = match UdpSocket::bind(&bind_addr).await {
+        let sock = match bind_udp(&bind_addr, None) {
             Ok(s) => {
                 let _ = startup_tx.send(Ok(()));
                 s
@@ -248,112 +294,133 @@ async fn run_robosense(session: Session, args: Args) -> Result<(), Box<dyn std::
         };
         info!("Listening for DIFOP packets on port {}", difop_port);
 
+        let ts_id = common::timestamp_id(&session_difop);
+        let mut receiver = net::Receiver::new(4, 512);
+        let mut rx_monitor = RxMonitor::new("DIFOP");
         let mut logged_imu_raw = false;
-        let mut buf = [0u8; 512];
         let mut logged_device_info = false;
         let mut last_device_info: Option<robosense::DeviceInfo> = None;
 
         loop {
-            match sock.recv(&mut buf).await {
-                Ok(len) => {
-                    // Extract device info under lock, then release before await
-                    let info = {
-                        let Ok(mut driver) = difop_driver.lock() else {
-                            continue;
-                        };
-                        if let Err(e) = driver.process_difop(&buf[..len]) {
-                            debug!("DIFOP parse error: {:?}", e);
-                            continue;
-                        }
-                        driver.device_info().clone()
-                    };
-
-                    // First DIFOP: log at INFO level
-                    if !logged_device_info {
-                        info!(
-                            serial = %info.serial_string(),
-                            firmware = %info.version_string(),
-                            timesync_mode = ?info.timesync_mode,
-                            timesync_status = ?info.timesync_status,
-                            "Robosense E1R device info"
-                        );
-                        logged_device_info = true;
-                    } else if last_device_info.as_ref() != Some(&info) {
-                        trace!(
-                            serial = %info.serial_string(),
-                            firmware = %info.version_string(),
-                            "DIFOP device info updated"
-                        );
-                    }
-
-                    // Store latest IMU accel for ground plane filtering.
-                    // The E1R IMU axes (from DIFOP) vs LiDAR point cloud frame:
-                    //   IMU +Y = gravity (down)  → LiDAR -Z
-                    //   IMU +X = LiDAR left      → LiDAR -X (or similar horizontal)
-                    //   IMU +Z = LiDAR forward   → LiDAR +Y? or +X?
-                    // Previous remap (imu_x, imu_z, -imu_y) put tilt in LiDAR Y
-                    // but visual test showed 90° CW error → swap X/Y:
-                    //   LiDAR = (imu_z, -imu_x, -imu_y)
-                    if let Some(imu) = &info.imu {
-                        if !logged_imu_raw {
-                            info!(
-                                "IMU raw sensor: accel=({:.3}, {:.3}, {:.3}) gyro=({:.3}, {:.3}, {:.3})",
-                                imu.accel_x,
-                                imu.accel_y,
-                                imu.accel_z,
-                                imu.gyro_x,
-                                imu.gyro_y,
-                                imu.gyro_z
-                            );
-                            logged_imu_raw = true;
-                        }
-                        if let Ok(mut lock) = imu_writer.lock() {
-                            *lock = Some((imu.accel_z, -imu.accel_x, -imu.accel_y));
-                        }
-                    }
-
-                    // Publish IMU data if present and wall-clock stamp available
-                    if let Some(imu) = &info.imu
-                        && let Some(stamp) = get_stamp()
-                    {
-                        match encode_imu_cdr(
-                            stamp,
-                            imu_frame_id.as_str(),
-                            Vector3 {
-                                x: imu.gyro_x as f64,
-                                y: imu.gyro_y as f64,
-                                z: imu.gyro_z as f64,
-                            },
-                            Vector3 {
-                                x: imu.accel_x as f64,
-                                y: imu.accel_y as f64,
-                                z: imu.accel_z as f64,
-                            },
-                        ) {
-                            Ok(cdr) => {
-                                let zbytes = ZBytes::from(cdr);
-                                let enc =
-                                    Encoding::APPLICATION_CDR.with_schema("sensor_msgs/msg/Imu");
-                                if let Err(e) =
-                                    publish_cdr(&imu_publisher, &session_difop, zbytes, enc).await
-                                {
-                                    debug!("IMU publish error: {:?}", e);
-                                }
-                            }
-                            Err(e) => debug!("IMU encode error: {:?}", e),
-                        }
-                    }
-
-                    last_device_info = Some(info);
-                }
+            match sock
+                .async_io(Interest::READABLE, || receiver.recv(sock.as_raw_fd()))
+                .await
+            {
+                Ok(_) => rx_monitor.recovered(),
                 Err(e) => {
-                    error!("DIFOP recv error: {:?}", e);
+                    if let Some(pause) = rx_monitor.error(&e) {
+                        tokio::time::sleep(pause).await;
+                    }
+                    continue;
                 }
+            }
+
+            for datagram in receiver.datagrams() {
+                // Another sensor's DIFOP must not change this sensor's
+                // synchronization state or publish its IMU.
+                if source_filter.is_some_and(|ip| datagram.source != Some(ip)) {
+                    continue;
+                }
+                if !rx_monitor.accept(&datagram) {
+                    continue;
+                }
+
+                // Extract device info under lock, then release before await
+                let info = {
+                    let Ok(mut driver) = difop_driver.lock() else {
+                        continue;
+                    };
+                    if let Err(e) = driver.process_difop(datagram.data) {
+                        debug!("DIFOP parse error: {:?}", e);
+                        continue;
+                    }
+                    driver.device_info().clone()
+                };
+
+                // First DIFOP: log at INFO level
+                if !logged_device_info {
+                    info!(
+                        serial = %info.serial_string(),
+                        firmware = %info.version_string(),
+                        timesync_mode = ?info.timesync_mode,
+                        timesync_status = ?info.timesync_status,
+                        "Robosense E1R device info"
+                    );
+                    logged_device_info = true;
+                } else if let Some(last) = &last_device_info
+                    && (last.timesync_mode, last.timesync_status)
+                        != (info.timesync_mode, info.timesync_status)
+                {
+                    info!(
+                        timesync_mode = ?info.timesync_mode,
+                        timesync_status = ?info.timesync_status,
+                        "Robosense E1R time synchronization changed"
+                    );
+                } else if last_device_info.as_ref() != Some(&info) {
+                    trace!(
+                        serial = %info.serial_string(),
+                        firmware = %info.version_string(),
+                        "DIFOP device info updated"
+                    );
+                }
+
+                // Store latest IMU accel for ground plane filtering, mapped
+                // to the LiDAR frame as (imu_z, -imu_x, -imu_y); IMU +Y is
+                // gravity (LiDAR -Z).
+                if let Some(imu) = &info.imu {
+                    if !logged_imu_raw {
+                        info!(
+                            "IMU raw sensor: accel=({:.3}, {:.3}, {:.3}) gyro=({:.3}, {:.3}, {:.3})",
+                            imu.accel_x,
+                            imu.accel_y,
+                            imu.accel_z,
+                            imu.gyro_x,
+                            imu.gyro_y,
+                            imu.gyro_z
+                        );
+                        logged_imu_raw = true;
+                    }
+                    if let Ok(mut lock) = imu_writer.lock() {
+                        *lock = Some((imu.accel_z, -imu.accel_x, -imu.accel_y));
+                    }
+                }
+
+                // Publish IMU data stamped with the DIFOP receive time
+                if let Some(imu) = &info.imu {
+                    let stamp = stamp_from_ns(system_time_ns(datagram.rx_time));
+                    match encode_imu_cdr(
+                        stamp,
+                        imu_frame_id.as_str(),
+                        Vector3 {
+                            x: imu.gyro_x as f64,
+                            y: imu.gyro_y as f64,
+                            z: imu.gyro_z as f64,
+                        },
+                        Vector3 {
+                            x: imu.accel_x as f64,
+                            y: imu.accel_y as f64,
+                            z: imu.accel_z as f64,
+                        },
+                    ) {
+                        Ok(cdr) => {
+                            let zbytes = ZBytes::from(cdr);
+                            let enc = Encoding::APPLICATION_CDR.with_schema("sensor_msgs/msg/Imu");
+                            if let Err(e) =
+                                publish_cdr(&imu_publisher, zbytes, enc, ts_id, &stamp).await
+                            {
+                                debug!("IMU publish error: {:?}", e);
+                            }
+                        }
+                        Err(e) => debug!("IMU encode error: {:?}", e),
+                    }
+                }
+
+                last_device_info = Some(info);
             }
         }
     });
 
-    // Wait for DIFOP startup confirmation (PR #7 fix)
+    // Wait for DIFOP startup confirmation
     match startup_rx.await {
         Ok(Ok(())) => info!("DIFOP listener started on port {}", difop_port),
         Ok(Err(e)) => warn!("DIFOP bind failed: {} (continuing without DIFOP)", e),
@@ -363,14 +430,8 @@ async fn run_robosense(session: Session, args: Args) -> Result<(), Box<dyn std::
     let bind_addr = format!("0.0.0.0:{}", args.msop_port);
     info!("Listening for MSOP packets on port {}", args.msop_port);
 
-    // Parse target as source IP filter for Robosense
-    let source_filter: Option<std::net::IpAddr> = args
-        .target
-        .as_deref()
-        .filter(|t| !t.is_empty())
-        .map(|t| t.parse())
-        .transpose()
-        .map_err(|e| format!("Invalid target IP address: {}", e))?;
+    // The E1R follows grandmaster steps on its own; host steps are only logged.
+    spawn_named("clock-step", || clock_step_monitor(None));
 
     // Create client-owned frame
     let frame = RobosenseLidarFrame::new();
@@ -601,16 +662,17 @@ struct RobosenseDriverWrapper {
 }
 
 impl LidarDriver for RobosenseDriverWrapper {
-    fn process<F: lidar::LidarFrameWriter>(
+    fn process_at<F: lidar::LidarFrameWriter>(
         &mut self,
         frame: &mut F,
         data: &[u8],
+        rx_time: SystemTime,
     ) -> Result<bool, lidar::Error> {
         // Handle mutex poison gracefully - the DIFOP thread may have panicked
         // but the driver state is likely still valid for packet processing
         match self.inner.lock() {
             Ok(mut driver) => {
-                let result = driver.process(frame, data);
+                let result = driver.process_at(frame, data, rx_time);
                 if !self.logged_return_mode
                     && let Ok(true) = &result
                 {
@@ -624,8 +686,15 @@ impl LidarDriver for RobosenseDriverWrapper {
                     "Driver mutex poisoned (DIFOP thread may have panicked), \
                      recovering with potentially stale device info"
                 );
-                poisoned.into_inner().process(frame, data)
+                poisoned.into_inner().process_at(frame, data, rx_time)
             }
+        }
+    }
+
+    fn set_host_latency(&mut self, latency: Duration) {
+        match self.inner.lock() {
+            Ok(mut driver) => driver.set_host_latency(latency),
+            Err(poisoned) => poisoned.into_inner().set_host_latency(latency),
         }
     }
 }
@@ -682,11 +751,12 @@ async fn run_lidar_loop<D: LidarDriver, F: lidar::LidarFrameWriter + LidarFrame>
     }
 
     common::set_process_priority();
-    let sock = UdpSocket::bind(bind_addr).await?;
-    let sock = common::set_socket_bufsize(sock.into_std()?, 16 * 1024 * 1024);
-    let sock = UdpSocket::from_std(sock)?;
+    let sock = bind_udp(bind_addr, Some(LIDAR_RECV_BUFFER))?;
+    let mut receiver = net::Receiver::new(LIDAR_RECV_BATCH, net::MAX_DATAGRAM);
+    let ts_id = common::timestamp_id(&session);
+    let mut rx_monitor = RxMonitor::new("LiDAR");
 
-    let mut buf = [0u8; 16 * 1024];
+    driver.set_host_latency(Duration::from_nanos(args.lidar_latency));
 
     if let Some(filter_ip) = source_filter {
         info!("Filtering packets from source IP: {}", filter_ip);
@@ -694,80 +764,525 @@ async fn run_lidar_loop<D: LidarDriver, F: lidar::LidarFrameWriter + LidarFrame>
     info!("Starting LiDAR processing loop");
 
     loop {
-        let (len, src_addr) = match sock.recv_from(&mut buf).await {
-            Ok((len, addr)) => (len, addr),
+        match sock
+            .async_io(Interest::READABLE, || receiver.recv(sock.as_raw_fd()))
+            .await
+        {
+            Ok(_) => rx_monitor.recovered(),
             Err(e) => {
-                error!("UDP recv error: {:?}", e);
+                if let Some(pause) = rx_monitor.error(&e) {
+                    tokio::time::sleep(pause).await;
+                }
                 continue;
             }
-        };
-
-        // Filter by source IP if configured
-        if let Some(filter_ip) = source_filter
-            && src_addr.ip() != filter_ip
-        {
-            continue;
         }
 
-        // Process packet into client-owned frame
-        match driver.process(&mut frame, &buf[..len]) {
-            Ok(true) => {
-                // Frame is complete - process it
-                let n_points = frame.len();
-                let timestamp_ns = frame.timestamp();
-                let frame_id = frame.frame_id();
-
-                trace!(
-                    timestamp = timestamp_ns,
-                    frame_id = frame_id,
-                    n_points = n_points,
-                    "publishing frame"
-                );
-
-                let timestamp = Time::from_nanos(timestamp_ns);
-
-                // Send to clustering if enabled
-                if args.clustering_enabled() {
-                    // Use pre-computed range directly - NO sqrt needed! (PR #2 fix)
-                    let ranges: Vec<f32> = frame.range().to_vec();
-                    let points = lidar::Points {
-                        x: frame.x().to_vec(),
-                        y: frame.y().to_vec(),
-                        z: frame.z().to_vec(),
-                        intensity: frame.intensity().to_vec(),
-                    };
-                    let imu_accel = if args.ground_filter {
-                        latest_imu.lock().ok().and_then(|lock| *lock)
-                    } else {
-                        None
-                    };
-                    let _ = tx_cluster.send((ranges, points, timestamp, imu_accel));
-                }
-
-                // Format and publish point cloud
-                let (msg, enc) = format_points(
-                    &frame,
-                    timestamp,
-                    args.frame_id.clone(),
-                    args.mirror_y(),
-                    args.mirror_z(),
-                )?;
-
-                if let Err(e) = publish_cdr(&points_publisher, &session, msg, enc).await {
-                    error!("publish points error: {:?}", e);
-                }
-
-                args.tracy.then(frame_mark);
+        for datagram in receiver.datagrams() {
+            // Filter by source IP if configured
+            if let Some(filter_ip) = source_filter
+                && datagram.source != Some(filter_ip)
+            {
+                continue;
             }
-            Ok(false) => {
-                // More packets needed to complete frame
+
+            if !rx_monitor.accept(&datagram) {
+                continue;
             }
-            Err(e) => {
-                debug!("Packet processing error: {:?}", e);
+
+            // Process packet into client-owned frame
+            match driver.process_at(&mut frame, datagram.data, datagram.rx_time) {
+                Ok(true) => {
+                    publish_frame(
+                        &frame,
+                        &args,
+                        &points_publisher,
+                        ts_id,
+                        &tx_cluster,
+                        &latest_imu,
+                    )
+                    .await?;
+                }
+                Ok(false) => {
+                    // More packets needed to complete frame
+                }
+                Err(e) => {
+                    debug!("Packet processing error: {:?}", e);
+                }
             }
         }
     }
 }
+
+/// Frame data sent to the clustering thread: ranges, points, stamp and the
+/// latest IMU acceleration when the ground filter is enabled.
+type ClusterInput = (Vec<f32>, lidar::Points, Time, Option<(f32, f32, f32)>);
+
+/// Publishes a completed frame as a point cloud and hands it to the
+/// clustering thread when clustering is enabled.
+async fn publish_frame<F: LidarFrame>(
+    frame: &F,
+    args: &Args,
+    points_publisher: &zenoh::pubsub::Publisher<'_>,
+    ts_id: TimestampId,
+    tx_cluster: &kanal::Sender<ClusterInput>,
+    latest_imu: &Mutex<Option<(f32, f32, f32)>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let timestamp_ns = frame.timestamp();
+    trace!(
+        timestamp = timestamp_ns,
+        frame_id = frame.frame_id(),
+        n_points = frame.len(),
+        "publishing frame"
+    );
+
+    let timestamp = stamp_from_ns(timestamp_ns);
+
+    if args.clustering_enabled() {
+        // Range comes from the driver, no sqrt needed
+        let ranges: Vec<f32> = frame.range().to_vec();
+        let points = lidar::Points {
+            x: frame.x().to_vec(),
+            y: frame.y().to_vec(),
+            z: frame.z().to_vec(),
+            intensity: frame.intensity().to_vec(),
+        };
+        let imu_accel = if args.ground_filter {
+            latest_imu.lock().ok().and_then(|lock| *lock)
+        } else {
+            None
+        };
+        let _ = tx_cluster.send((ranges, points, timestamp, imu_accel));
+    }
+
+    let (msg, enc) = format_points(
+        frame,
+        timestamp,
+        args.frame_id.clone(),
+        args.mirror_y(),
+        args.mirror_z(),
+    )?;
+
+    if let Err(e) = publish_cdr(points_publisher, msg, enc, ts_id, &timestamp).await {
+        error!("publish points error: {:?}", e);
+    }
+
+    args.tracy.then(frame_mark);
+    Ok(())
+}
+
+/// Requested receive buffer for the LiDAR data socket, about 3 s of E1R
+/// data or 1.5 s of Ouster 1024x20 data.
+const LIDAR_RECV_BUFFER: usize = 16 * 1024 * 1024;
+
+/// Maximum datagrams read per receive call on the LiDAR data socket.
+const LIDAR_RECV_BATCH: usize = 32;
+
+/// Time after binding during which datagrams without a kernel receive
+/// timestamp are expected, while the kernel enables timestamping.
+const RX_STAMP_GRACE: Duration = Duration::from_secs(1);
+
+/// Pause after a receive error before the next attempt.
+const RX_ERROR_PAUSE: Duration = Duration::from_millis(10);
+
+/// Receive-path conditions that are logged once or rate-limited rather than
+/// per datagram.
+struct RxMonitor {
+    name: &'static str,
+    started: Instant,
+    logged_unstamped: bool,
+    logged_truncated: bool,
+    error_streak: u64,
+}
+
+impl RxMonitor {
+    fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            started: Instant::now(),
+            logged_unstamped: false,
+            logged_truncated: false,
+            error_streak: 0,
+        }
+    }
+
+    /// Returns whether a datagram should be processed. Truncated datagrams
+    /// are dropped.
+    fn accept(&mut self, datagram: &net::Datagram) -> bool {
+        if datagram.truncated {
+            if !self.logged_truncated {
+                warn!(
+                    "{}: dropping UDP datagrams larger than {} bytes",
+                    self.name,
+                    datagram.data.len()
+                );
+                self.logged_truncated = true;
+            }
+            return false;
+        }
+        if !datagram.kernel_stamped
+            && !self.logged_unstamped
+            && self.started.elapsed() > RX_STAMP_GRACE
+        {
+            warn!(
+                "{}: datagram without a kernel receive timestamp, stamped when read",
+                self.name
+            );
+            self.logged_unstamped = true;
+        }
+        true
+    }
+
+    /// Logs a receive error (the first of a run, then every 1000th) and
+    /// returns how long to pause before the next attempt.
+    fn error(&mut self, err: &std::io::Error) -> Option<Duration> {
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            return None;
+        }
+        self.error_streak += 1;
+        if self.error_streak == 1 || self.error_streak.is_multiple_of(1000) {
+            error!(
+                "{}: UDP receive error ({} in a row): {err}",
+                self.name, self.error_streak
+            );
+        }
+        Some(RX_ERROR_PAUSE)
+    }
+
+    /// Records a successful receive, logging the end of an error run.
+    fn recovered(&mut self) {
+        if self.error_streak > 0 {
+            info!(
+                "{}: UDP receive recovered after {} errors",
+                self.name, self.error_streak
+            );
+            self.error_streak = 0;
+        }
+    }
+}
+
+/// Binds a non-blocking UDP socket with kernel receive timestamps and, when
+/// `recv_buffer` is given, a receive buffer of that size.
+///
+/// Missing receive timestamps or a smaller buffer are logged, not errors.
+fn bind_udp(addr: &str, recv_buffer: Option<usize>) -> std::io::Result<UdpSocket> {
+    let sock = std::net::UdpSocket::bind(addr)?;
+    sock.set_nonblocking(true)?;
+    let fd = sock.as_raw_fd();
+
+    if let Some(size) = recv_buffer {
+        match net::set_recv_buffer(fd, size) {
+            Ok(granted) if granted < size => warn!(
+                "{addr}: UDP receive buffer is {granted} bytes, requested {size}; \
+                 run with CAP_NET_ADMIN or raise net.core.rmem_max"
+            ),
+            Ok(granted) => debug!("{addr}: UDP receive buffer is {granted} bytes"),
+            Err(e) => warn!("{addr}: cannot set the UDP receive buffer: {e}"),
+        }
+    }
+
+    if let Err(e) = net::enable_rx_timestamps(fd) {
+        warn!(
+            "{addr}: kernel receive timestamps unavailable, using the clock after each receive: {e}"
+        );
+    }
+
+    UdpSocket::from_std(sock)
+}
+
+/// Converts nanoseconds since the Unix epoch to a message stamp, saturating
+/// past the `i32` seconds range (Y2038).
+fn stamp_from_ns(ns: u64) -> Time {
+    let sec = ns / 1_000_000_000;
+    match i32::try_from(sec) {
+        Ok(sec) => Time {
+            sec,
+            nanosec: (ns % 1_000_000_000) as u32,
+        },
+        Err(_) => {
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                warn!("Timestamp overflow: stamp exceeds i32 range (Y2038), saturating");
+            }
+            Time {
+                sec: i32::MAX,
+                nanosec: 999_999_999,
+            }
+        }
+    }
+}
+
+/// Ouster PTP offset from master below which the sensor clock can become
+/// the stamp source.
+const OUSTER_PTP_ENTER_OFFSET_NS: f64 = 1_000_000.0;
+
+/// Ouster PTP offset from master above which the sensor clock stops being the
+/// stamp source.
+const OUSTER_PTP_EXIT_OFFSET_NS: f64 = 2_000_000.0;
+
+/// Consecutive polls within [`OUSTER_PTP_ENTER_OFFSET_NS`] required before
+/// the sensor clock becomes the stamp source, so a converging PTP servo does
+/// not switch the source back and forth.
+const OUSTER_PTP_ENTER_POLLS: u32 = 5;
+
+/// Consecutive failed polls after which a synchronized Ouster clock stops
+/// being the stamp source; fewer failures keep the current state.
+const OUSTER_PTP_MAX_FAILED_POLLS: u32 = 3;
+
+/// Longest wait between attempts to restart the Ouster PTP client.
+#[cfg(target_os = "linux")]
+const OUSTER_PTP_RESTART_MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Interval between Ouster PTP status polls.
+const OUSTER_PTP_POLL: Duration = Duration::from_secs(1);
+
+/// Host clock steps at least this large restart the Ouster PTP client. The
+/// Ouster steps its clock only when its PTP client starts and slews any later
+/// offset at well under 1 ms/s, while a restart converges in about 25 s.
+#[cfg(target_os = "linux")]
+const OUSTER_PTP_RESTART_STEP_NS: i128 = 10_000_000;
+
+/// Host clock steps at least this large are logged at INFO level.
+#[cfg(target_os = "linux")]
+const CLOCK_STEP_LOG_NS: i128 = 1_000_000;
+
+/// Spawns a named background thread, logging when it cannot be started.
+fn spawn_named(name: &str, f: impl FnOnce() + Send + 'static) {
+    if let Err(e) = std::thread::Builder::new().name(name.to_owned()).spawn(f) {
+        error!("could not start the {name} thread: {e}");
+    }
+}
+
+/// HTTP agent for the Ouster API with a bounded request time.
+fn ouster_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(2)))
+        .build()
+        .into()
+}
+
+/// PTP state reported by an Ouster sensor at `/api/v1/time/ptp`.
+#[derive(Debug, PartialEq)]
+struct OusterPtpStatus {
+    profile: String,
+    port_state: String,
+    offset_ns: f64,
+}
+
+impl OusterPtpStatus {
+    fn from_json(value: &serde_json::Value) -> Option<Self> {
+        Some(Self {
+            profile: value["profile"].as_str().unwrap_or_default().to_owned(),
+            port_state: value["port_data_set"]["port_state"].as_str()?.to_owned(),
+            offset_ns: value["current_data_set"]["offset_from_master"].as_f64()?,
+        })
+    }
+
+    fn locked_within(&self, offset_ns: f64) -> bool {
+        self.port_state == "SLAVE" && self.offset_ns.abs() < offset_ns
+    }
+}
+
+/// Decides from successive PTP polls whether the Ouster clock is
+/// synchronized, with hysteresis between entering and leaving.
+#[derive(Debug, Default)]
+struct OusterPtpTracker {
+    synced: bool,
+    streak: u32,
+    failures: u32,
+}
+
+impl OusterPtpTracker {
+    /// Updates the state with a poll result (`None` when the poll failed) and
+    /// returns whether the sensor clock is synchronized.
+    fn update(&mut self, status: Option<&OusterPtpStatus>) -> bool {
+        if status.is_none() {
+            self.failures += 1;
+            if self.synced && self.failures < OUSTER_PTP_MAX_FAILED_POLLS {
+                return true;
+            }
+        } else {
+            self.failures = 0;
+        }
+        let within_enter = status.is_some_and(|s| s.locked_within(OUSTER_PTP_ENTER_OFFSET_NS));
+        let within_exit = status.is_some_and(|s| s.locked_within(OUSTER_PTP_EXIT_OFFSET_NS));
+        self.streak = if within_enter { self.streak + 1 } else { 0 };
+        self.synced = if self.synced {
+            within_exit
+        } else {
+            self.streak >= OUSTER_PTP_ENTER_POLLS
+        };
+        self.synced
+    }
+
+    /// Forgets the synchronized state, for example after the sensor's PTP
+    /// client was restarted.
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// Shared state between the Ouster PTP monitor, the clock step monitor and
+/// the driver.
+struct OusterPtpShared {
+    /// Set while frames may be stamped from the sensor clock.
+    synced: Arc<AtomicBool>,
+    /// Incremented by the clock step monitor when it restarts the sensor's
+    /// PTP client, so the PTP monitor discards polls that straddle a restart.
+    restarts: AtomicU64,
+}
+
+fn ouster_ptp_status(
+    agent: &ureq::Agent,
+    target: &str,
+) -> Result<OusterPtpStatus, Box<dyn std::error::Error>> {
+    let value = agent
+        .get(&format!("http://{target}/api/v1/time/ptp"))
+        .call()?
+        .body_mut()
+        .read_json::<serde_json::Value>()?;
+    OusterPtpStatus::from_json(&value).ok_or_else(|| "unexpected PTP status format".into())
+}
+
+/// Polls the Ouster PTP state and sets `synced` while the sensor clock is
+/// synchronized to its grandmaster.
+fn ouster_ptp_monitor(target: String, shared: Arc<OusterPtpShared>) {
+    let agent = ouster_agent();
+    let mut tracker = OusterPtpTracker::default();
+    let mut seen_restarts = 0;
+    let mut last: Option<(Option<String>, bool)> = None;
+    loop {
+        let before = shared.restarts.load(Ordering::SeqCst);
+        let status = ouster_ptp_status(&agent, &target);
+        let after = shared.restarts.load(Ordering::SeqCst);
+        if after != seen_restarts {
+            tracker.reset();
+            seen_restarts = after;
+        }
+        // A poll that straddles a restart may describe the sensor before the
+        // host step and is not trusted.
+        let now_synced = before == after && tracker.update(status.as_ref().ok());
+        shared.synced.store(now_synced, Ordering::SeqCst);
+        // A restart after the check above must win over this store.
+        if shared.restarts.load(Ordering::SeqCst) != after {
+            shared.synced.store(false, Ordering::SeqCst);
+        }
+
+        let state = (
+            status.as_ref().ok().map(|s| s.port_state.clone()),
+            now_synced,
+        );
+        if last.as_ref() != Some(&state) {
+            match &status {
+                Ok(status) => info!(
+                    profile = %status.profile,
+                    port_state = %status.port_state,
+                    offset_ms = status.offset_ns / 1e6,
+                    synced = now_synced,
+                    "Ouster PTP state"
+                ),
+                Err(e) => warn!("Ouster PTP state unavailable: {e}"),
+            }
+            last = Some(state);
+        }
+
+        sleep(OUSTER_PTP_POLL);
+    }
+}
+
+/// Restarts the Ouster PTP client by re-applying its current profile, so it
+/// steps its clock to the grandmaster again. Returns the profile.
+fn restart_ouster_ptp(
+    agent: &ureq::Agent,
+    target: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let url = format!("http://{target}/api/v1/time/ptp/profile");
+    let profile = agent.get(&url).call()?.body_mut().read_json::<String>()?;
+    agent.put(&url).send_json(&profile)?;
+    Ok(profile)
+}
+
+/// Logs host clock steps and, for an Ouster in PTP mode, restarts its PTP
+/// client after a step so the sensor clock follows the host again.
+#[cfg(target_os = "linux")]
+fn clock_step_monitor(ouster_ptp: Option<(String, Arc<OusterPtpShared>)>) {
+    let mut watcher = match clock::ClockStepWatcher::new() {
+        Ok(watcher) => watcher,
+        Err(e) => {
+            error!(
+                "cannot watch for host clock steps, so they are not logged{}: {e}",
+                restart_note(&ouster_ptp)
+            );
+            return;
+        }
+    };
+    let agent = ouster_agent();
+
+    loop {
+        let step_ns = match watcher.wait() {
+            Ok(step_ns) => step_ns,
+            Err(e) => {
+                error!(
+                    "stopped watching for host clock steps, so they are no longer logged{}: {e}",
+                    restart_note(&ouster_ptp)
+                );
+                return;
+            }
+        };
+
+        if step_ns.abs() >= CLOCK_STEP_LOG_NS {
+            info!(step_s = step_ns as f64 / 1e9, "host clock stepped");
+        } else {
+            debug!(step_ns = step_ns as i64, "host clock set");
+        }
+
+        if let Some((target, shared)) = &ouster_ptp
+            && step_ns.abs() >= OUSTER_PTP_RESTART_STEP_NS
+        {
+            shared.restarts.fetch_add(1, Ordering::SeqCst);
+            shared.synced.store(false, Ordering::SeqCst);
+            restart_ouster_ptp_until_done(&agent, target);
+        }
+    }
+}
+
+/// Restarts the Ouster PTP client, retrying with backoff until it succeeds.
+#[cfg(target_os = "linux")]
+fn restart_ouster_ptp_until_done(agent: &ureq::Agent, target: &str) {
+    let mut backoff = Duration::from_secs(1);
+    let mut failures = 0u32;
+    loop {
+        match restart_ouster_ptp(agent, target) {
+            Ok(profile) => {
+                info!(
+                    profile = %profile,
+                    failed_attempts = failures,
+                    "restarted the Ouster PTP client to follow the host clock step"
+                );
+                return;
+            }
+            Err(e) => {
+                if failures == 0 {
+                    warn!("could not restart the Ouster PTP client, retrying: {e}");
+                }
+                failures += 1;
+            }
+        }
+        sleep(backoff);
+        backoff = (backoff * 2).min(OUSTER_PTP_RESTART_MAX_BACKOFF);
+    }
+}
+
+/// Consequence of losing clock step handling, for the log.
+#[cfg(target_os = "linux")]
+fn restart_note(ouster_ptp: &Option<(String, Arc<OusterPtpShared>)>) -> &'static str {
+    match ouster_ptp {
+        Some(_) => " and the Ouster PTP client is not restarted after them",
+        None => "",
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn clock_step_monitor(_ouster_ptp: Option<(String, Arc<OusterPtpShared>)>) {}
 
 /// Gets the current wall-clock timestamp for message headers.
 ///
@@ -817,17 +1332,18 @@ fn format_points<F: LidarFrame>(
     Ok((zbytes, enc))
 }
 
-/// Put a CDR payload with a Zenoh source timestamp from `session`.
+/// Put a CDR payload whose Zenoh sample timestamp equals its `stamp`.
 async fn publish_cdr(
     publisher: &zenoh::pubsub::Publisher<'_>,
-    session: &Session,
     payload: impl Into<ZBytes>,
     encoding: Encoding,
+    ts_id: TimestampId,
+    stamp: &Time,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     publisher
         .put(payload)
         .encoding(encoding)
-        .timestamp(session.new_timestamp())
+        .timestamp(common::zenoh_timestamp(ts_id, stamp))
         .await
 }
 
@@ -839,44 +1355,55 @@ async fn tf_static_loop(session: Session, args: Args) {
         .await
         .unwrap();
 
-    let stamp = get_stamp().unwrap_or_else(|| {
-        warn!("tf_static: system clock unavailable, using epoch-zero timestamp");
-        Time { sec: 0, nanosec: 0 }
-    });
-    let cdr = match encode_transform_stamped_cdr(
-        stamp,
-        args.base_frame_id.as_str(),
-        args.frame_id.as_str(),
-        Vector3 {
-            x: args.tf_vec[0],
-            y: args.tf_vec[1],
-            z: args.tf_vec[2],
-        },
-        Quaternion {
-            x: args.tf_quat[0],
-            y: args.tf_quat[1],
-            z: args.tf_quat[2],
-            w: args.tf_quat[3],
-        },
-    ) {
-        Ok(cdr) => cdr,
-        Err(e) => {
-            error!("TransformStamped encode failed: {e}");
-            return;
-        }
-    };
-
-    let msg = ZBytes::from(cdr);
+    let ts_id = common::timestamp_id(&session);
     let enc = Encoding::APPLICATION_CDR.with_schema("geometry_msgs/msg/TransformStamped");
-
     let interval = Duration::from_secs(1);
     let mut target_time = Instant::now() + interval;
+    let mut warned_epoch = false;
+    let mut publish_failing = false;
 
     loop {
-        publish_cdr(&publisher, &session, msg.clone(), enc.clone())
-            .await
-            .unwrap();
-        trace!("lidarpub publishing tf_static");
+        // Re-stamp at each republish so the stamp follows host clock steps.
+        let stamp = get_stamp().unwrap_or_else(|| {
+            if !warned_epoch {
+                warn!("tf_static: system clock unavailable, using epoch-zero timestamp");
+                warned_epoch = true;
+            }
+            Time { sec: 0, nanosec: 0 }
+        });
+        match encode_transform_stamped_cdr(
+            stamp,
+            args.base_frame_id.as_str(),
+            args.frame_id.as_str(),
+            Vector3 {
+                x: args.tf_vec[0],
+                y: args.tf_vec[1],
+                z: args.tf_vec[2],
+            },
+            Quaternion {
+                x: args.tf_quat[0],
+                y: args.tf_quat[1],
+                z: args.tf_quat[2],
+                w: args.tf_quat[3],
+            },
+        ) {
+            Ok(cdr) => {
+                match publish_cdr(&publisher, ZBytes::from(cdr), enc.clone(), ts_id, &stamp).await {
+                    Ok(()) if publish_failing => {
+                        info!("tf_static publishing recovered");
+                        publish_failing = false;
+                    }
+                    Ok(()) => {}
+                    Err(e) if !publish_failing => {
+                        warn!("tf_static publish error: {e:?}");
+                        publish_failing = true;
+                    }
+                    Err(_) => {}
+                }
+                trace!("lidarpub publishing tf_static");
+            }
+            Err(e) => error!("TransformStamped encode failed: {e}"),
+        }
         tokio::time::sleep(target_time.saturating_duration_since(Instant::now())).await;
         target_time += interval;
     }
@@ -935,7 +1462,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn publish_cdr_attaches_session_timestamp() {
+    async fn publish_cdr_timestamp_equals_stamp() {
         let session = zenoh::open(test_zenoh_config()).await.unwrap();
         let key = format!("lidarpub/test/publish_cdr/{}", std::process::id());
         let subscriber = session.declare_subscriber(key.clone()).await.unwrap();
@@ -943,18 +1470,154 @@ mod tests {
 
         let payload = ZBytes::from(vec![1u8, 2, 3, 4]);
         let enc = Encoding::APPLICATION_CDR.with_schema("sensor_msgs/msg/PointCloud2");
-        publish_cdr(&publisher, &session, payload, enc)
-            .await
-            .expect("publish_cdr");
+        let stamp = Time {
+            sec: 1_234_567_890,
+            nanosec: 123_456_789,
+        };
+        publish_cdr(
+            &publisher,
+            payload,
+            enc,
+            common::timestamp_id(&session),
+            &stamp,
+        )
+        .await
+        .expect("publish_cdr");
 
         let sample = tokio::time::timeout(Duration::from_secs(5), subscriber.recv_async())
             .await
             .expect("timed out waiting for sample")
             .expect("recv sample");
-        assert!(
-            sample.timestamp().is_some(),
-            "published sample should carry a Zenoh source timestamp"
-        );
+        let ts = sample
+            .timestamp()
+            .expect("published sample should carry a Zenoh source timestamp")
+            .get_time()
+            .to_duration();
+        let expected = Duration::new(stamp.sec as u64, stamp.nanosec);
+        assert!(ts.abs_diff(expected) <= Duration::from_nanos(1), "{ts:?}");
         assert_eq!(sample.payload().to_bytes().as_ref(), &[1u8, 2, 3, 4]);
+    }
+
+    fn ptp_json(port_state: &str, offset: f64) -> serde_json::Value {
+        serde_json::json!({
+            "profile": "default",
+            "port_data_set": { "port_state": port_state },
+            "current_data_set": { "offset_from_master": offset },
+        })
+    }
+
+    fn status(port_state: &str, offset: f64) -> OusterPtpStatus {
+        OusterPtpStatus::from_json(&ptp_json(port_state, offset)).unwrap()
+    }
+
+    #[test]
+    fn ouster_ptp_status_parses_api_fields() {
+        let locked = status("SLAVE", -250_000.0);
+        assert_eq!(locked.profile, "default");
+        assert_eq!(locked.port_state, "SLAVE");
+        assert!(locked.locked_within(OUSTER_PTP_ENTER_OFFSET_NS));
+        // Slewing after a host step: still SLAVE, far from the grandmaster.
+        assert!(!status("SLAVE", 3.1e9).locked_within(OUSTER_PTP_EXIT_OFFSET_NS));
+        // PTP version mismatch leaves the port uncalibrated.
+        assert!(!status("UNCALIBRATED", 0.0).locked_within(OUSTER_PTP_EXIT_OFFSET_NS));
+        assert!(OusterPtpStatus::from_json(&serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn ouster_ptp_tracker_enters_after_consecutive_polls() {
+        let near = status("SLAVE", 400_000.0);
+        let mut tracker = OusterPtpTracker::default();
+        for _ in 1..OUSTER_PTP_ENTER_POLLS {
+            assert!(!tracker.update(Some(&near)));
+        }
+        assert!(tracker.update(Some(&near)));
+
+        // A converging servo crossing the threshold restarts the count.
+        let mut tracker = OusterPtpTracker::default();
+        for _ in 1..OUSTER_PTP_ENTER_POLLS {
+            tracker.update(Some(&near));
+        }
+        assert!(!tracker.update(Some(&status("SLAVE", 7_700_000.0))));
+        assert!(!tracker.update(Some(&near)));
+    }
+
+    #[test]
+    fn ouster_ptp_tracker_leaves_on_large_offset_state_or_error() {
+        let near = status("SLAVE", 400_000.0);
+        let synced = || {
+            let mut tracker = OusterPtpTracker::default();
+            for _ in 0..OUSTER_PTP_ENTER_POLLS {
+                tracker.update(Some(&near));
+            }
+            tracker
+        };
+
+        // Between the enter and exit thresholds: stays synchronized.
+        let mut tracker = synced();
+        assert!(tracker.update(Some(&status("SLAVE", -1_500_000.0))));
+        assert!(!tracker.update(Some(&status("SLAVE", 2_500_000.0))));
+
+        assert!(!synced().update(Some(&status("LISTENING", 0.0))));
+
+        // A few failed polls are tolerated; the last of the limit leaves.
+        let mut tracker = synced();
+        for _ in 1..OUSTER_PTP_MAX_FAILED_POLLS {
+            assert!(tracker.update(None));
+        }
+        assert!(!tracker.update(None));
+        // Failed polls never enter the synchronized state.
+        assert!(!OusterPtpTracker::default().update(None));
+
+        let mut tracker = synced();
+        tracker.reset();
+        assert!(!tracker.update(Some(&near)));
+    }
+
+    fn datagram(data: &[u8], truncated: bool, kernel_stamped: bool) -> net::Datagram<'_> {
+        net::Datagram {
+            data,
+            rx_time: SystemTime::now(),
+            source: None,
+            truncated,
+            kernel_stamped,
+        }
+    }
+
+    #[test]
+    fn rx_monitor_drops_truncated_and_keeps_unstamped() {
+        let mut monitor = RxMonitor::new("test");
+        assert!(monitor.accept(&datagram(&[0; 8], false, true)));
+        assert!(!monitor.accept(&datagram(&[0; 8], true, true)));
+        assert!(monitor.accept(&datagram(&[0; 8], false, false)));
+    }
+
+    #[test]
+    fn rx_monitor_pauses_on_errors_except_interrupts() {
+        let mut monitor = RxMonitor::new("test");
+        let interrupted = std::io::Error::from(std::io::ErrorKind::Interrupted);
+        assert_eq!(monitor.error(&interrupted), None);
+        let refused = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+        assert_eq!(monitor.error(&refused), Some(RX_ERROR_PAUSE));
+        assert_eq!(monitor.error_streak, 1);
+        monitor.recovered();
+        assert_eq!(monitor.error_streak, 0);
+    }
+
+    #[test]
+    fn stamp_from_ns_splits_and_saturates() {
+        assert_eq!(
+            stamp_from_ns(1_790_000_000_123_456_789),
+            Time {
+                sec: 1_790_000_000,
+                nanosec: 123_456_789
+            }
+        );
+        assert_eq!(
+            stamp_from_ns(u64::MAX),
+            Time {
+                sec: i32::MAX,
+                nanosec: 999_999_999
+            }
+        );
     }
 }

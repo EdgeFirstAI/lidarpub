@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Implements the LiDAR part of the middleware timestamp contract (EDGEAI-1941,
+EDGEAI-1937).
+
+### Added
+- Frames from a PTP-synchronized sensor are stamped with the sensor's
+  start-of-frame time: the E1R MSOP header time when the packet reports a PTP
+  time mode and DIFOP reports success, and the Ouster first valid column
+  timestamp when `TIMESTAMP_MODE=ptp1588` and the sensor has reported a locked
+  PTP port within 1 ms of its grandmaster for 5 consecutive polls (left above
+  2 ms). Sensor times more than 100 ms behind or
+  5 ms ahead of the host receive time are rejected.
+- `LIDAR_LATENCY` (nanoseconds, default 0) is subtracted from host receive
+  stamps.
+- Host clock steps are detected and logged; for an Ouster in `ptp1588` mode
+  the sensor's PTP client is restarted after a step so its clock follows.
+- The frame stamp source and E1R time synchronization changes are logged.
+
+### Changed
+- Unsynchronized frames are stamped with the kernel receive time
+  (`SO_TIMESTAMPNS`) of their first packet instead of a clock read in user
+  space. The Ouster previously used the time of the frame's last packet.
+- The E1R IMU is stamped with the kernel receive time of its DIFOP packet.
+- The Zenoh sample timestamp equals `header.stamp` on every topic, including
+  `lidar/clusters`.
+- `tf_static` is re-stamped at each republish.
+- UDP packets are read in batches with `recvmmsg`, and the LiDAR socket
+  requests its 16 MiB receive buffer with `SO_RCVBUFFORCE`, falling back to
+  `SO_RCVBUF`, which `net.core.rmem_max` caps at 208 KiB by default.
+- `LidarDriver::process_at` takes the packet receive time; `process` keeps
+  its signature and uses the current time.
+
+### Fixed
+- The E1R packet that starts a new sweep was dropped, losing its points and
+  stamping the sweep at its second packet.
+- The E1R no longer falls back to its free-running clock when the system
+  clock is unusable.
+- The Ouster driver no longer reports an empty frame at startup.
+- Robosense DIFOP packets are filtered by `TARGET` like MSOP packets, so
+  another E1R on the network cannot change the synchronization state or
+  publish its IMU.
+
 ## [2.3.2] - 2026-09-15
 
 Documentation-only release. No wire-format or configuration-key changes from

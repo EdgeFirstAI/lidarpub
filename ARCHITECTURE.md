@@ -122,8 +122,11 @@ src/
 ├── ground.rs            - IMU-guided PCA ground plane filter
 ├── formats.rs           - PointCloud2 CDR serialization (SIMD)
 ├── args.rs              - CLI configuration, zenoh_namespace()
-├── common.rs            - Shared utilities, timestamps
+├── common.rs            - Shared utilities, Zenoh sample timestamps
 ├── lidar.rs             - Sensor traits and types
+├── stamp.rs             - Frame stamp selection (PTP sensor clock or host receive time)
+├── net.rs               - Batched UDP receive with kernel timestamps, receive buffer sizing
+├── clock.rs             - Host clock step detection (timerfd, Linux)
 ├── packet_source.rs     - PacketSource trait (UDP, test fixtures)
 ├── pcap_source.rs       - PCAP replay (`pcap` feature)
 └── lib.rs               - Library exports and crate-level docs
@@ -190,9 +193,9 @@ sequenceDiagram
     participant Z as Zenoh publishers
     participant Cl as cluster_thread
 
-    loop Each UDP datagram
-        UDP->>Loop: packet bytes
-        Loop->>Drv: process frame packet
+    loop Each batch of UDP datagrams (recvmmsg)
+        UDP->>Loop: packet bytes and kernel receive time
+        Loop->>Drv: process_at frame packet rx_time
         alt frame incomplete
             Drv-->>Loop: Ok false
         else frame complete
@@ -207,7 +210,7 @@ sequenceDiagram
 
 ### Robosense IMU side path
 
-DIFOP packets on `--difop-port` are handled on a separate async task. Parsed accelerometer/gyroscope samples are published to `{lidar_topic}/imu` and the latest accelerometer reading is shared (mutex) with the clustering thread when `--ground-filter` is enabled.
+DIFOP packets on `--difop-port` are handled on a separate async task, filtered by the `TARGET` source address like MSOP packets. Parsed accelerometer/gyroscope samples are published to `{lidar_topic}/imu`, stamped with the kernel receive time of the DIFOP packet, and the latest accelerometer reading is shared (mutex) with the clustering thread when `--ground-filter` is enabled. The same task keeps the driver's time synchronization state current and logs changes of the E1R time sync mode or status.
 
 ---
 
@@ -221,12 +224,16 @@ graph TB
         DifopTask["Robosense DIFOP listener"]
     end
 
-    subgraph OS [OS thread]
+    subgraph OS [OS threads]
         ClusterThread["cluster_thread blocking tokio runtime"]
+        ClockStep["clock-step: host clock step watcher"]
+        OusterPtp["ouster-ptp: Ouster PTP state poller (ptp1588 only)"]
     end
 
     MainTask --> LidarLoop
     LidarLoop -->|"kanal bounded 8"| ClusterThread
+    OusterPtp -->|"AtomicBool sensor_synced"| LidarLoop
+    ClockStep -->|"re-apply Ouster PTP profile"| OusterPtp
 ```
 
 **Clustering channel** (`run_lidar_loop`): capacity 8, payload `(Vec<f32> ranges, Points, Time, Option<IMU accel>)`. The cluster thread drains the latest frame when backlogged.
@@ -246,7 +253,20 @@ graph TB
 | `{lidar_topic}/imu` | `{hostname}/lidar/imu` | `sensor_msgs/msg/Imu` | Robosense DIFOP |
 | `tf_static` | `{hostname}/tf_static` | `geometry_msgs/msg/TransformStamped` | 1 Hz |
 
-Publisher declarations live in `run_lidar_loop`, the Robosense DIFOP handler, and `tf_static_loop`. Point clouds, IMU, and `tf_static` use `publish_cdr()` in `main.rs` to attach a Zenoh source timestamp. Cluster output is published from `cluster_thread` via `.put(...).timestamp(session.new_timestamp())` (same timestamp semantics, separate call site).
+Publisher declarations live in `run_lidar_loop`, the Robosense DIFOP handler, and `tf_static_loop`. Every sample carries a Zenoh timestamp equal to its `header.stamp` (`common::zenoh_timestamp`, exact to within NTP64's 0.23 ns resolution): point clouds, IMU and `tf_static` through `publish_cdr()` in `main.rs`, cluster output from `cluster_thread` with the stamp of the frame it was computed from. `tf_static` is re-stamped at each 1 Hz republish.
+
+### Timestamps and Clock Synchronization
+
+Stamps follow the EdgeFirst timestamp contract: `header.stamp` is the acquisition time of the frame in the host `CLOCK_REALTIME` (Unix time) domain.
+
+- **PTP-synchronized sensor:** the sensor's own start-of-frame time. Robosense E1R: the MSOP header time of the frame's first packet, when the packet reports a PTP time mode (byte 9 = `0x02` or `0x03`) and the latest DIFOP reports status success. Ouster: the first valid column timestamp of the frame, when `TIMESTAMP_MODE=ptp1588` and the `ouster-ptp` thread has seen `port_state` `SLAVE` with `offset_from_master` under 1 ms for 5 consecutive 1 s polls; it stops when the offset exceeds 2 ms, the port leaves `SLAVE`, or 3 consecutive polls fail (`OusterPtpTracker`).
+- **Otherwise:** the kernel receive time (`SO_TIMESTAMPNS`) of the frame's first packet, less `LIDAR_LATENCY`.
+- A synchronized sensor time is only used when it lies between 5 ms ahead of and 100 ms behind the host receive time of its packet (`stamp::FrameStamper`); otherwise the host time is used and a warning is logged. This rejects clocks that report synchronization but are not in the host domain, such as an Ouster slewing after a host clock step or a TAI clock.
+- The chosen source is logged at INFO when it changes (`frame stamp source`).
+
+Host clock steps are detected with a `CLOCK_REALTIME` timerfd armed with `TFD_TIMER_CANCEL_ON_SET` (`clock::ClockStepWatcher`) and logged. Host receive times follow steps without any correction. The E1R follows grandmaster steps within about a second. The Ouster only steps its clock when its PTP client starts and otherwise slews at well under 1 ms/s, so after a step of 10 ms or more lidarpub re-applies the Ouster PTP profile (`PUT /api/v1/time/ptp/profile`), which restarts the sensor's PTP client; frames use host stamps until it has converged (about 25 s).
+
+The LiDAR data socket requests a 16 MiB receive buffer with `SO_RCVBUFFORCE` (needs `CAP_NET_ADMIN`), falling back to `SO_RCVBUF`, which `net.core.rmem_max` caps at 208 KiB by default; a smaller grant is logged.
 
 ### QoS
 
@@ -454,6 +474,8 @@ See [`lidarpub.default`](lidarpub.default) for the full environment-variable tem
 | `LIDAR_TOPIC` | `lidar` | Prefix for points/clusters/imu keys |
 | `MODE` | `peer` | Zenoh participant mode (not sensor scan rate) |
 | `CLUSTERING` | `""` | `dbscan`, `voxel`, or empty |
+| `TIMESTAMP_MODE` | `internal` | Ouster clock source; `ptp1588` stamps frames from the PTP-synchronized sensor clock |
+| `LIDAR_LATENCY` | `0` | Nanoseconds subtracted from host receive stamps (not from PTP stamps) |
 
 Zenoh: `--mode`, `--connect`, `--listen`, `--no-multicast-scouting` (see `args.rs`).
 
@@ -523,9 +545,12 @@ Connect with the Tracy GUI. Cluster pipeline spans and frame marks map to LiDAR 
 
 | File | Key symbols |
 |------|-------------|
-| `main.rs` | `run`, `run_ouster`, `run_robosense`, `run_lidar_loop`, `format_points`, `publish_cdr`, `tf_static_loop` |
-| `ouster.rs` | `FrameReader`, `OusterLidarFrame`, `calculate_points_fused_into` |
+| `main.rs` | `run`, `run_ouster`, `run_robosense`, `run_lidar_loop`, `bind_udp`, `format_points`, `publish_cdr`, `tf_static_loop`, `ouster_ptp_monitor`, `clock_step_monitor` |
+| `ouster.rs` | `FrameReader`, `OusterDriver::sensor_synced`, `OusterLidarFrame`, `calculate_points_fused_into` |
 | `robosense.rs` | `RobosenseDriver`, MSOP/DIFOP parsers |
+| `stamp.rs` | `FrameStamper`, `plausible` |
+| `net.rs` | `Receiver`, `enable_rx_timestamps`, `set_recv_buffer` |
+| `clock.rs` | `ClockStepWatcher`, `realtime_minus_monotonic` |
 | `formats.rs` | PointCloud2 CDR builders, clustered layout |
 | `cluster_thread.rs` | `cluster_thread` async pipeline |
 | `cluster.rs` | `cluster_`, `voxel_cluster`, DBSCAN helpers |

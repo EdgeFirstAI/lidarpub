@@ -20,7 +20,11 @@
 //! - Device info: serial number, firmware version, network config, time sync
 //!   status
 
-use crate::lidar::{Error, LidarDriver, LidarFrame, LidarFrameWriter, timestamp};
+use crate::{
+    lidar::{Error, LidarDriver, LidarFrame, LidarFrameWriter},
+    stamp::{FrameStamper, system_time_ns},
+};
+use std::time::{Duration, SystemTime};
 
 /// MSOP packet sync bytes: 0x55, 0xaa, 0x5a, 0xa5
 const MSOP_SYNC: [u8; 4] = [0x55, 0xaa, 0x5a, 0xa5];
@@ -94,7 +98,7 @@ pub enum TimeSyncMode {
     /// Internal oscillator timing
     #[default]
     Internal = 0x00,
-    /// PTP E2E time synchronization
+    /// IEEE 1588 E2E time synchronization over Ethernet (Layer 2 only)
     PtpE2E = 0x02,
     /// gPTP (IEEE 802.1AS) time synchronization
     Gptp = 0x03,
@@ -330,8 +334,12 @@ pub struct RobosenseDriver {
     device_info: DeviceInfo,
     /// Whether we've received any packets yet
     first_packet: bool,
-    /// Frame was completed on previous call; next call must reset before processing
-    needs_reset: bool,
+    /// Packet that closed the previous frame; it starts the next one
+    pending_packet: Vec<u8>,
+    /// Receive time of the pending packet, `None` when there is none
+    pending_rx: Option<SystemTime>,
+    /// Chooses each frame's stamp
+    stamper: FrameStamper,
     /// Return mode from MSOP header
     return_mode: ReturnMode,
     /// Whether to filter noisy points (PointAttribute == 2)
@@ -346,7 +354,9 @@ impl RobosenseDriver {
             last_pkt_cnt: u16::MAX,
             device_info: DeviceInfo::default(),
             first_packet: true,
-            needs_reset: false,
+            pending_packet: vec![0; MSOP_PACKET_SIZE],
+            pending_rx: None,
+            stamper: FrameStamper::new("robosense"),
             return_mode: ReturnMode::default(),
             filter_noisy: true,
         }
@@ -468,6 +478,9 @@ impl RobosenseDriver {
         // Return mode: byte 8
         let return_mode = ReturnMode::from(data[8]);
 
+        // Time synchronization mode in effect: byte 9, same values as DIFOP
+        let time_mode = TimeSyncMode::from(data[9]);
+
         // Temperature: byte 31, Temp = LidarTmp - 80
         // Subtraction done in i16 to avoid overflow when data[31] > 127
         let temperature = (i16::from(data[31]) - 80) as i8;
@@ -477,6 +490,7 @@ impl RobosenseDriver {
             timestamp_ns,
             temperature,
             return_mode,
+            time_mode,
         })
     }
 
@@ -550,8 +564,60 @@ impl Default for RobosenseDriver {
     }
 }
 
+impl RobosenseDriver {
+    /// Whether the sensor clock is synchronized to a PTP grandmaster: the
+    /// packet reports a PTP time mode and the latest DIFOP reports success.
+    fn sensor_synced(&self, header: &MsopHeader) -> bool {
+        header.time_mode != TimeSyncMode::Internal
+            && self.device_info.timesync_status == TimeSyncStatus::Success
+    }
+
+    /// Starts a new frame with `data`, its first packet.
+    fn start_frame<F: LidarFrameWriter>(
+        &mut self,
+        frame: &mut F,
+        data: &[u8],
+        header: &MsopHeader,
+        rx_time: SystemTime,
+    ) -> Result<(), Error> {
+        frame.reset();
+        let sensor_ns = self.sensor_synced(header).then_some(header.timestamp_ns);
+        let stamp = self.stamper.stamp(system_time_ns(rx_time), sensor_ns);
+        frame.set_timestamp(stamp);
+        frame.set_frame_id(self.frame_id);
+        self.parse_blocks(frame, data)
+    }
+
+    /// Parses all data blocks of an MSOP packet into the frame.
+    fn parse_blocks<F: LidarFrameWriter>(&self, frame: &mut F, data: &[u8]) -> Result<(), Error> {
+        for i in 0..BLOCKS_PER_PACKET {
+            let block_start = MSOP_HEADER_SIZE + i * BLOCK_SIZE;
+            let block_end = block_start + BLOCK_SIZE;
+            if block_end <= data.len() {
+                self.parse_block(frame, &data[block_start..block_end])?;
+            }
+        }
+        Ok(())
+    }
+}
+
 impl LidarDriver for RobosenseDriver {
-    fn process<F: LidarFrameWriter>(&mut self, frame: &mut F, data: &[u8]) -> Result<bool, Error> {
+    fn process_at<F: LidarFrameWriter>(
+        &mut self,
+        frame: &mut F,
+        data: &[u8],
+        rx_time: SystemTime,
+    ) -> Result<bool, Error> {
+        // The packet that completed the previous frame starts this one.
+        if let Some(pending_rx) = self.pending_rx.take() {
+            let pending = std::mem::take(&mut self.pending_packet);
+            let result = self
+                .parse_header(&pending)
+                .and_then(|header| self.start_frame(frame, &pending, &header, pending_rx));
+            self.pending_packet = pending;
+            result?;
+        }
+
         // Validate packet size
         if data.len() < MSOP_PACKET_SIZE {
             return Err(Error::InvalidPacket(format!(
@@ -565,57 +631,30 @@ impl LidarDriver for RobosenseDriver {
         let header = self.parse_header(data)?;
         self.return_mode = header.return_mode;
 
-        // If previous call returned Ok(true), reset frame for the new cycle.
-        // The boundary packet that triggered completion was already consumed,
-        // so this packet is the first data packet of the new frame.
-        if self.needs_reset {
-            frame.reset();
-            let ts = timestamp().unwrap_or_else(|e| {
-                tracing::warn!("wall-clock timestamp failed ({e}), using sensor timestamp");
-                header.timestamp_ns
-            });
-            frame.set_timestamp(ts);
-            frame.set_frame_id(self.frame_id);
-            self.needs_reset = false;
-        } else {
-            // Check for frame boundary
-            let is_boundary = self.is_frame_boundary(header.pkt_cnt);
-            let frame_complete = is_boundary && !self.first_packet && !frame.is_empty();
-
-            if frame_complete {
-                self.frame_id = self.frame_id.wrapping_add(1);
-                self.last_pkt_cnt = header.pkt_cnt;
-                self.first_packet = false;
-                self.needs_reset = true;
-                return Ok(true);
-            }
-
-            // Start new frame if at boundary (first packet case)
-            if is_boundary {
-                frame.reset();
-                let ts = timestamp().unwrap_or_else(|e| {
-                    tracing::warn!("wall-clock timestamp failed ({e}), using sensor timestamp");
-                    header.timestamp_ns
-                });
-                frame.set_timestamp(ts);
-                frame.set_frame_id(self.frame_id);
-            }
-        }
-
+        let is_boundary = self.is_frame_boundary(header.pkt_cnt);
         self.first_packet = false;
         self.last_pkt_cnt = header.pkt_cnt;
 
-        // Parse all data blocks directly into frame
-        let data_start = MSOP_HEADER_SIZE;
-        for i in 0..BLOCKS_PER_PACKET {
-            let block_start = data_start + i * BLOCK_SIZE;
-            let block_end = block_start + BLOCK_SIZE;
-            if block_end <= data.len() {
-                self.parse_block(frame, &data[block_start..block_end])?;
-            }
+        if is_boundary && !frame.is_empty() {
+            // The previous frame is complete. Keep this packet, with its
+            // receive time, to start the next frame on the following call.
+            self.frame_id = self.frame_id.wrapping_add(1);
+            self.pending_packet[..MSOP_PACKET_SIZE].copy_from_slice(&data[..MSOP_PACKET_SIZE]);
+            self.pending_rx = Some(rx_time);
+            return Ok(true);
+        }
+
+        if is_boundary {
+            self.start_frame(frame, data, &header, rx_time)?;
+        } else {
+            self.parse_blocks(frame, data)?;
         }
 
         Ok(false)
+    }
+
+    fn set_host_latency(&mut self, latency: Duration) {
+        self.stamper.set_host_latency(latency);
     }
 }
 
@@ -630,6 +669,8 @@ struct MsopHeader {
     temperature: i8,
     /// Return mode
     return_mode: ReturnMode,
+    /// Time synchronization mode in effect
+    time_mode: TimeSyncMode,
 }
 
 #[cfg(test)]
@@ -680,7 +721,7 @@ mod tests {
         let driver = RobosenseDriver::new();
         assert_eq!(driver.frame_id, 0);
         assert!(driver.first_packet);
-        assert!(!driver.needs_reset);
+        assert!(driver.pending_rx.is_none());
     }
 
     #[test]
@@ -822,6 +863,129 @@ mod tests {
         let result = driver.process(&mut frame, &packet_wrap);
         assert!(result.is_ok());
         assert!(result.unwrap()); // Frame complete!
+    }
+
+    /// MSOP packet with one valid point, a time mode and a sensor time in
+    /// whole microseconds.
+    fn make_point_packet(pkt_cnt: u16, time_mode: u8, sensor_ns: u64) -> Vec<u8> {
+        let mut packet = vec![0u8; MSOP_PACKET_SIZE];
+        packet[0..4].copy_from_slice(&MSOP_SYNC);
+        packet[4..6].copy_from_slice(&pkt_cnt.to_be_bytes());
+        packet[9] = time_mode;
+        let secs = sensor_ns / 1_000_000_000;
+        let micros = ((sensor_ns % 1_000_000_000) / 1_000) as u32;
+        packet[10..16].copy_from_slice(&secs.to_be_bytes()[2..]);
+        packet[16..20].copy_from_slice(&micros.to_be_bytes());
+        let block = &mut packet[MSOP_HEADER_SIZE..MSOP_HEADER_SIZE + BLOCK_SIZE];
+        block[2..4].copy_from_slice(&200u16.to_be_bytes()); // 1 m
+        block[4..6].copy_from_slice(&i16::MAX.to_be_bytes()); // +X
+        block[10] = 50;
+        block[11] = 1;
+        packet
+    }
+
+    const RX: u64 = 1_790_000_000_000_000_000;
+    const MS: u64 = 1_000_000;
+
+    fn at(ns: u64) -> SystemTime {
+        std::time::UNIX_EPOCH + Duration::from_nanos(ns)
+    }
+
+    #[test]
+    fn test_boundary_packet_starts_next_frame() {
+        let mut driver = RobosenseDriver::new();
+        let mut frame = RobosenseLidarFrame::new();
+
+        assert!(
+            !driver
+                .process_at(&mut frame, &make_point_packet(0, 0, 0), at(RX))
+                .unwrap()
+        );
+        assert!(
+            !driver
+                .process_at(&mut frame, &make_point_packet(1, 0, 0), at(RX + MS))
+                .unwrap()
+        );
+        assert!(
+            driver
+                .process_at(&mut frame, &make_point_packet(0, 0, 0), at(RX + 100 * MS))
+                .unwrap()
+        );
+        assert_eq!(frame.len(), 2);
+        assert_eq!(frame.timestamp(), RX, "stamped at the first packet");
+        assert_eq!(frame.frame_id(), 0);
+
+        // The boundary packet's point and receive time belong to the next frame.
+        assert!(
+            !driver
+                .process_at(&mut frame, &make_point_packet(1, 0, 0), at(RX + 101 * MS))
+                .unwrap()
+        );
+        assert_eq!(frame.len(), 2);
+        assert_eq!(frame.timestamp(), RX + 100 * MS);
+        assert_eq!(frame.frame_id(), 1);
+    }
+
+    #[test]
+    fn test_host_latency_applies_when_unsynchronized() {
+        let mut driver = RobosenseDriver::new();
+        driver.set_host_latency(Duration::from_millis(15));
+        let mut frame = RobosenseLidarFrame::new();
+        driver
+            .process_at(&mut frame, &make_point_packet(0, 0, RX), at(RX))
+            .unwrap();
+        assert_eq!(frame.timestamp(), RX - 15 * MS);
+    }
+
+    #[test]
+    fn test_synchronized_sensor_time_is_used() {
+        let mut driver = RobosenseDriver::new();
+        driver.set_host_latency(Duration::from_millis(15));
+        driver.process_difop(&make_difop_packet()).unwrap(); // status success
+        let mut frame = RobosenseLidarFrame::new();
+
+        let sensor = RX - 16 * MS;
+        driver
+            .process_at(&mut frame, &make_point_packet(0, 0x03, sensor), at(RX))
+            .unwrap();
+        assert_eq!(frame.timestamp(), sensor);
+    }
+
+    #[test]
+    fn test_sensor_time_needs_ptp_mode_and_success() {
+        let sensor = RX - 16 * MS;
+
+        // Status success from DIFOP, but the packet reports internal time.
+        let mut driver = RobosenseDriver::new();
+        driver.process_difop(&make_difop_packet()).unwrap();
+        let mut frame = RobosenseLidarFrame::new();
+        driver
+            .process_at(&mut frame, &make_point_packet(0, 0x00, sensor), at(RX))
+            .unwrap();
+        assert_eq!(frame.timestamp(), RX);
+
+        // gPTP mode in the packet, but no DIFOP success (holdover).
+        let mut driver = RobosenseDriver::new();
+        let mut frame = RobosenseLidarFrame::new();
+        driver
+            .process_at(&mut frame, &make_point_packet(0, 0x03, sensor), at(RX))
+            .unwrap();
+        assert_eq!(frame.timestamp(), RX);
+    }
+
+    #[test]
+    fn test_implausible_synchronized_time_falls_back_to_host() {
+        let mut driver = RobosenseDriver::new();
+        driver.process_difop(&make_difop_packet()).unwrap();
+        let mut frame = RobosenseLidarFrame::new();
+        driver
+            .process_at(
+                &mut frame,
+                &make_point_packet(0, 0x03, RX - 5_000 * MS),
+                at(RX),
+            )
+            .unwrap();
+        assert_eq!(frame.timestamp(), RX);
     }
 
     fn make_difop_packet() -> Vec<u8> {

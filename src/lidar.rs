@@ -33,7 +33,10 @@
 //! ```
 
 use clap::ValueEnum;
-use std::fmt;
+use std::{
+    fmt,
+    time::{Duration, SystemTime},
+};
 
 /// Trait for LiDAR frame data (Structure-of-Arrays layout).
 ///
@@ -272,13 +275,20 @@ impl fmt::Display for SensorType {
 /// This trait uses the client-owned frame pattern where the client owns all
 /// frame objects and the driver writes into mutable references.
 ///
+/// # Frame stamps
+///
+/// A frame is stamped with the sensor's start-of-frame time when the sensor
+/// clock is synchronized to the host by PTP, and otherwise with the host
+/// receive time of the frame's first packet less the configured host latency
+/// (see [`crate::stamp`]).
+///
 /// # Returns
 ///
 /// - `Ok(true)` - Frame is complete, ready for consumption
 /// - `Ok(false)` - More packets needed to complete frame
 /// - `Err(e)` - Processing error
 pub trait LidarDriver: Send {
-    /// Process UDP packet data into the provided frame.
+    /// Process UDP packet data received at `rx_time` into the provided frame.
     ///
     /// The driver handles:
     /// - Resetting the buffer on new frame boundary
@@ -289,13 +299,33 @@ pub trait LidarDriver: Send {
     ///
     /// * `frame` - Mutable reference to a frame implementing `LidarFrameWriter`
     /// * `data` - Raw UDP packet data
+    /// * `rx_time` - Host receive time of the packet (`CLOCK_REALTIME`),
+    ///   ideally the kernel receive timestamp
     ///
     /// # Returns
     ///
     /// - `Ok(true)` - Frame is complete and ready for consumption
     /// - `Ok(false)` - More packets needed to complete the frame
     /// - `Err(e)` - Processing error
-    fn process<F: LidarFrameWriter>(&mut self, frame: &mut F, data: &[u8]) -> Result<bool, Error>;
+    fn process_at<F: LidarFrameWriter>(
+        &mut self,
+        frame: &mut F,
+        data: &[u8],
+        rx_time: SystemTime,
+    ) -> Result<bool, Error>;
+
+    /// Process UDP packet data received now into the provided frame.
+    ///
+    /// Equivalent to [`process_at`](Self::process_at) with the current time,
+    /// for sources without receive timestamps such as pcap replay.
+    #[allow(dead_code)] // Used by library consumers; the service passes receive times
+    fn process<F: LidarFrameWriter>(&mut self, frame: &mut F, data: &[u8]) -> Result<bool, Error> {
+        self.process_at(frame, data, SystemTime::now())
+    }
+
+    /// Set the sensor latency subtracted from host receive times when a
+    /// frame is stamped from the host clock.
+    fn set_host_latency(&mut self, latency: Duration);
 }
 
 /// Gets the current wall-clock timestamp in nanoseconds.

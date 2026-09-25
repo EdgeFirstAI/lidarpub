@@ -387,3 +387,89 @@ async fn test_ouster_pcap_port_filtering() {
         LIDAR_PORT
     );
 }
+
+/// Frame ID from an Ouster lidar packet header.
+fn packet_frame_id(packet: &[u8]) -> u16 {
+    u16::from_le_bytes([packet[2], packet[3]])
+}
+
+/// Timestamp of the first valid column of an RNG15_RFL8_NIR8 packet.
+fn first_valid_column_ts(packet: &[u8], rows: usize, columns: usize) -> Option<u64> {
+    let column_len = 12 + rows * 4;
+    (0..columns).find_map(|c| {
+        let col = &packet[32 + c * column_len..];
+        let status = u16::from_le_bytes([col[10], col[11]]);
+        (status & 1 == 1).then(|| u64::from_le_bytes(col[..8].try_into().unwrap()))
+    })
+}
+
+/// Replays the capture with synthetic receive times and checks each
+/// completed frame's stamp against the first packet of that frame.
+async fn check_frame_stamps(sensor_synced: bool) {
+    let params = load_test_params().expect("Failed to load sensor parameters");
+    let rows = params.lidar_data_format.pixels_per_column;
+    let columns = params.lidar_data_format.columns_per_packet;
+    let mut driver = OusterDriver::new(&params).expect("Failed to create driver");
+    driver
+        .sensor_synced()
+        .store(sensor_synced, std::sync::atomic::Ordering::Relaxed);
+    let mut frame =
+        OusterLidarFrame::with_capacity(rows * params.lidar_data_format.columns_per_frame);
+    let mut source =
+        PcapSource::from_file(OUSTER_PCAP, Some(LIDAR_PORT)).expect("Failed to load PCAP file");
+
+    let base = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_790_000_000);
+    let mut buf = [0u8; 16 * 1024];
+    let mut expected: std::collections::HashMap<u16, u64> = Default::default();
+    let mut current = None;
+    let mut checked = 0;
+
+    for i in 0u64.. {
+        if !source.has_more() {
+            break;
+        }
+        let len = source.recv(&mut buf).await.expect("Failed to read packet");
+        let packet = &buf[..len];
+        let Some(column_ts) = first_valid_column_ts(packet, rows, columns) else {
+            continue;
+        };
+
+        // Synchronized: a receive time 3 ms after the sensor time, as
+        // measured on a PTP-locked OS1. Otherwise 1 ms per packet.
+        let rx_ns = if sensor_synced {
+            column_ts + 3_000_000
+        } else {
+            1_790_000_000_000_000_000 + i * 1_000_000
+        };
+        let rx = if sensor_synced {
+            std::time::UNIX_EPOCH + std::time::Duration::from_nanos(rx_ns)
+        } else {
+            base + std::time::Duration::from_millis(i)
+        };
+        let fid = packet_frame_id(packet);
+        expected
+            .entry(fid)
+            .or_insert(if sensor_synced { column_ts } else { rx_ns });
+
+        if let Ok(true) = driver.process_at(&mut frame, packet, rx) {
+            let completed = current.expect("a frame completes after its first packet");
+            assert_eq!(frame.timestamp(), expected[&completed], "frame {completed}");
+            checked += 1;
+        }
+        current = Some(fid);
+    }
+
+    assert!(checked >= 1, "no frames completed");
+}
+
+#[tokio::test]
+async fn test_ouster_frames_stamped_at_first_packet_receive_time() {
+    require_test_data!();
+    check_frame_stamps(false).await;
+}
+
+#[tokio::test]
+async fn test_ouster_frames_stamped_from_sensor_clock_when_synchronized() {
+    require_test_data!();
+    check_frame_stamps(true).await;
+}

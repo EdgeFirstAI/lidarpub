@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2025 Au-Zone Technologies. All Rights Reserved.
 
-use crate::{Args, formats::encode_clustered_pointcloud2_cdr, lidar::Points};
+use crate::{Args, common, formats::encode_clustered_pointcloud2_cdr, lidar::Points};
 use edgefirst_lidarpub::cluster::{
     CLUSTER_ID_FIRST, CLUSTER_ID_GROUND, ClusterData, VoxelClusterData, cluster_, voxel_cluster,
 };
@@ -61,6 +61,7 @@ pub async fn cluster_thread(
         }
     };
 
+    let ts_id = common::timestamp_id(&session);
     let mut ground_filter = GroundFilter::new();
     let ground_thickness_m = args.ground_thickness as f32 / 1000.0;
     let sensor_height_m: Option<f32> = args.sensor_height.map(|h| h as f32 / 1000.0);
@@ -186,7 +187,7 @@ pub async fn cluster_thread(
                 match publ
                     .put(msg)
                     .encoding(enc)
-                    .timestamp(session.new_timestamp())
+                    .timestamp(common::zenoh_timestamp(ts_id, &time))
                     .await
                 {
                     Ok(_) => {}
@@ -390,7 +391,14 @@ mod tests {
                 .await
                 .expect("timed out waiting for clustered cloud")
                 .expect("recv clustered cloud");
-        assert!(sample.timestamp().is_some());
+        let ts = sample
+            .timestamp()
+            .expect("clustered cloud should carry a Zenoh timestamp")
+            .get_time()
+            .to_duration();
+        assert!(
+            ts.abs_diff(std::time::Duration::from_secs(1)) <= std::time::Duration::from_nanos(1)
+        );
         let pc = PointCloud2::from_cdr(sample.payload().to_bytes().into_owned())
             .expect("decode clustered PointCloud2");
         assert_eq!(pc.point_step(), 17);

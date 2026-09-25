@@ -12,10 +12,21 @@
 #![allow(clippy::wrong_self_convention)]
 #![allow(dead_code)]
 
-use crate::lidar::{Error, LidarDriver, LidarFrame, LidarFrameWriter, timestamp};
+use crate::{
+    lidar::{Error, LidarDriver, LidarFrame, LidarFrameWriter},
+    stamp::{FrameStamper, system_time_ns},
+};
 use ndarray::Array2;
 use serde::{Deserialize, Serialize};
-use std::{f32::consts::PI, fmt};
+use std::{
+    f32::consts::PI,
+    fmt,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, SystemTime},
+};
 use tracing::{instrument, warn};
 
 // SIMD imports: NEON on aarch64 (stable), portable_simd elsewhere (nightly)
@@ -379,7 +390,10 @@ pub struct FrameReader {
     depth: Array2<u16>,
     /// Reflectivity buffer owned by FrameReader - never copied
     reflect: Array2<u8>,
-    timestamp: u64,
+    /// Host receive time of the frame's first packet, in nanoseconds
+    first_rx_ns: Option<u64>,
+    /// Sensor timestamp of the frame's first valid column, in nanoseconds
+    first_column_ns: Option<u64>,
     /// True when a complete frame is ready for processing
     frame_ready: bool,
 }
@@ -403,7 +417,8 @@ impl FrameReader {
             frame_id: 0,
             depth: Array2::zeros((rows, cols)),
             reflect: Array2::zeros((rows, cols)),
-            timestamp: 0,
+            first_rx_ns: None,
+            first_column_ns: None,
             frame_ready: false,
         })
     }
@@ -420,13 +435,18 @@ impl FrameReader {
     /// references to the completed frame data, then call `start_new_frame()`
     /// to prepare for the next frame.
     pub fn update(&mut self, slice: &[u8]) -> Result<bool, Error> {
+        self.update_at(slice, system_time_ns(SystemTime::now()))
+    }
+
+    /// Same as [`update`](Self::update) for a packet received at `rx_ns`
+    /// nanoseconds since the Unix epoch.
+    pub fn update_at(&mut self, slice: &[u8], rx_ns: u64) -> Result<bool, Error> {
         let header = HeaderSlice::from_slice(slice)?;
 
-        // Detect frame boundary
-        let is_new_frame = self.frame_id != header.frame_id();
-        if is_new_frame {
-            // Previous frame is complete - mark ready and update frame_id
-            self.frame_ready = true;
+        // Detect frame boundary. A frame that has not received any packet
+        // (the first one after start) is not reported as complete.
+        if self.frame_id != header.frame_id() {
+            self.frame_ready = self.first_rx_ns.is_some();
             self.frame_id = header.frame_id();
         }
 
@@ -436,10 +456,13 @@ impl FrameReader {
             return Ok(true);
         }
 
+        self.first_rx_ns.get_or_insert(rx_ns);
+
         // Process packet columns into our buffers
         for i in 0..self.columns_per_packet {
             let column = header.column(self.rows, i)?;
             if column.status() {
+                self.first_column_ns.get_or_insert(column.timestamp());
                 let col = column.measurement_id() as usize;
                 if col < self.cols {
                     for row in 0..self.rows {
@@ -448,10 +471,6 @@ impl FrameReader {
                         self.reflect[[row, col]] = data.reflect;
                     }
                 }
-            }
-
-            if i == 0 {
-                self.timestamp = timestamp()?;
             }
         }
 
@@ -464,12 +483,22 @@ impl FrameReader {
     pub fn start_new_frame(&mut self) {
         self.depth.fill(0);
         self.reflect.fill(0);
+        self.first_rx_ns = None;
+        self.first_column_ns = None;
         self.frame_ready = false;
     }
 
-    /// Get the timestamp of the current/completed frame.
+    /// Host receive time of the current/completed frame's first packet in
+    /// nanoseconds, 0 before any packet.
     pub fn timestamp(&self) -> u64 {
-        self.timestamp
+        self.first_rx_ns.unwrap_or(0)
+    }
+
+    /// Sensor timestamp of the current/completed frame's first valid column
+    /// in nanoseconds. It is in the host clock domain only when the sensor is
+    /// in `TIME_FROM_PTP_1588` mode and synchronized.
+    pub fn first_column_timestamp(&self) -> Option<u64> {
+        self.first_column_ns
     }
 
     /// Get the frame_id of the current/completed frame.
@@ -962,6 +991,12 @@ pub struct OusterDriver {
     pending_packet_buf: Vec<u8>,
     /// Length of valid data in pending_packet_buf (0 = no pending packet)
     pending_packet_len: usize,
+    /// Host receive time of the pending packet in nanoseconds
+    pending_packet_rx_ns: u64,
+    /// Chooses each frame's stamp
+    stamper: FrameStamper,
+    /// Set while the sensor clock is synchronized to a PTP grandmaster
+    sensor_synced: Arc<AtomicBool>,
 }
 
 impl OusterDriver {
@@ -975,7 +1010,17 @@ impl OusterDriver {
             frame_builder,
             pending_packet_buf: vec![0u8; MAX_PACKET_SIZE],
             pending_packet_len: 0,
+            pending_packet_rx_ns: 0,
+            stamper: FrameStamper::new("ouster"),
+            sensor_synced: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Flag to set while the sensor clock is synchronized to a PTP
+    /// grandmaster (`TIME_FROM_PTP_1588` and a locked PTP port), so frames
+    /// are stamped from the column timestamps. Cleared by default.
+    pub fn sensor_synced(&self) -> Arc<AtomicBool> {
+        self.sensor_synced.clone()
     }
 
     /// Get the number of rows in the frame
@@ -995,25 +1040,38 @@ impl OusterDriver {
 }
 
 impl LidarDriver for OusterDriver {
-    fn process<F: LidarFrameWriter>(&mut self, frame: &mut F, data: &[u8]) -> Result<bool, Error> {
+    fn process_at<F: LidarFrameWriter>(
+        &mut self,
+        frame: &mut F,
+        data: &[u8],
+        rx_time: SystemTime,
+    ) -> Result<bool, Error> {
         // Process pending packet from previous frame boundary first
         if self.pending_packet_len > 0 {
-            let pending = &self.pending_packet_buf[..self.pending_packet_len];
-            self.frame_reader.update(pending)?;
-            self.pending_packet_len = 0;
+            let len = std::mem::take(&mut self.pending_packet_len);
+            self.frame_reader
+                .update_at(&self.pending_packet_buf[..len], self.pending_packet_rx_ns)?;
         }
 
         // Process current packet
-        let frame_ready = self.frame_reader.update(data)?;
+        let rx_ns = system_time_ns(rx_time);
+        let frame_ready = self.frame_reader.update_at(data, rx_ns)?;
 
         if frame_ready {
             // Store this packet in pre-allocated buffer (no allocation)
             let len = data.len().min(MAX_PACKET_SIZE);
             self.pending_packet_buf[..len].copy_from_slice(&data[..len]);
             self.pending_packet_len = len;
+            self.pending_packet_rx_ns = rx_ns;
+
+            let sensor_ns = self
+                .sensor_synced
+                .load(Ordering::Relaxed)
+                .then(|| self.frame_reader.first_column_timestamp())
+                .flatten();
+            let timestamp = self.stamper.stamp(self.frame_reader.timestamp(), sensor_ns);
 
             // Get zero-copy references to FrameReader's buffers
-            let timestamp = self.frame_reader.timestamp();
             let frame_id = self.frame_reader.frame_id();
             let depth = self.frame_reader.depth();
             let reflect = self.frame_reader.reflect();
@@ -1033,6 +1091,10 @@ impl LidarDriver for OusterDriver {
         } else {
             Ok(false)
         }
+    }
+
+    fn set_host_latency(&mut self, latency: Duration) {
+        self.stamper.set_host_latency(latency);
     }
 }
 

@@ -2,7 +2,12 @@
 // Copyright (c) 2025 Au-Zone Technologies. All Rights Reserved.
 
 use clap::ValueEnum;
-use std::{fmt, net::UdpSocket};
+use edgefirst_schemas::builtin_interfaces::Time;
+use std::{fmt, time::Duration};
+use zenoh::{
+    Session,
+    time::{NTP64, Timestamp, TimestampId},
+};
 
 #[cfg(target_os = "linux")]
 use log::warn;
@@ -53,32 +58,49 @@ pub fn set_process_priority() {
 #[cfg(not(target_os = "linux"))]
 pub fn set_process_priority() {}
 
-#[cfg(target_os = "linux")]
-pub fn set_socket_bufsize(socket: UdpSocket, size: usize) -> UdpSocket {
-    use std::os::fd::{FromRawFd, IntoRawFd};
-
-    let fd = socket.into_raw_fd();
-    let size = size as libc::c_int;
-    let err = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_RCVBUF,
-            &size as *const _ as *const libc::c_void,
-            std::mem::size_of_val(&size) as libc::socklen_t,
-        )
-    };
-    if err != 0 {
-        warn!(
-            "setsockopt SO_RCVBUF failed: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-
-    unsafe { UdpSocket::from_raw_fd(fd) }
+/// Returns the Zenoh timestamp source ID of the session.
+pub fn timestamp_id(session: &Session) -> TimestampId {
+    *session.new_timestamp().get_id()
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn set_socket_bufsize(socket: UdpSocket, _size: usize) -> UdpSocket {
-    socket
+/// Builds the Zenoh sample timestamp for a message stamp so the sample
+/// timestamp and `header.stamp` denote the same instant. NTP64 quantizes the
+/// fraction to 2^-32 s (about 0.23 ns), so the round trip is exact only to
+/// within a nanosecond.
+pub fn zenoh_timestamp(id: TimestampId, stamp: &Time) -> Timestamp {
+    let time = Duration::new(stamp.sec.max(0) as u64, stamp.nanosec);
+    Timestamp::new(NTP64::from(time), id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn round_trip(stamp: Time) -> Duration {
+        zenoh_timestamp(TimestampId::rand(), &stamp)
+            .get_time()
+            .to_duration()
+    }
+
+    #[test]
+    fn zenoh_timestamp_matches_stamp() {
+        for nanosec in [0, 1, 123_456_789, 500_000_000, 999_999_999] {
+            let stamp = Time {
+                sec: 1_790_000_000,
+                nanosec,
+            };
+            let expected = Duration::new(stamp.sec as u64, stamp.nanosec);
+            let diff = round_trip(stamp).abs_diff(expected);
+            assert!(diff <= Duration::from_nanos(1), "{nanosec}: {diff:?}");
+        }
+    }
+
+    #[test]
+    fn zenoh_timestamp_clamps_negative_seconds() {
+        let stamp = Time {
+            sec: -5,
+            nanosec: 7,
+        };
+        assert!(round_trip(stamp) <= Duration::from_nanos(8));
+    }
 }
