@@ -67,16 +67,20 @@
 
 #![cfg_attr(feature = "portable_simd", feature(portable_simd))]
 
+#[cfg(target_os = "linux")]
+pub mod clock;
 pub mod cluster;
 pub mod common;
 pub mod formats;
 pub mod ground;
 pub mod lidar;
+pub mod net;
 pub mod ouster;
 pub mod packet_source;
 #[cfg(feature = "pcap")]
 pub mod pcap_source;
 pub mod robosense;
+pub mod stamp;
 
 // Re-exports for convenience
 pub use formats::PointFieldType;

@@ -35,12 +35,22 @@ pub struct Args {
           value_parser = PossibleValuesParser::new(["512x10", "1024x10", "2048x10", "512x20", "1024x20",]))]
     pub lidar_mode: String,
 
-    /// LiDAR timestamp mode.  If using the PTP1588 timestamp mode the LiDAR
-    /// must be connected to a PTP1588 enabled network, the Maivin can provide
-    /// this time through the ptp4l service.
-    /// (Ouster only)
+    /// LiDAR timestamp mode.  With ptp1588 the sensor clock follows a PTP
+    /// grandmaster, which must be the host (ptp4l with phc2sys-master on the
+    /// sensor interface) or another system on the sensor network that
+    /// distributes the host's time; frames are then stamped from the sensor's
+    /// column timestamps while it is synchronized.  Otherwise frames are
+    /// stamped with the host receive time.
+    /// (Ouster only; the Robosense E1R reports its own synchronization state)
     #[arg(long, env, default_value = "internal")]
     pub timestamp_mode: TimestampMode,
+
+    /// LiDAR latency in nanoseconds, subtracted from the host receive time of
+    /// a frame's first packet when the frame is stamped from the host clock
+    /// because the sensor clock is not synchronized by PTP.  Not applied to
+    /// PTP-synchronized sensor timestamps.
+    #[arg(long, env, default_value = "0")]
+    pub lidar_latency: u64,
 
     // --- Robosense-specific options ---
     /// MSOP (Main data Stream Output Protocol) port for Robosense sensors.
@@ -297,6 +307,7 @@ mod tests {
         "AZIMUTH",
         "LIDAR_MODE",
         "TIMESTAMP_MODE",
+        "LIDAR_LATENCY",
         "MSOP_PORT",
         "DIFOP_PORT",
         "INCLUDE_NOISY",

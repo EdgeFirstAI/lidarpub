@@ -62,6 +62,11 @@ MODE="peer"
 # visualize per-frame pipeline timing (ground_filter, clustering, etc.).
 #TRACY="false"
 
+# LiDAR latency in nanoseconds, subtracted from the host receive time of a
+# frame's first packet when the sensor clock is not PTP-synchronized. Measured
+# start-of-frame to first packet: about 16000000 (E1R), 3000000 (Ouster).
+#LIDAR_LATENCY="0"
+
 # Mirror the point cloud output. Applies axis negation to the published
 # point data (both raw and clustered). Useful when the sensor's native
 # coordinate frame doesn't match the expected orientation.
@@ -142,8 +147,13 @@ AZIMUTH="0 360"
 LIDAR_MODE="1024x10"
 
 # Timestamp mode for the Ouster sensor.
-# "internal" uses the internal oscillator (time since boot).
-# "ptp1588" synchronizes to a PTP-1588 master (e.g. ptp4l on Maivin).
+# "internal" uses the internal oscillator; frames are stamped with the host
+#            receive time.
+# "ptp1588"  (recommended) follows a PTP grandmaster; frames are stamped from
+#            the sensor clock while it is synchronized. Requires a grandmaster
+#            on the sensor network carrying the host time: ptp4l with
+#            phc2sys-master on this host, or another system on the network.
+#            Ouster firmware 2.x needs linuxptp 4.2+ with ptp_minor_version 0.
 TIMESTAMP_MODE="internal"
 
 # ---------------------------------------------------------------------------

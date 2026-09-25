@@ -103,6 +103,10 @@ edgefirst-lidarpub --help
 # --ground-thickness <MM>   Slab thickness above ground to remove (default: 150)
 # --sensor-height <MM>      Fixed sensor height (skips auto-detection)
 
+# Timestamp parameters:
+# --timestamp-mode <MODE>   Ouster clock: internal (default), ptp1588, sync-pulse
+# --lidar-latency <NS>      Subtracted from host receive stamps (default: 0)
+
 # Or use environment variables (useful for systemd services):
 SENSOR_TYPE=robosense CLUSTERING=voxel GROUND_FILTER=true edgefirst-lidarpub
 ```
@@ -137,6 +141,24 @@ Example:
 ```
 pipeline avg over 100 frames (24967 pts): valid=0.2ms ground=9.3ms cluster=13.2ms relabel=0.5ms format=3.4ms publish=2.6ms total=29.1ms
 ```
+
+### Timestamps and PTP Synchronization
+
+Every frame is stamped with its acquisition time in the host `CLOCK_REALTIME` (Unix time) domain, and the Zenoh sample timestamp of every published message equals its `header.stamp`. The stamp comes from one of two sources, chosen per frame and logged at INFO when it changes (`frame stamp source`):
+
+- **PTP-synchronized sensor clock** (preferred): the sensor's own start-of-frame time, free of network and host scheduling delay.
+- **Host receive time**: the kernel receive timestamp (`SO_TIMESTAMPNS`) of the frame's first packet, less `LIDAR_LATENCY`. Used whenever the sensor clock is not synchronized to the host.
+
+**We recommend PTP synchronization.** It requires a PTP grandmaster on the sensor network that carries the host's time: either the host itself, running `ptp4l` as grandmaster with `phc2sys` disciplining the sensor interface's hardware clock from the system clock (with `-O 0`, so the PTP clock carries UTC), or another system on the sensor network that distributes the same time. Without a grandmaster, a sensor set to PTP never synchronizes and lidarpub keeps using host receive times.
+
+- **Ouster:** set `TIMESTAMP_MODE="ptp1588"`. The default remains `internal`, so PTP is opt-in. The sensor's `default` PTP profile needs an IEEE 1588 E2E grandmaster over UDPv4. Ouster firmware 2.x only accepts PTP version 2.0 messages: use linuxptp 4.2 or newer with `ptp_minor_version 0`, because linuxptp 4.x otherwise sends version 2.1 and the sensor stays `UNCALIBRATED`. lidarpub polls the sensor's PTP state every second and uses its clock once the port has been `SLAVE` within 1 ms of the grandmaster for 5 consecutive polls, until the offset exceeds 2 ms or the port leaves `SLAVE`. After a host clock step it restarts the sensor's PTP client so the sensor steps to the new time (about 25 s).
+- **Robosense E1R:** configured on the sensor, detected automatically from its packets. The E1R supports gPTP (IEEE 802.1AS) or IEEE 1588 E2E over Layer 2 only, not UDP. For gPTP the grandmaster must set `asCapable true`, because the E1R does not answer peer delay requests.
+
+A reported-synchronized sensor time is still checked against the host receive time of its packet and ignored (with a warning) when it is more than 100 ms behind or 5 ms ahead, for example while a sensor clock is still converging.
+
+`LIDAR_LATENCY` (nanoseconds, default `0`) moves host-receive stamps earlier by the sensor's delay between acquisition and transmission. Measured delays from start of frame to the first packet's arrival are about 16 ms for the E1R and about 3 ms for the Ouster. PTP-synchronized stamps are never adjusted.
+
+The LiDAR socket requests a 16 MiB receive buffer with `SO_RCVBUFFORCE`, which requires `CAP_NET_ADMIN` (the packaged service runs as root). Otherwise the kernel caps it at `net.core.rmem_max` (208 KiB by default) and lidarpub logs a warning.
 
 ## Documentation
 
