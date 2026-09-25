@@ -44,6 +44,9 @@ EDGEAI-1937).
 - The E1R no longer falls back to its free-running clock when the system
   clock is unusable.
 - The Ouster driver no longer reports an empty frame at startup.
+- Robosense DIFOP packets are filtered by `TARGET` like MSOP packets, so
+  another E1R on the network cannot change the synchronization state or
+  publish its IMU.
 
 ## [2.3.2] - 2026-09-15
 

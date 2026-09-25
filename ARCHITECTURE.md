@@ -210,7 +210,7 @@ sequenceDiagram
 
 ### Robosense IMU side path
 
-DIFOP packets on `--difop-port` are handled on a separate async task. Parsed accelerometer/gyroscope samples are published to `{lidar_topic}/imu`, stamped with the kernel receive time of the DIFOP packet, and the latest accelerometer reading is shared (mutex) with the clustering thread when `--ground-filter` is enabled. The same task keeps the driver's time synchronization state current and logs changes of the E1R time sync mode or status.
+DIFOP packets on `--difop-port` are handled on a separate async task, filtered by the `TARGET` source address like MSOP packets. Parsed accelerometer/gyroscope samples are published to `{lidar_topic}/imu`, stamped with the kernel receive time of the DIFOP packet, and the latest accelerometer reading is shared (mutex) with the clustering thread when `--ground-filter` is enabled. The same task keeps the driver's time synchronization state current and logs changes of the E1R time sync mode or status.
 
 ---
 
@@ -259,7 +259,7 @@ Publisher declarations live in `run_lidar_loop`, the Robosense DIFOP handler, an
 
 Stamps follow the EdgeFirst timestamp contract: `header.stamp` is the acquisition time of the frame in the host `CLOCK_REALTIME` (Unix time) domain.
 
-- **PTP-synchronized sensor:** the sensor's own start-of-frame time. Robosense E1R: the MSOP header time of the frame's first packet, when the packet reports a PTP time mode (byte 9 = `0x02` or `0x03`) and the latest DIFOP reports status success. Ouster: the first valid column timestamp of the frame, when `TIMESTAMP_MODE=ptp1588` and the `ouster-ptp` thread has seen `port_state` `SLAVE` with `offset_from_master` under 1 ms for 5 consecutive 1 s polls; it stops when the offset exceeds 2 ms, the port leaves `SLAVE` or the API fails (`OusterPtpTracker`).
+- **PTP-synchronized sensor:** the sensor's own start-of-frame time. Robosense E1R: the MSOP header time of the frame's first packet, when the packet reports a PTP time mode (byte 9 = `0x02` or `0x03`) and the latest DIFOP reports status success. Ouster: the first valid column timestamp of the frame, when `TIMESTAMP_MODE=ptp1588` and the `ouster-ptp` thread has seen `port_state` `SLAVE` with `offset_from_master` under 1 ms for 5 consecutive 1 s polls; it stops when the offset exceeds 2 ms, the port leaves `SLAVE`, or 3 consecutive polls fail (`OusterPtpTracker`).
 - **Otherwise:** the kernel receive time (`SO_TIMESTAMPNS`) of the frame's first packet, less `LIDAR_LATENCY`.
 - A synchronized sensor time is only used when it lies between 5 ms ahead of and 100 ms behind the host receive time of its packet (`stamp::FrameStamper`); otherwise the host time is used and a warning is logged. This rejects clocks that report synchronization but are not in the host domain, such as an Ouster slewing after a host clock step or a TAI clock.
 - The chosen source is logged at INFO when it changes (`frame stamp source`).

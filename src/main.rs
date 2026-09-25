@@ -250,6 +250,15 @@ async fn run_robosense(session: Session, args: Args) -> Result<(), Box<dyn std::
     robosense_driver.set_filter_noisy(!args.include_noisy);
     let driver = Arc::new(Mutex::new(robosense_driver));
 
+    // Parse target as source IP filter for Robosense MSOP and DIFOP packets
+    let source_filter: Option<std::net::IpAddr> = args
+        .target
+        .as_deref()
+        .filter(|t| !t.is_empty())
+        .map(|t| t.parse())
+        .transpose()
+        .map_err(|e| format!("Invalid target IP address: {}", e))?;
+
     // Start DIFOP listener for device information and IMU publishing
     let difop_driver = driver.clone();
     let difop_port = args.difop_port;
@@ -307,6 +316,11 @@ async fn run_robosense(session: Session, args: Args) -> Result<(), Box<dyn std::
             }
 
             for datagram in receiver.datagrams() {
+                // Another sensor's DIFOP must not change this sensor's
+                // synchronization state or publish its IMU.
+                if source_filter.is_some_and(|ip| datagram.source != Some(ip)) {
+                    continue;
+                }
                 if !rx_monitor.accept(&datagram) {
                     continue;
                 }
@@ -415,15 +429,6 @@ async fn run_robosense(session: Session, args: Args) -> Result<(), Box<dyn std::
 
     let bind_addr = format!("0.0.0.0:{}", args.msop_port);
     info!("Listening for MSOP packets on port {}", args.msop_port);
-
-    // Parse target as source IP filter for Robosense
-    let source_filter: Option<std::net::IpAddr> = args
-        .target
-        .as_deref()
-        .filter(|t| !t.is_empty())
-        .map(|t| t.parse())
-        .transpose()
-        .map_err(|e| format!("Invalid target IP address: {}", e))?;
 
     // The E1R follows grandmaster steps on its own; host steps are only logged.
     spawn_named("clock-step", || clock_step_monitor(None));
@@ -787,54 +792,15 @@ async fn run_lidar_loop<D: LidarDriver, F: lidar::LidarFrameWriter + LidarFrame>
             // Process packet into client-owned frame
             match driver.process_at(&mut frame, datagram.data, datagram.rx_time) {
                 Ok(true) => {
-                    // Frame is complete - process it
-                    let n_points = frame.len();
-                    let timestamp_ns = frame.timestamp();
-                    let frame_id = frame.frame_id();
-
-                    trace!(
-                        timestamp = timestamp_ns,
-                        frame_id = frame_id,
-                        n_points = n_points,
-                        "publishing frame"
-                    );
-
-                    let timestamp = stamp_from_ns(timestamp_ns);
-
-                    // Send to clustering if enabled
-                    if args.clustering_enabled() {
-                        // Range comes from the driver, no sqrt needed
-                        let ranges: Vec<f32> = frame.range().to_vec();
-                        let points = lidar::Points {
-                            x: frame.x().to_vec(),
-                            y: frame.y().to_vec(),
-                            z: frame.z().to_vec(),
-                            intensity: frame.intensity().to_vec(),
-                        };
-                        let imu_accel = if args.ground_filter {
-                            latest_imu.lock().ok().and_then(|lock| *lock)
-                        } else {
-                            None
-                        };
-                        let _ = tx_cluster.send((ranges, points, timestamp, imu_accel));
-                    }
-
-                    // Format and publish point cloud
-                    let (msg, enc) = format_points(
+                    publish_frame(
                         &frame,
-                        timestamp,
-                        args.frame_id.clone(),
-                        args.mirror_y(),
-                        args.mirror_z(),
-                    )?;
-
-                    if let Err(e) =
-                        publish_cdr(&points_publisher, msg, enc, ts_id, &timestamp).await
-                    {
-                        error!("publish points error: {:?}", e);
-                    }
-
-                    args.tracy.then(frame_mark);
+                        &args,
+                        &points_publisher,
+                        ts_id,
+                        &tx_cluster,
+                        &latest_imu,
+                    )
+                    .await?;
                 }
                 Ok(false) => {
                     // More packets needed to complete frame
@@ -845,6 +811,63 @@ async fn run_lidar_loop<D: LidarDriver, F: lidar::LidarFrameWriter + LidarFrame>
             }
         }
     }
+}
+
+/// Frame data sent to the clustering thread: ranges, points, stamp and the
+/// latest IMU acceleration when the ground filter is enabled.
+type ClusterInput = (Vec<f32>, lidar::Points, Time, Option<(f32, f32, f32)>);
+
+/// Publishes a completed frame as a point cloud and hands it to the
+/// clustering thread when clustering is enabled.
+async fn publish_frame<F: LidarFrame>(
+    frame: &F,
+    args: &Args,
+    points_publisher: &zenoh::pubsub::Publisher<'_>,
+    ts_id: TimestampId,
+    tx_cluster: &kanal::Sender<ClusterInput>,
+    latest_imu: &Mutex<Option<(f32, f32, f32)>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let timestamp_ns = frame.timestamp();
+    trace!(
+        timestamp = timestamp_ns,
+        frame_id = frame.frame_id(),
+        n_points = frame.len(),
+        "publishing frame"
+    );
+
+    let timestamp = stamp_from_ns(timestamp_ns);
+
+    if args.clustering_enabled() {
+        // Range comes from the driver, no sqrt needed
+        let ranges: Vec<f32> = frame.range().to_vec();
+        let points = lidar::Points {
+            x: frame.x().to_vec(),
+            y: frame.y().to_vec(),
+            z: frame.z().to_vec(),
+            intensity: frame.intensity().to_vec(),
+        };
+        let imu_accel = if args.ground_filter {
+            latest_imu.lock().ok().and_then(|lock| *lock)
+        } else {
+            None
+        };
+        let _ = tx_cluster.send((ranges, points, timestamp, imu_accel));
+    }
+
+    let (msg, enc) = format_points(
+        frame,
+        timestamp,
+        args.frame_id.clone(),
+        args.mirror_y(),
+        args.mirror_z(),
+    )?;
+
+    if let Err(e) = publish_cdr(points_publisher, msg, enc, ts_id, &timestamp).await {
+        error!("publish points error: {:?}", e);
+    }
+
+    args.tracy.then(frame_mark);
+    Ok(())
 }
 
 /// Requested receive buffer for the LiDAR data socket, about 3 s of E1R
@@ -1001,8 +1024,8 @@ const OUSTER_PTP_EXIT_OFFSET_NS: f64 = 2_000_000.0;
 /// not switch the source back and forth.
 const OUSTER_PTP_ENTER_POLLS: u32 = 5;
 
-/// Consecutive failed polls tolerated before a synchronized Ouster clock
-/// stops being the stamp source.
+/// Consecutive failed polls after which a synchronized Ouster clock stops
+/// being the stamp source; fewer failures keep the current state.
 const OUSTER_PTP_MAX_FAILED_POLLS: u32 = 3;
 
 /// Longest wait between attempts to restart the Ouster PTP client.
@@ -1074,7 +1097,7 @@ impl OusterPtpTracker {
     fn update(&mut self, status: Option<&OusterPtpStatus>) -> bool {
         if status.is_none() {
             self.failures += 1;
-            if self.synced && self.failures <= OUSTER_PTP_MAX_FAILED_POLLS {
+            if self.synced && self.failures < OUSTER_PTP_MAX_FAILED_POLLS {
                 return true;
             }
         } else {
@@ -1536,9 +1559,9 @@ mod tests {
 
         assert!(!synced().update(Some(&status("LISTENING", 0.0))));
 
-        // A few failed polls are tolerated, then the state is left.
+        // A few failed polls are tolerated; the last of the limit leaves.
         let mut tracker = synced();
-        for _ in 0..OUSTER_PTP_MAX_FAILED_POLLS {
+        for _ in 1..OUSTER_PTP_MAX_FAILED_POLLS {
             assert!(tracker.update(None));
         }
         assert!(!tracker.update(None));
