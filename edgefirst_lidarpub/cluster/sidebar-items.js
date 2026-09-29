@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["CLUSTER_ID_FIRST","CLUSTER_ID_GROUND","CLUSTER_ID_NOISE","INITIAL_TABLE_SIZE","MAX_LOAD_FACTOR","SENTINEL","SLOT_EMPTY","UNVISITED","VISITED"],"enum":["SpatialHashKind"],"fn":["cluster_","compute_valid","expand_cluster","voxel_cluster"],"struct":["ClusterData","FlatSpatialHash","SpatialHash","VoxelClusterData"]};

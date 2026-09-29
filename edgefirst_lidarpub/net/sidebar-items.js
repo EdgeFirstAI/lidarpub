@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["MAX_DATAGRAM"],"fn":["cmsg_timestamp","enable_rx_timestamps","set_recv_buffer","sockaddr_ip","timespec_to_system_time"],"struct":["Datagram","Receiver"],"type":["CmsgBuf"]};
