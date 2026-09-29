@@ -3,7 +3,7 @@ name = "edgefirst-lidarpub"
 description = "EdgeFirst LiDAR Publisher"
 repository = "https://github.com/EdgeFirstAI/lidarpub"
 license = "Apache-2.0"
-version = "2.3.2"
+version = "2.4.0"
 edition = "2024"
 rust-version = "1.95"
 
@@ -45,11 +45,11 @@ env_logger = "0.11"
 etherparse = { version = "0.21", optional = true }
 kanal = { git = "https://github.com/fereidani/kanal", rev = "9a4b98d" }
 libc = "0.2"
-mdns-sd = { version = "0.18", optional = true }
+mdns-sd = { version = "0.21", optional = true }
 log = "0.4"
 ndarray = "0.17"
 pcap-parser = { version = "0.17", optional = true }
-rerun = { version = "0.36", optional = true, features = ["clap"] }
+rerun = { version = "0.38", optional = true, features = ["clap"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1", features = [

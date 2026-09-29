@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.4.0] - 2026-09-29
+
 Implements the LiDAR part of the middleware timestamp contract (EDGEAI-1941,
 EDGEAI-1937).
 
@@ -47,6 +49,11 @@ EDGEAI-1937).
 - Robosense DIFOP packets are filtered by `TARGET` like MSOP packets, so
   another E1R on the network cannot change the synchronization state or
   publish its IMU.
+
+### Dependencies
+- Updated the lockfile to the latest compatible versions, including Zenoh
+  1.10.1.
+- `rerun` 0.36 to 0.38 and `mdns-sd` 0.18 to 0.21 (optional features).
 
 ## [2.3.2] - 2026-09-15
 
