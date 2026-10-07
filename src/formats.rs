@@ -30,8 +30,6 @@
 //! └───────┴───────┴───────┴────────────┴───────────┘
 //! ```
 
-use std::borrow::Cow;
-
 #[cfg(all(feature = "portable_simd", not(target_arch = "aarch64")))]
 use std::simd::{Simd, ToBytes as _};
 
@@ -143,24 +141,6 @@ pub fn clustered_xyz_fields() -> [PointFieldView<'static>; 5] {
     ]
 }
 
-/// Optionally negate the first `n_points` values for axis mirroring.
-///
-/// # Panics
-///
-/// Panics if `n_points` is greater than `values.len()`.
-fn mirrored(values: &[f32], n_points: usize, negate: bool) -> Cow<'_, [f32]> {
-    assert!(
-        n_points <= values.len(),
-        "n_points ({n_points}) exceeds coordinate slice length ({})",
-        values.len()
-    );
-    if negate {
-        Cow::Owned(values[..n_points].iter().map(|v| -v).collect())
-    } else {
-        Cow::Borrowed(&values[..n_points])
-    }
-}
-
 /// Encode XYZ+intensity points as a CDR-serialized `sensor_msgs/PointCloud2`.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_xyzr_pointcloud2_cdr(
@@ -171,14 +151,15 @@ pub fn encode_xyzr_pointcloud2_cdr(
     n_points: usize,
     timestamp: Time,
     frame_id: String,
-    mirror_y: bool,
-    mirror_z: bool,
 ) -> Result<Vec<u8>, CdrError> {
     let fields = standard_xyz_intensity_fields();
-    let y = mirrored(y, n_points, mirror_y);
-    let z = mirrored(z, n_points, mirror_z);
-
-    let data = format_points_13byte(x, &y, &z, intensity, n_points);
+    let data = format_points_13byte(
+        &x[..n_points],
+        &y[..n_points],
+        &z[..n_points],
+        &intensity[..n_points],
+        n_points,
+    );
 
     let msg = PointCloud2::builder()
         .stamp(timestamp)
@@ -207,14 +188,16 @@ pub fn encode_clustered_pointcloud2_cdr(
     n_points: usize,
     timestamp: Time,
     frame_id: String,
-    mirror_y: bool,
-    mirror_z: bool,
 ) -> Result<Vec<u8>, CdrError> {
     let fields = clustered_xyz_fields();
-    let y = mirrored(y, n_points, mirror_y);
-    let z = mirrored(z, n_points, mirror_z);
-
-    let data = format_clustered_17byte(x, &y, &z, cluster_ids, intensity, n_points);
+    let data = format_clustered_17byte(
+        &x[..n_points],
+        &y[..n_points],
+        &z[..n_points],
+        &cluster_ids[..n_points],
+        &intensity[..n_points],
+        n_points,
+    );
 
     let msg = PointCloud2::builder()
         .stamp(timestamp)
@@ -857,18 +840,9 @@ mod tests {
             nanosec: 500,
         };
 
-        let cdr = encode_xyzr_pointcloud2_cdr(
-            &x,
-            &y,
-            &z,
-            &intensity,
-            2,
-            stamp,
-            "lidar".to_string(),
-            false,
-            false,
-        )
-        .expect("encode PointCloud2");
+        let cdr =
+            encode_xyzr_pointcloud2_cdr(&x, &y, &z, &intensity, 2, stamp, "lidar".to_string())
+                .expect("encode PointCloud2");
         let pc = PointCloud2::from_cdr(cdr).expect("decode PointCloud2");
 
         assert_eq!(pc.stamp(), stamp);
@@ -891,51 +865,14 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_xyzr_pointcloud2_cdr_mirrors_axes() {
-        let x = [1.0f32];
-        let y = [2.0f32];
-        let z = [3.0f32];
-        let intensity = [1u8];
-        let stamp = Time { sec: 0, nanosec: 0 };
-
-        let cdr = encode_xyzr_pointcloud2_cdr(
-            &x,
-            &y,
-            &z,
-            &intensity,
-            1,
-            stamp,
-            "lidar".to_string(),
-            true,
-            true,
-        )
-        .expect("encode mirrored PointCloud2");
-        let pc = PointCloud2::from_cdr(cdr).expect("decode PointCloud2");
-        let y0 = f32::from_le_bytes(pc.data()[4..8].try_into().unwrap());
-        let z0 = f32::from_le_bytes(pc.data()[8..12].try_into().unwrap());
-        assert_eq!(y0, -2.0);
-        assert_eq!(z0, -3.0);
-    }
-
-    #[test]
-    #[should_panic(expected = "n_points (2) exceeds coordinate slice length (1)")]
-    fn test_mirrored_rejects_short_slice() {
+    #[should_panic(expected = "range end index 2 out of range for slice of length 1")]
+    fn test_encode_rejects_short_slice() {
         let x = [1.0f32, 2.0];
         let y = [10.0f32];
         let z = [100.0f32, 200.0];
         let intensity = [128u8, 64];
         let stamp = Time { sec: 0, nanosec: 0 };
-        let _ = encode_xyzr_pointcloud2_cdr(
-            &x,
-            &y,
-            &z,
-            &intensity,
-            2,
-            stamp,
-            "lidar".to_string(),
-            true,
-            false,
-        );
+        let _ = encode_xyzr_pointcloud2_cdr(&x, &y, &z, &intensity, 2, stamp, "lidar".to_string());
     }
 
     #[test]
@@ -956,8 +893,6 @@ mod tests {
             2,
             stamp,
             "cluster".to_string(),
-            false,
-            true,
         )
         .expect("encode clustered PointCloud2");
         let pc = PointCloud2::from_cdr(cdr).expect("decode clustered PointCloud2");
@@ -972,7 +907,7 @@ mod tests {
         let z0 = f32::from_le_bytes(pc.data()[8..12].try_into().unwrap());
         let id0 = u32::from_le_bytes(pc.data()[12..16].try_into().unwrap());
         assert_eq!(y0, 10.0);
-        assert_eq!(z0, -100.0);
+        assert_eq!(z0, 100.0);
         assert_eq!(id0, 7);
         assert_eq!(pc.data()[16], 128);
     }
@@ -1061,18 +996,9 @@ mod tests {
         let n = x.len();
         assert!(n > 10_000);
         let stamp = Time { sec: 1, nanosec: 0 };
-        let cdr = encode_xyzr_pointcloud2_cdr(
-            &x,
-            &y,
-            &z,
-            &intensity,
-            n,
-            stamp,
-            "lidar".to_string(),
-            false,
-            false,
-        )
-        .expect("encode E1R PointCloud2");
+        let cdr =
+            encode_xyzr_pointcloud2_cdr(&x, &y, &z, &intensity, n, stamp, "lidar".to_string())
+                .expect("encode E1R PointCloud2");
         let pc = PointCloud2::from_cdr(cdr).expect("decode E1R PointCloud2");
         assert_eq!(pc.width() as usize, n);
         assert_eq!(pc.point_step(), 13);
@@ -1088,14 +1014,12 @@ mod tests {
             n,
             stamp,
             "lidar".to_string(),
-            true,
-            false,
         )
         .expect("encode clustered E1R PointCloud2");
         let pc = PointCloud2::from_cdr(clustered).expect("decode clustered E1R");
         assert_eq!(pc.point_step(), 17);
         assert_eq!(pc.width() as usize, n);
         let y0 = f32::from_le_bytes(pc.data()[4..8].try_into().unwrap());
-        assert_eq!(y0, -y[0]);
+        assert_eq!(y0, y[0]);
     }
 }

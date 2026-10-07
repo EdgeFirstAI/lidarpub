@@ -149,16 +149,6 @@ pub struct Args {
     #[arg(long, env)]
     pub sensor_height: Option<u16>,
 
-    /// Mirror the point cloud output. Useful when the sensor's coordinate
-    /// frame doesn't match the expected orientation.
-    ///   ""           - No mirroring (default)
-    ///   "horizontal" - Flip left-right (negate Y)
-    ///   "vertical"   - Flip up-down (negate Z)
-    ///   "both"       - Flip both axes
-    #[arg(long, env, default_value = "",
-          value_parser = PossibleValuesParser::new(["", "horizontal", "vertical", "both"]))]
-    pub mirror: String,
-
     /// zenoh connection mode
     #[arg(long, env, default_value = "peer")]
     mode: WhatAmI,
@@ -180,9 +170,8 @@ pub struct Args {
 /// preserved (i.e. the argument has a non-empty default but "" is a documented
 /// "disable" sentinel).
 ///
-/// None for lidarpub: the only arguments where "" is a documented sentinel
-/// (`CLUSTERING`, `MIRROR`) already default to "", so scrubbing them is a
-/// no-op.
+/// None for lidarpub: the only argument where "" is a documented sentinel
+/// (`CLUSTERING`) already defaults to "", so scrubbing it is a no-op.
 pub const KEEP: &[&str] = &[];
 
 /// Names of this program's env-bound arguments whose value, as reported by
@@ -221,14 +210,6 @@ pub unsafe fn scrub_empty_env<C: CommandFactory>(keep: &[&str]) {
 impl Args {
     pub fn clustering_enabled(&self) -> bool {
         !self.clustering.is_empty()
-    }
-
-    pub fn mirror_y(&self) -> bool {
-        self.mirror == "horizontal" || self.mirror == "both"
-    }
-
-    pub fn mirror_z(&self) -> bool {
-        self.mirror == "vertical" || self.mirror == "both"
     }
 }
 
@@ -446,26 +427,12 @@ mod tests {
     }
 
     #[test]
-    fn clustering_enabled_and_mirror_helpers() {
+    fn clustering_enabled() {
         let disabled = parse_cli();
         assert!(!disabled.clustering_enabled());
-        assert!(!disabled.mirror_y());
-        assert!(!disabled.mirror_z());
 
         let voxel = Args::parse_from(["edgefirst-lidarpub", "--clustering", "voxel"]);
         assert!(voxel.clustering_enabled());
-
-        let horizontal = Args::parse_from(["edgefirst-lidarpub", "--mirror", "horizontal"]);
-        assert!(horizontal.mirror_y());
-        assert!(!horizontal.mirror_z());
-
-        let vertical = Args::parse_from(["edgefirst-lidarpub", "--mirror", "vertical"]);
-        assert!(!vertical.mirror_y());
-        assert!(vertical.mirror_z());
-
-        let both = Args::parse_from(["edgefirst-lidarpub", "--mirror", "both"]);
-        assert!(both.mirror_y());
-        assert!(both.mirror_z());
     }
 
     #[test]

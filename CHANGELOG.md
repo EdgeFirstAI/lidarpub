@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Ouster XYZ tests against the reference projection formula using OS1-64
+  FW 2.5.3 and OS1-128 Rev7 FW 3.2 metadata, plus a Rev7 capture. The OS1 PCD
+  test frames are regenerated from real returns (EDGEAI-2022).
+
+### Removed
+- `--mirror` / `MIRROR` point cloud axis mirroring (EDGEAI-2021). Points are
+  always published in the sensor's right-handed frame; sensor orientation is
+  set with `TF_VEC` / `TF_QUAT`, and display mirroring is a WebUI view option.
+  A leftover `MIRROR` entry in `/etc/default/lidarpub` is ignored.
+
 ### Fixed
 - Ouster beams with a positive pixel shift were projected with the encoder
   angle of the destaggered column instead of their own `measurement_id`,
@@ -16,11 +27,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ring of points at the beam origin offset (EDGEAI-2022).
 - The last column of the Ouster `column_window` is no longer dropped
   (EDGEAI-2022).
-
-### Added
-- Ouster XYZ tests against the reference projection formula using OS1-64
-  FW 2.5.3 and OS1-128 Rev7 FW 3.2 metadata, plus a Rev7 capture. The OS1 PCD
-  test frames are regenerated from real returns (EDGEAI-2022).
 
 ## [2.4.0] - 2026-09-29
 

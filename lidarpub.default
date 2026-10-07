@@ -67,15 +67,6 @@ MODE="peer"
 # start-of-frame to first packet: about 16000000 (E1R), 3000000 (Ouster).
 #LIDAR_LATENCY="0"
 
-# Mirror the point cloud output. Applies axis negation to the published
-# point data (both raw and clustered). Useful when the sensor's native
-# coordinate frame doesn't match the expected orientation.
-#   ""           - No mirroring (default)
-#   "horizontal" - Flip left-right (negate Y)
-#   "vertical"   - Flip up-down (negate Z)
-#   "both"       - Flip both axes
-#MIRROR=""
-
 # ---------------------------------------------------------------------------
 # Clustering settings
 # ---------------------------------------------------------------------------
