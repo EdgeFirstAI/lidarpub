@@ -854,13 +854,7 @@ async fn publish_frame<F: LidarFrame>(
         let _ = tx_cluster.send((ranges, points, timestamp, imu_accel));
     }
 
-    let (msg, enc) = format_points(
-        frame,
-        timestamp,
-        args.frame_id.clone(),
-        args.mirror_y(),
-        args.mirror_z(),
-    )?;
+    let (msg, enc) = format_points(frame, timestamp, args.frame_id.clone())?;
 
     if let Err(e) = publish_cdr(points_publisher, msg, enc, ts_id, &timestamp).await {
         error!("publish points error: {:?}", e);
@@ -1312,8 +1306,6 @@ fn format_points<F: LidarFrame>(
     frame: &F,
     timestamp: Time,
     frame_id: String,
-    mirror_y: bool,
-    mirror_z: bool,
 ) -> Result<(ZBytes, Encoding), CdrError> {
     let n_points = frame.len();
     let cdr = encode_xyzr_pointcloud2_cdr(
@@ -1324,8 +1316,6 @@ fn format_points<F: LidarFrame>(
         n_points,
         timestamp,
         frame_id,
-        mirror_y,
-        mirror_z,
     )?;
     let zbytes = ZBytes::from(cdr);
     let enc = Encoding::APPLICATION_CDR.with_schema("sensor_msgs/msg/PointCloud2");
@@ -1426,8 +1416,7 @@ mod tests {
     fn format_points_encodes_pointcloud2() {
         let frame = sample_frame();
         let stamp = Time { sec: 1, nanosec: 2 };
-        let (zbytes, enc) =
-            format_points(&frame, stamp, "lidar".to_string(), false, false).unwrap();
+        let (zbytes, enc) = format_points(&frame, stamp, "lidar".to_string()).unwrap();
         assert!(enc.to_string().contains("PointCloud2"));
 
         let cdr = zbytes.to_bytes().into_owned();
@@ -1437,17 +1426,6 @@ mod tests {
         assert_eq!(pc.point_step(), 13);
         let y0 = f32::from_le_bytes(pc.data()[4..8].try_into().unwrap());
         assert_eq!(y0, 2.0);
-    }
-
-    #[test]
-    fn format_points_mirrors_y() {
-        let frame = sample_frame();
-        let stamp = Time { sec: 0, nanosec: 0 };
-        let (zbytes, _) = format_points(&frame, stamp, "lidar".to_string(), true, false).unwrap();
-        let cdr = zbytes.to_bytes().into_owned();
-        let pc = PointCloud2::from_cdr(cdr).unwrap();
-        let y0 = f32::from_le_bytes(pc.data()[4..8].try_into().unwrap());
-        assert_eq!(y0, -2.0);
     }
 
     fn test_zenoh_config() -> zenoh::Config {

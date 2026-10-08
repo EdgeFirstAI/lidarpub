@@ -169,8 +169,6 @@ pub async fn cluster_thread(
             n_points,
             time,
             args.frame_id.clone(),
-            args.mirror_y(),
-            args.mirror_z(),
         ) {
             Ok(v) => v,
             Err(e) => {
@@ -244,8 +242,6 @@ fn format_points_clustered(
     n_points: usize,
     timestamp: Time,
     frame_id: String,
-    mirror_y: bool,
-    mirror_z: bool,
 ) -> Result<(ZBytes, Encoding), CdrError> {
     let cdr = encode_clustered_pointcloud2_cdr(
         &points.x,
@@ -256,8 +252,6 @@ fn format_points_clustered(
         n_points,
         timestamp,
         frame_id,
-        mirror_y,
-        mirror_z,
     )?;
     let zbytes = ZBytes::from(cdr);
     let enc = Encoding::APPLICATION_CDR.with_schema("sensor_msgs/msg/PointCloud2");
@@ -281,16 +275,9 @@ mod tests {
         let cluster_ids = [1u32, 2];
         let stamp = Time { sec: 9, nanosec: 1 };
 
-        let (zbytes, enc) = format_points_clustered(
-            &points,
-            &cluster_ids,
-            2,
-            stamp,
-            "cluster".to_string(),
-            true,
-            false,
-        )
-        .unwrap();
+        let (zbytes, enc) =
+            format_points_clustered(&points, &cluster_ids, 2, stamp, "cluster".to_string())
+                .unwrap();
         assert!(enc.to_string().contains("PointCloud2"));
 
         let cdr = zbytes.to_bytes().into_owned();
@@ -300,7 +287,7 @@ mod tests {
         assert_eq!(pc.point_step(), 17);
         let y0 = f32::from_le_bytes(pc.data()[4..8].try_into().unwrap());
         let id0 = u32::from_le_bytes(pc.data()[12..16].try_into().unwrap());
-        assert_eq!(y0, -3.0);
+        assert_eq!(y0, 3.0);
         assert_eq!(id0, 1);
     }
 

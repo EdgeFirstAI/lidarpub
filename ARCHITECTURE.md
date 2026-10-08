@@ -293,7 +293,6 @@ graph TD
 **Raw PointCloud2** (`format_points` / `formats.rs`):
 - Fields: x, y, z (FLOAT32), reflect (UINT8)
 - Point step: 13 bytes
-- Optional axis mirroring via `--mirror`
 
 **Clustered PointCloud2** (`format_points_clustered`):
 - Fields: x, y, z, cluster_id (UINT32), reflect (UINT8)
