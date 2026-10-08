@@ -561,15 +561,17 @@ impl FrameBuilder {
         .unwrap();
         let range_delta = (beam_to_lidar[[0, 3]].powi(2) + beam_to_lidar[[2, 3]].powi(2)).sqrt();
 
+        // column_window is inclusive at both ends.
+        let packet_cols = column_window[1] - column_window[0] + 1;
+
         // The left and right columns are incomplete within the pixel shift
         // region.  We crop out this region to return the clean subset.
         let crop = {
-            let mut pixel_shift = pixel_shift_by_row.clone();
-            pixel_shift.sort_unstable();
-            let left = pixel_shift[pixel_shift.len() - 1];
-            let right = pixel_shift[0].abs();
-            let right = (column_window[1] - column_window[0]) as i16 - right;
-            (left as usize, right as usize)
+            let max_shift = pixel_shift_by_row.iter().copied().max().unwrap_or(0);
+            let min_shift = pixel_shift_by_row.iter().copied().min().unwrap_or(0);
+            let left = max_shift.max(0) as usize;
+            let right = packet_cols.saturating_sub(min_shift.min(0).unsigned_abs() as usize);
+            (left, right.max(left))
         };
 
         let enc = (0..cols)
@@ -624,25 +626,21 @@ impl FrameBuilder {
         let mut y_offset = Vec::with_capacity(n_output_points);
         let mut z_coeff = Vec::with_capacity(n_output_points);
 
-        let col_base = column_window[0] as i16;
-        let packet_cols = column_window[1] - column_window[0];
-
         for row in 0..rows {
-            let col_offset = (col_base - pixel_shift_by_row[row]).max(0) as usize;
+            let shift = pixel_shift_by_row[row] as isize;
 
             for col in crop.0..crop.1 {
-                // Source index: reverse pixel shift to find packet data location
-                let shift = pixel_shift_by_row[row];
-                let src_col = ((col as i16 - shift).clamp(0, packet_cols as i16 - 1)) as usize
-                    + column_window[0];
+                // A destaggered column maps back to the staggered column the
+                // row was fired in (its measurement_id). The crop keeps this
+                // inside the column window. Both the range sample and the
+                // encoder angle come from that measurement_id.
+                let src_col = (col as isize - shift) as usize + column_window[0];
                 src_indices.push(row * cols + src_col);
 
-                // Lookup table index with column offset adjustment
-                let lookup_col = col + col_offset;
-                x_coeff.push(x_range[[row, lookup_col]]);
-                y_coeff.push(y_range[[row, lookup_col]]);
-                x_offset.push(x_delta[lookup_col]);
-                y_offset.push(y_delta[lookup_col]);
+                x_coeff.push(x_range[[row, src_col]]);
+                y_coeff.push(y_range[[row, src_col]]);
+                x_offset.push(x_delta[src_col]);
+                y_offset.push(y_delta[src_col]);
                 z_coeff.push(altitude_sin[row]);
             }
         }
@@ -670,7 +668,8 @@ impl FrameBuilder {
     ///
     /// Reads directly from packet arrays, applies range scaling, computes
     /// Cartesian coordinates using pre-computed lookup tables, and writes
-    /// directly to the output frame buffers (true zero-copy).
+    /// directly to the output frame buffers (true zero-copy). Pixels without
+    /// a return are dropped, so the frame holds only measured points.
     #[instrument(skip_all, fields(rows = self.rows, cols = self.cols))]
     pub fn update_fused<F: LidarFrameWriter>(
         &mut self,
@@ -691,26 +690,34 @@ impl FrameBuilder {
         for i in 0..n_points {
             let src_idx = self.src_indices[i];
             let d = depth_raw[src_idx];
-            // Range calculation: 0 stays 0, otherwise apply scale and offset
-            self.range[i] = if d == 0 {
-                0.0
-            } else {
-                d as f32 * 8.0 - self.range_delta
-            };
+            // RNG15 range is in 8 mm units, measured from the lidar origin.
+            // A zero (no return) or a range inside the beam origin offset
+            // marks the pixel invalid.
+            let r = d as f32 * 8.0 - self.range_delta;
+            self.range[i] = if d == 0 || r <= 0.0 { 0.0 } else { r };
             frame_intensity[i] = reflect_raw[src_idx];
         }
 
         // Calculate XYZ coordinates directly into frame buffers (zero-copy)
         self.calculate_points_fused_into(n_points, frame_x, frame_y, frame_z);
-        self.n_points = n_points;
 
-        // Copy range to frame (convert to meters)
-        for (i, frame_r) in frame_range.iter_mut().enumerate().take(n_points) {
-            *frame_r = self.range[i] * 0.001;
+        // Compact valid points to the front. Invalid pixels would otherwise
+        // project onto the beam origin offset as a ring around the sensor.
+        let mut n_valid = 0;
+        for i in 0..n_points {
+            let r = self.range[i];
+            if r > 0.0 {
+                frame_x[n_valid] = frame_x[i];
+                frame_y[n_valid] = frame_y[i];
+                frame_z[n_valid] = frame_z[i];
+                frame_intensity[n_valid] = frame_intensity[i];
+                frame_range[n_valid] = r * 0.001;
+                n_valid += 1;
+            }
         }
+        self.n_points = n_valid;
 
-        // Set the valid length
-        frame.set_len(n_points);
+        frame.set_len(n_valid);
     }
 
     /// Calculate XYZ coordinates using NEON SIMD, writing directly to provided

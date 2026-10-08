@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Ouster beams with a positive pixel shift were projected with the encoder
+  angle of the destaggered column instead of their own `measurement_id`,
+  rotating about half the beams roughly 4° about Z on all models
+  (EDGEAI-2022).
+- Ouster pixels without a return are dropped instead of being published as a
+  ring of points at the beam origin offset (EDGEAI-2022).
+- The last column of the Ouster `column_window` is no longer dropped
+  (EDGEAI-2022).
+
+### Added
+- Ouster XYZ tests against the reference projection formula using OS1-64
+  FW 2.5.3 and OS1-128 Rev7 FW 3.2 metadata, plus a Rev7 capture. The OS1 PCD
+  test frames are regenerated from real returns (EDGEAI-2022).
+
 ## [2.4.0] - 2026-09-29
 
 Implements the LiDAR part of the middleware timestamp contract (EDGEAI-1941,
