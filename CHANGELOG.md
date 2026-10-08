@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.0] - 2026-10-07
+
+Corrects Ouster point cloud geometry on all models and removes point cloud
+mirroring (EDGEAI-2022, EDGEAI-2021). Ouster frames no longer include pixels
+without a return, so they carry fewer points.
+
 ### Added
 - Ouster XYZ tests against the reference projection formula using OS1-64
   FW 2.5.3 and OS1-128 Rev7 FW 3.2 metadata, plus a Rev7 capture. The OS1 PCD
@@ -27,6 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ring of points at the beam origin offset (EDGEAI-2022).
 - The last column of the Ouster `column_window` is no longer dropped
   (EDGEAI-2022).
+
+### Dependencies
+- Updated the lockfile to the latest compatible versions, including tokio
+  1.53.2 and hyper 1.12.0.
 
 ## [2.4.0] - 2026-09-29
 
