@@ -158,6 +158,7 @@ fn load_test_params() -> Result<Parameters, Box<dyn std::error::Error>> {
         udp_profile_imu: None,
     });
 
+    let columns_per_frame = data_format.columns_per_frame.unwrap_or(cols);
     let lidar_data_format = LidarDataFormat {
         udp_profile_lidar: data_format
             .udp_profile_lidar
@@ -166,9 +167,12 @@ fn load_test_params() -> Result<Parameters, Box<dyn std::error::Error>> {
             .udp_profile_imu
             .unwrap_or_else(|| "LEGACY".to_string()),
         columns_per_packet: data_format.columns_per_packet.unwrap_or(16),
-        columns_per_frame: data_format.columns_per_frame.unwrap_or(cols),
+        columns_per_frame,
         pixels_per_column: data_format.pixels_per_column.unwrap_or(rows),
-        column_window: data_format.column_window.unwrap_or([0, cols]),
+        // column_window is inclusive at both ends.
+        column_window: data_format
+            .column_window
+            .unwrap_or([0, columns_per_frame - 1]),
         pixel_shift_by_row: data_format
             .pixel_shift_by_row
             .unwrap_or_else(|| vec![0; rows]),

@@ -203,6 +203,16 @@ mod pcap {
     const OS1_64_FW25_PCAP: &str = "testdata/os1_frames.pcap";
     const OS1_128_REV7_FW32_PCAP: &str = "testdata/os1_128_rev7_frames.pcap";
 
+    /// True when `pcap` is present; otherwise logs the skip, matching the
+    /// other capture tests when test data has not been fetched.
+    fn capture_available(pcap: &str) -> bool {
+        let found = std::path::Path::new(pcap).exists();
+        if !found {
+            eprintln!("Skipping: {pcap} not found. See testdata/README.md");
+        }
+        found
+    }
+
     /// Decode every complete frame in a capture, calling `check` on each.
     async fn for_each_frame(pcap: &str, metadata: &str, mut check: impl FnMut(&OusterLidarFrame)) {
         let params = load_params(metadata);
@@ -221,6 +231,9 @@ mod pcap {
     }
 
     async fn check_real_frames(pcap: &str, metadata: &str) {
+        if !capture_available(pcap) {
+            return;
+        }
         let mut frames = 0;
         for_each_frame(pcap, metadata, |frame| {
             frames += 1;
@@ -259,6 +272,9 @@ mod pcap {
     #[tokio::test]
     #[ignore]
     async fn regenerate_os1_pcd_testdata() {
+        if !capture_available(OS1_64_FW25_PCAP) {
+            return;
+        }
         let mut decoded = 0;
         for_each_frame(OS1_64_FW25_PCAP, OS1_64_FW25, |frame| {
             decoded += 1;
