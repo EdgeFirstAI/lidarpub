@@ -40,27 +40,8 @@ use edgefirst_schemas::{
     builtin_interfaces::Time,
     cdr::CdrError,
     geometry_msgs::{Quaternion, Transform, TransformStamped, Vector3},
-    sensor_msgs::{Imu, PointCloud2, PointFieldView},
+    sensor_msgs::{Imu, PointCloud2, PointFieldView, point_field},
 };
-
-/// Point field data types for PointCloud2 messages.
-///
-/// These values correspond to the ROS sensor_msgs/PointField datatype field.
-/// All variants are defined for completeness, even if not all are currently
-/// used.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-#[allow(dead_code)]
-pub enum PointFieldType {
-    INT8 = 1,
-    UINT8 = 2,
-    INT16 = 3,
-    UINT16 = 4,
-    INT32 = 5,
-    UINT32 = 6,
-    FLOAT32 = 7,
-    FLOAT64 = 8,
-}
 
 /// Build the standard XYZ + intensity point fields (13-byte stride).
 ///
@@ -74,25 +55,25 @@ pub fn standard_xyz_intensity_fields() -> [PointFieldView<'static>; 4] {
         PointFieldView {
             name: "x",
             offset: 0,
-            datatype: PointFieldType::FLOAT32 as u8,
+            datatype: point_field::FLOAT32,
             count: 1,
         },
         PointFieldView {
             name: "y",
             offset: 4,
-            datatype: PointFieldType::FLOAT32 as u8,
+            datatype: point_field::FLOAT32,
             count: 1,
         },
         PointFieldView {
             name: "z",
             offset: 8,
-            datatype: PointFieldType::FLOAT32 as u8,
+            datatype: point_field::FLOAT32,
             count: 1,
         },
         PointFieldView {
             name: "reflect",
             offset: 12,
-            datatype: PointFieldType::UINT8 as u8,
+            datatype: point_field::UINT8,
             count: 1,
         },
     ]
@@ -111,31 +92,31 @@ pub fn clustered_xyz_fields() -> [PointFieldView<'static>; 5] {
         PointFieldView {
             name: "x",
             offset: 0,
-            datatype: PointFieldType::FLOAT32 as u8,
+            datatype: point_field::FLOAT32,
             count: 1,
         },
         PointFieldView {
             name: "y",
             offset: 4,
-            datatype: PointFieldType::FLOAT32 as u8,
+            datatype: point_field::FLOAT32,
             count: 1,
         },
         PointFieldView {
             name: "z",
             offset: 8,
-            datatype: PointFieldType::FLOAT32 as u8,
+            datatype: point_field::FLOAT32,
             count: 1,
         },
         PointFieldView {
             name: "cluster_id",
             offset: 12,
-            datatype: PointFieldType::UINT32 as u8,
+            datatype: point_field::UINT32,
             count: 1,
         },
         PointFieldView {
             name: "reflect",
             offset: 16,
-            datatype: PointFieldType::UINT8 as u8,
+            datatype: point_field::UINT8,
             count: 1,
         },
     ]
@@ -805,6 +786,14 @@ mod tests {
         assert_eq!(clustered[3].offset, 12);
         assert_eq!(clustered[4].name, "reflect");
         assert_eq!(clustered[4].offset, 16);
+
+        let datatypes = |f: &[PointFieldView]| f.iter().map(|f| f.datatype).collect::<Vec<_>>();
+        use point_field::{FLOAT32, UINT8, UINT32};
+        assert_eq!(datatypes(&fields), [FLOAT32, FLOAT32, FLOAT32, UINT8]);
+        assert_eq!(
+            datatypes(&clustered),
+            [FLOAT32, FLOAT32, FLOAT32, UINT32, UINT8]
+        );
     }
 
     #[test]
