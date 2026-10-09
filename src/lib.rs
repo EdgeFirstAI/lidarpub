@@ -83,7 +83,6 @@ pub mod robosense;
 pub mod stamp;
 
 // Re-exports for convenience
-pub use formats::PointFieldType;
 pub use lidar::{Error, LidarDriver, LidarFrame, LidarFrameWriter, Points, SensorType};
 pub use ouster::OusterLidarFrame;
 pub use packet_source::PacketSource;

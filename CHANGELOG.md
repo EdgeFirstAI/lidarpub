@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- PointCloud2 field datatypes come from the `edgefirst-schemas` `sensor_msgs::point_field` constants instead of a local enum (EDGEAI-2200).
+
+### Removed
+
+- The library's `PointFieldType` enum and its crate-root re-export. Use `edgefirst_schemas::sensor_msgs::point_field` instead (EDGEAI-2200).
+
 ## [2.5.0] - 2026-10-07
 
 Corrects Ouster point cloud geometry on all models and removes point cloud
