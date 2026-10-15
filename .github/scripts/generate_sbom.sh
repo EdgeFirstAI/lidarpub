@@ -67,8 +67,8 @@ elif command -v scancode &> /dev/null; then
     echo "  Using system scancode"
 else
     echo "Error: scancode not found. Please install:"
-    echo "  Option 1 (recommended): python3 -m venv venv && venv/bin/pip install scancode-toolkit"
-    echo "  Option 2 (system): pip install scancode-toolkit"
+    echo "  Option 1 (recommended): python3 -m venv venv && venv/bin/pip install scancode-toolkit pluggy==1.6.0"
+    echo "  Option 2 (system): pip install scancode-toolkit pluggy==1.6.0"
     exit 1
 fi
 

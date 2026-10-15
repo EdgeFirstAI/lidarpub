@@ -54,7 +54,7 @@ jobs:
           # Install scancode-toolkit for comprehensive source scanning
           # (script will detect and use system installation)
           python -m pip install --upgrade pip
-          pip install scancode-toolkit
+          pip install scancode-toolkit pluggy==1.6.0
           
           # Install Python dependencies for validation scripts
           pip install jsonschema requests
