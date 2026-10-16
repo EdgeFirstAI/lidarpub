@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["MAX_SENSOR_LATENCY","MAX_SENSOR_LEAD"],"enum":["StampSource"],"fn":["plausible","system_time_ns"],"struct":["FrameStamper"]};
