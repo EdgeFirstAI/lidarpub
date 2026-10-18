@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["BRACKET_ATTEMPTS","MAX_BRACKET_NS","WATCH_HORIZON_SECS"],"fn":["clock_ns","realtime_minus_monotonic"],"struct":["ClockStepWatcher"]};
